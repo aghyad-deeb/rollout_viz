@@ -138,30 +138,80 @@ export function LeftPanel({
       });
     }
 
-    // Apply filter expression (simple implementation)
-    if (filterExpression) {
+    // Apply filter expression with AND/OR support
+    if (filterExpression.trim()) {
       try {
-        // Parse simple expressions like "reward > 0" or "step == 1"
-        const match = filterExpression.match(/(\w+)\s*(==|!=|>=|<=|>|<)\s*(.+)/);
-        if (match) {
-          const [, field, operator, valueStr] = match;
-          const value = isNaN(Number(valueStr)) ? valueStr.trim() : Number(valueStr);
+        // Helper to evaluate a single condition
+        const evaluateCondition = (
+          condition: string,
+          attrs: Record<string, unknown>
+        ): boolean => {
+          // Match: field operator value (supports contains operator)
+          const match = condition.trim().match(/^(\w+)\s*(==|!=|>=|<=|>|<|contains)\s*(.+)$/i);
+          if (!match) return true; // Invalid condition passes
           
-          result = result.filter(sample => {
-            const attrs = sample.attributes as unknown as Record<string, unknown>;
-            const sampleValue = attrs[field];
-            
-            switch (operator) {
-              case '==': return sampleValue === value;
-              case '!=': return sampleValue !== value;
-              case '>': return (sampleValue as number) > (value as number);
-              case '<': return (sampleValue as number) < (value as number);
-              case '>=': return (sampleValue as number) >= (value as number);
-              case '<=': return (sampleValue as number) <= (value as number);
-              default: return true;
-            }
+          const [, field, operator, valueStr] = match;
+          const rawValue = valueStr.trim();
+          const sampleValue = attrs[field];
+          
+          // Handle undefined fields
+          if (sampleValue === undefined) return false;
+          
+          // Parse value based on type
+          let value: string | number | boolean;
+          if (rawValue.toLowerCase() === 'true') {
+            value = true;
+          } else if (rawValue.toLowerCase() === 'false') {
+            value = false;
+          } else if (!isNaN(Number(rawValue))) {
+            value = Number(rawValue);
+          } else {
+            value = rawValue;
+          }
+          
+          const op = operator.toLowerCase();
+          
+          switch (op) {
+            case '==': 
+              // Handle string comparison (case-insensitive for strings)
+              if (typeof sampleValue === 'string' && typeof value === 'string') {
+                return sampleValue.toLowerCase() === value.toLowerCase();
+              }
+              return sampleValue === value;
+            case '!=':
+              if (typeof sampleValue === 'string' && typeof value === 'string') {
+                return sampleValue.toLowerCase() !== value.toLowerCase();
+              }
+              return sampleValue !== value;
+            case '>': return (sampleValue as number) > (value as number);
+            case '<': return (sampleValue as number) < (value as number);
+            case '>=': return (sampleValue as number) >= (value as number);
+            case '<=': return (sampleValue as number) <= (value as number);
+            case 'contains':
+              if (typeof sampleValue === 'string' && typeof value === 'string') {
+                return sampleValue.toLowerCase().includes(value.toLowerCase());
+              }
+              return String(sampleValue).toLowerCase().includes(String(value).toLowerCase());
+            default: return true;
+          }
+        };
+
+        // Parse expression with AND/OR support
+        // Split by OR first (lower precedence), then AND (higher precedence)
+        const orGroups = filterExpression.split(/\s+OR\s+/i);
+        
+        result = result.filter(sample => {
+          const attrs = sample.attributes as unknown as Record<string, unknown>;
+          
+          // OR: any group must match
+          return orGroups.some(orGroup => {
+            // AND: all conditions in group must match
+            const andConditions = orGroup.split(/\s+AND\s+/i);
+            return andConditions.every(condition => 
+              evaluateCondition(condition, attrs)
+            );
           });
-        }
+        });
       } catch {
         // Ignore invalid filter expressions
       }
@@ -315,6 +365,7 @@ export function LeftPanel({
           matchCount={filteredSamples.length}
           currentMatchIndex={currentMatchIndex}
           isDarkMode={isDarkMode}
+          samples={samples}
         />
 
         {/* Loading/Error states */}
