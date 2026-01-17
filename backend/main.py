@@ -132,6 +132,56 @@ def list_s3_files(bucket: str, prefix: str = "") -> List[Dict[str, Any]]:
     return files
 
 
+def list_s3_contents(bucket: str, prefix: str = "") -> Dict[str, List[Dict[str, Any]]]:
+    """List both folders and JSONL files in S3 at the given prefix level (non-recursive)."""
+    import boto3
+    
+    load_env_credentials()
+    s3_client = boto3.client('s3')
+    
+    # Ensure prefix ends with / if it's not empty
+    if prefix and not prefix.endswith('/'):
+        prefix = prefix + '/'
+    
+    # Use delimiter to get "folder-like" behavior
+    response = s3_client.list_objects_v2(
+        Bucket=bucket,
+        Prefix=prefix,
+        Delimiter='/'
+    )
+    
+    folders = []
+    files = []
+    
+    # Get "folders" (common prefixes)
+    for cp in response.get('CommonPrefixes', []):
+        folder_prefix = cp['Prefix']
+        # Get folder name (remove trailing /)
+        folder_name = folder_prefix.rstrip('/').split('/')[-1]
+        folders.append({
+            'key': folder_prefix,
+            'name': folder_name,
+            'type': 'folder',
+        })
+    
+    # Get files at this level
+    for obj in response.get('Contents', []):
+        key = obj['Key']
+        # Skip the prefix itself
+        if key == prefix:
+            continue
+        if key.endswith('.jsonl'):
+            files.append({
+                'key': key,
+                'name': key.split('/')[-1],
+                'size': obj['Size'],
+                'last_modified': obj['LastModified'].isoformat(),
+                'type': 'file',
+            })
+    
+    return {'folders': folders, 'files': files}
+
+
 def list_local_files(directory: str) -> List[Dict[str, Any]]:
     """List JSONL files in a local directory."""
     files = []
@@ -153,6 +203,44 @@ def list_local_files(directory: str) -> List[Dict[str, Any]]:
         })
     
     return files
+
+
+def list_local_contents(directory: str) -> Dict[str, List[Dict[str, Any]]]:
+    """List both folders and JSONL files in a local directory (non-recursive)."""
+    dir_path = Path(directory)
+    
+    # Resolve relative paths from project root
+    if not dir_path.is_absolute():
+        dir_path = PROJECT_ROOT / dir_path
+    
+    folders = []
+    files = []
+    
+    if not dir_path.exists():
+        return {'folders': folders, 'files': files}
+    
+    for item in dir_path.iterdir():
+        if item.is_dir():
+            folders.append({
+                'key': str(item),
+                'name': item.name,
+                'type': 'folder',
+            })
+        elif item.is_file() and item.suffix == '.jsonl':
+            stat = item.stat()
+            files.append({
+                'key': str(item),
+                'name': item.name,
+                'size': stat.st_size,
+                'last_modified': datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                'type': 'file',
+            })
+    
+    # Sort folders and files by name
+    folders.sort(key=lambda x: x['name'].lower())
+    files.sort(key=lambda x: x['name'].lower())
+    
+    return {'folders': folders, 'files': files}
 
 
 @app.get("/api/health")
@@ -180,6 +268,29 @@ async def get_s3_files(
     try:
         files = list_s3_files(bucket, prefix)
         return files
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/contents/local")
+async def get_local_contents(directory: str = Query(default=".")):
+    """List folders and JSONL files in a local directory (non-recursive)."""
+    try:
+        contents = list_local_contents(directory)
+        return contents
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/contents/s3")
+async def get_s3_contents(
+    bucket: str = Query(...),
+    prefix: str = Query(default="")
+):
+    """List folders and JSONL files in an S3 bucket at a specific prefix (non-recursive)."""
+    try:
+        contents = list_s3_contents(bucket, prefix)
+        return contents
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

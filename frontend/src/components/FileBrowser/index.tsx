@@ -1,6 +1,22 @@
 import { useState, useEffect, useCallback } from 'react';
 import type { FileInfo } from '../../types';
 
+interface FolderInfo {
+  key: string;
+  name: string;
+  type: 'folder';
+}
+
+interface FileInfoExtended extends FileInfo {
+  name?: string;
+  type?: 'file';
+}
+
+interface ContentsResponse {
+  folders: FolderInfo[];
+  files: FileInfoExtended[];
+}
+
 interface FileBrowserProps {
   isOpen: boolean;
   onClose: () => void;
@@ -19,12 +35,66 @@ export function FileBrowser({
   isDarkMode,
 }: FileBrowserProps) {
   const [directoryPath, setDirectoryPath] = useState('');
-  const [files, setFiles] = useState<FileInfo[]>([]);
+  const [currentPath, setCurrentPath] = useState(''); // The path we're currently viewing
+  const [folders, setFolders] = useState<FolderInfo[]>([]);
+  const [files, setFiles] = useState<FileInfoExtended[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showMarkedOnly, setShowMarkedOnly] = useState(false);
   const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set());
+  const [browseMode, setBrowseMode] = useState<'navigate' | 'browse'>('navigate'); // navigate = show folders, browse = recursive files
 
+  // Fetch contents (folders + files at current level)
+  const fetchContents = useCallback(async (path: string) => {
+    if (!path.trim()) {
+      setFolders([]);
+      setFiles([]);
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      let response: Response;
+
+      if (path.startsWith('s3://')) {
+        // Parse S3 path: s3://bucket/prefix
+        const s3Path = path.slice(5); // Remove 's3://'
+        const slashIndex = s3Path.indexOf('/');
+        const bucket = slashIndex > 0 ? s3Path.slice(0, slashIndex) : s3Path;
+        const prefix = slashIndex > 0 ? s3Path.slice(slashIndex + 1) : '';
+        
+        response = await fetch(
+          `/api/contents/s3?bucket=${encodeURIComponent(bucket)}&prefix=${encodeURIComponent(prefix)}`
+        );
+      } else {
+        // Local directory
+        response = await fetch(
+          `/api/contents/local?directory=${encodeURIComponent(path)}`
+        );
+      }
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.detail || 'Failed to list contents');
+      }
+
+      const data: ContentsResponse = await response.json();
+      setFolders(data.folders);
+      setFiles(data.files);
+      setCurrentPath(path);
+      setBrowseMode('navigate');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to fetch contents');
+      setFolders([]);
+      setFiles([]);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  // Fetch all files recursively (original browse behavior)
   const fetchFiles = useCallback(async (path: string) => {
     if (!path.trim()) {
       setFiles([]);
@@ -60,7 +130,10 @@ export function FileBrowser({
       }
 
       const data = await response.json();
+      setFolders([]);
       setFiles(data);
+      setCurrentPath(path);
+      setBrowseMode('browse');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to fetch files');
       setFiles([]);
@@ -77,23 +150,80 @@ export function FileBrowser({
     }
   }, [isOpen]);
 
-  const handleBrowse = () => {
+  const handleNavigate = () => {
+    fetchContents(directoryPath);
+  };
+
+  const handleBrowseAll = () => {
     fetchFiles(directoryPath);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter') {
-      handleBrowse();
+      handleNavigate();
     }
   };
 
-  const getFullPath = (file: FileInfo): string => {
-    return directoryPath.startsWith('s3://')
-      ? `s3://${directoryPath.slice(5).split('/')[0]}/${file.key}`
-      : file.key;
+  // Navigate into a folder
+  const navigateToFolder = (folder: FolderInfo) => {
+    let newPath: string;
+    if (currentPath.startsWith('s3://')) {
+      // For S3, reconstruct the full path
+      const bucket = currentPath.slice(5).split('/')[0];
+      newPath = `s3://${bucket}/${folder.key}`;
+    } else {
+      newPath = folder.key;
+    }
+    setDirectoryPath(newPath);
+    fetchContents(newPath);
   };
 
-  const handleFileClick = (file: FileInfo) => {
+  // Navigate to parent folder
+  const navigateToParent = () => {
+    if (!currentPath) return;
+    
+    let parentPath: string;
+    if (currentPath.startsWith('s3://')) {
+      // For S3
+      const s3Path = currentPath.slice(5); // Remove 's3://'
+      const bucket = s3Path.split('/')[0];
+      const prefix = s3Path.slice(bucket.length + 1); // +1 for the /
+      
+      // Remove trailing slash and go up one level
+      const trimmedPrefix = prefix.replace(/\/$/, '');
+      const lastSlash = trimmedPrefix.lastIndexOf('/');
+      
+      if (lastSlash > 0) {
+        parentPath = `s3://${bucket}/${trimmedPrefix.slice(0, lastSlash + 1)}`;
+      } else {
+        parentPath = `s3://${bucket}/`;
+      }
+    } else {
+      // For local paths
+      const parts = currentPath.replace(/\/$/, '').split('/');
+      parts.pop();
+      parentPath = parts.join('/') || '/';
+    }
+    
+    setDirectoryPath(parentPath);
+    fetchContents(parentPath);
+  };
+
+  const getFullPath = (file: FileInfoExtended): string => {
+    if (browseMode === 'browse') {
+      // In browse mode, files already have full paths for local, or need bucket prefix for S3
+      return currentPath.startsWith('s3://')
+        ? `s3://${currentPath.slice(5).split('/')[0]}/${file.key}`
+        : file.key;
+    } else {
+      // In navigate mode, files already have full keys
+      return currentPath.startsWith('s3://')
+        ? `s3://${currentPath.slice(5).split('/')[0]}/${file.key}`
+        : file.key;
+    }
+  };
+
+  const handleFileClick = (file: FileInfoExtended) => {
     const filePath = getFullPath(file);
     // Toggle selection
     setSelectedFiles(prev => {
@@ -123,7 +253,7 @@ export function FileBrowser({
     }
   };
 
-  const handleDoubleClick = (file: FileInfo) => {
+  const handleDoubleClick = (file: FileInfoExtended) => {
     // Double-click to load just that file
     const filePath = getFullPath(file);
     onSelectFiles([filePath]);
@@ -200,29 +330,73 @@ export function FileBrowser({
               className={`flex-1 px-3 py-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-sm ${isDarkMode ? 'bg-gray-800 border-gray-600 text-gray-200 placeholder-gray-500' : 'border-gray-300'}`}
             />
             <button
-              onClick={handleBrowse}
+              onClick={handleNavigate}
+              disabled={loading || !directoryPath.trim()}
+              className={`px-4 py-2 border rounded-md transition-colors flex items-center gap-1 ${
+                isDarkMode 
+                  ? 'border-gray-600 text-gray-300 hover:bg-gray-700 disabled:bg-gray-800 disabled:text-gray-600' 
+                  : 'border-gray-300 text-gray-700 hover:bg-gray-50 disabled:bg-gray-100 disabled:text-gray-400'
+              } disabled:cursor-not-allowed`}
+              title="Navigate into folder to see subfolders"
+            >
+              {loading && browseMode === 'navigate' ? (
+                <span className="material-symbols-outlined animate-spin text-sm">progress_activity</span>
+              ) : (
+                <span className="material-symbols-outlined text-sm">folder_open</span>
+              )}
+              Open
+            </button>
+            <button
+              onClick={handleBrowseAll}
               disabled={loading || !directoryPath.trim()}
               className={`px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors flex items-center gap-1 ${isDarkMode ? 'disabled:bg-gray-700' : 'disabled:bg-gray-300'} disabled:cursor-not-allowed`}
+              title="Browse all JSONL files recursively"
             >
-              {loading ? (
+              {loading && browseMode === 'browse' ? (
                 <span className="material-symbols-outlined animate-spin text-sm">progress_activity</span>
               ) : (
                 <span className="material-symbols-outlined text-sm">search</span>
               )}
-              Browse
+              Browse All
             </button>
           </div>
           <p className={`mt-1 text-xs ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>
-            Examples: <code className={`px-1 rounded ${isDarkMode ? 'bg-gray-800' : 'bg-gray-100'}`}>s3://my-bucket/logs/</code> or <code className={`px-1 rounded ${isDarkMode ? 'bg-gray-800' : 'bg-gray-100'}`}>/home/user/data</code>
+            <strong>Open:</strong> Navigate into folder to see subfolders. <strong>Browse All:</strong> List all JSONL files recursively.
           </p>
         </div>
+
+        {/* Current path breadcrumb */}
+        {currentPath && (
+          <div className={`px-4 py-2 border-b flex items-center gap-2 ${isDarkMode ? 'border-gray-700 bg-gray-800/50' : 'border-gray-200 bg-gray-50'}`}>
+            <button
+              onClick={navigateToParent}
+              className={`p-1 rounded transition-colors ${isDarkMode ? 'hover:bg-gray-700 text-gray-400' : 'hover:bg-gray-200 text-gray-500'}`}
+              title="Go to parent folder"
+            >
+              <span className="material-symbols-outlined text-sm">arrow_upward</span>
+            </button>
+            <span className={`text-sm font-mono truncate ${isDarkMode ? 'text-gray-300' : 'text-gray-600'}`}>
+              {currentPath}
+            </span>
+            {browseMode === 'browse' && (
+              <span className={`text-xs px-2 py-0.5 rounded ${isDarkMode ? 'bg-blue-900 text-blue-300' : 'bg-blue-100 text-blue-700'}`}>
+                recursive
+              </span>
+            )}
+          </div>
+        )}
 
         {/* Filter bar */}
         <div className={`px-4 py-2 border-b flex items-center justify-between ${isDarkMode ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-gray-50'}`}>
           <div className="flex items-center gap-4">
             <div className="flex items-center gap-2">
+              {folders.length > 0 && (
+                <span className={`text-sm ${isDarkMode ? 'text-gray-400' : 'text-gray-600'}`}>
+                  {folders.length} folder{folders.length !== 1 ? 's' : ''}
+                </span>
+              )}
               <span className={`text-sm ${isDarkMode ? 'text-gray-400' : 'text-gray-600'}`}>
-                {files.length} file{files.length !== 1 ? 's' : ''} found
+                {files.length} file{files.length !== 1 ? 's' : ''}
               </span>
               {markedFiles.size > 0 && (
                 <span className={`text-sm ${isDarkMode ? 'text-amber-400' : 'text-amber-600'}`}>
@@ -272,29 +446,61 @@ export function FileBrowser({
             </div>
           )}
 
-          {!error && files.length === 0 && !loading && (
+          {!error && folders.length === 0 && files.length === 0 && !loading && (
             <div className={`p-8 text-center ${isDarkMode ? 'text-gray-500' : 'text-gray-500'}`}>
               <span className="material-symbols-outlined text-4xl">folder_off</span>
               <p className="mt-2">
-                {directoryPath
-                  ? 'No JSONL files found in this directory'
-                  : 'Enter a directory path and click Browse'}
+                {currentPath
+                  ? 'No folders or JSONL files found in this directory'
+                  : 'Enter a directory path and click Open or Browse All'}
               </p>
             </div>
           )}
 
-          {displayedFiles.length > 0 && (
+          {(folders.length > 0 || displayedFiles.length > 0) && (
             <table className="w-full">
               <thead className={`sticky top-0 ${isDarkMode ? 'bg-gray-800' : 'bg-gray-50'}`}>
                 <tr className={`text-left text-xs font-medium uppercase tracking-wider ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>
                   <th className="px-4 py-2 w-10"></th>
                   <th className="px-2 py-2 w-10"></th>
-                  <th className="px-4 py-2">File Name</th>
+                  <th className="px-4 py-2">Name</th>
                   <th className="px-4 py-2 w-24 text-right">Size</th>
                   <th className="px-4 py-2 w-40">Last Modified</th>
                 </tr>
               </thead>
               <tbody className={`divide-y ${isDarkMode ? 'divide-gray-700' : 'divide-gray-200'}`}>
+                {/* Folders first */}
+                {folders.map((folder) => (
+                  <tr
+                    key={folder.key}
+                    onClick={() => navigateToFolder(folder)}
+                    className={`cursor-pointer transition-colors ${isDarkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-100'}`}
+                  >
+                    <td className="px-4 py-2">
+                      {/* No star for folders */}
+                    </td>
+                    <td className="px-2 py-2">
+                      {/* No checkbox for folders */}
+                    </td>
+                    <td className="px-4 py-2">
+                      <div className="flex items-center gap-2">
+                        <span className={`material-symbols-outlined text-lg ${isDarkMode ? 'text-amber-500' : 'text-amber-600'}`}>
+                          folder
+                        </span>
+                        <span className={`text-sm ${isDarkMode ? 'text-gray-200' : 'text-gray-800'}`}>
+                          {folder.name}
+                        </span>
+                      </div>
+                    </td>
+                    <td className={`px-4 py-2 text-right text-sm ${isDarkMode ? 'text-gray-500' : 'text-gray-400'}`}>
+                      —
+                    </td>
+                    <td className={`px-4 py-2 text-sm ${isDarkMode ? 'text-gray-500' : 'text-gray-400'}`}>
+                      —
+                    </td>
+                  </tr>
+                ))}
+                {/* Files */}
                 {displayedFiles.map((file) => {
                   const isMarked = markedFiles.has(file.key);
                   const filePath = getFullPath(file);
@@ -342,10 +548,10 @@ export function FileBrowser({
                             description
                           </span>
                           <span className={`text-sm truncate max-w-[300px] ${isDarkMode ? 'text-gray-200' : 'text-gray-800'}`} title={file.key}>
-                            {getFileName(file.key)}
+                            {file.name || getFileName(file.key)}
                           </span>
                         </div>
-                        {file.key !== getFileName(file.key) && (
+                        {browseMode === 'browse' && file.key !== getFileName(file.key) && (
                           <p className={`text-xs ml-7 truncate max-w-[300px] ${isDarkMode ? 'text-gray-500' : 'text-gray-400'}`} title={file.key}>
                             {file.key}
                           </p>
