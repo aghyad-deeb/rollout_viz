@@ -231,13 +231,13 @@ If running on AWS infrastructure, use IAM roles attached to your EC2 instance or
 
 ```bash
 # Upload a single file
-aws s3 cp rollouts.jsonl s3://your-bucket/logs/experiment_name/rollouts.jsonl
+aws s3 cp rollouts.jsonl s3://your-bucket/logs_jsonl/experiment_name/rollouts.jsonl
 
 # Upload a directory
-aws s3 sync ./rollouts/ s3://your-bucket/logs/experiment_name/
+aws s3 sync ./rollouts/ s3://your-bucket/logs_jsonl/experiment_name/
 
 # Upload with specific prefix structure
-aws s3 cp rollouts.jsonl s3://your-bucket/logs/$(date +%Y-%m-%d)/experiment_v1.jsonl
+aws s3 cp rollouts.jsonl s3://your-bucket/logs_jsonl/$(date +%Y-%m-%d)/experiment_v1.jsonl
 ```
 
 ### Using Python (boto3)
@@ -255,7 +255,7 @@ def upload_to_s3(local_path: str, bucket: str, key: str):
 bucket = "your-bucket"
 experiment = "my_experiment"
 date_str = datetime.now().strftime("%Y-%m-%d")
-key = f"logs/rollout_traces/{experiment}/{date_str}/rollouts.jsonl"
+key = f"logs_jsonl/rollout_traces/{experiment}/{date_str}/rollouts.jsonl"
 
 upload_to_s3("rollouts.jsonl", bucket, key)
 print(f"Uploaded to s3://{bucket}/{key}")
@@ -331,7 +331,7 @@ class S3RolloutLogger:
 
 ```
 s3://your-bucket/
-└── logs/
+└── logs_jsonl/
     └── rollout_traces/
         └── experiment_name/
             └── 2026-01-16/
@@ -357,7 +357,7 @@ This structure allows:
 
 ### From S3
 1. Click the folder icon to open the file browser
-2. Enter an S3 path: `s3://bucket-name/logs/experiment/`
+2. Enter an S3 path: `s3://bucket-name/logs_jsonl/experiment/`
 3. Click "Open" to navigate folders or "Browse All" to list all JSONL files recursively
 4. Select files (checkbox) and click "Load Selected"
 
