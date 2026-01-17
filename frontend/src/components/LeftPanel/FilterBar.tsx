@@ -323,46 +323,45 @@ export function FilterBar({
   };
 
   const applySuggestion = (suggestion: Suggestion) => {
-    const { type } = parseContext;
+    const { type, currentToken } = parseContext;
     let newValue = filterExpression;
     
-    // Remove the current token being typed
     if (type === 'field') {
       // Replace partial field with suggestion
-      const parts = filterExpression.split(/\s+(AND|OR)\s+/i);
-      parts[parts.length - 1] = suggestion.value + ' ';
-      newValue = parts.join(' ').replace(/\s+(AND|OR)\s+/gi, (match) => match.toUpperCase());
-      // Handle case where we're at the start
-      if (filterExpression.trim() === '' || !filterExpression.includes('AND') && !filterExpression.includes('OR')) {
-        newValue = suggestion.value + ' ';
+      // Check if there's a logical operator prefix we need to preserve
+      const logicalMatch = filterExpression.match(/^(.*\s+(AND|OR)\s+)/i);
+      if (logicalMatch) {
+        // After AND/OR, replace whatever partial field was typed
+        newValue = logicalMatch[1] + suggestion.value + ' ';
       } else {
-        // Preserve the logical operators
-        const match = filterExpression.match(/^(.*\s+(AND|OR)\s+)/i);
-        if (match) {
-          newValue = match[1] + suggestion.value + ' ';
-        }
+        // At the start or replacing partial field
+        newValue = suggestion.value + ' ';
       }
     } else if (type === 'operator') {
-      // Add operator after field
+      // Keep everything before the current partial operator and add the selected operator
+      // The expression should be: [prefix AND/OR] field [partial_operator]
+      // We want: [prefix AND/OR] field operator
       const trimmed = filterExpression.trimEnd();
-      const lastSpace = trimmed.lastIndexOf(' ');
-      newValue = trimmed.slice(0, lastSpace + 1) + suggestion.value + ' ';
-    } else if (type === 'value') {
-      // Add value - need to handle strings with spaces
-      const trimmed = filterExpression.trimEnd();
-      // Find where the value starts (after operator)
-      const parts = trimmed.split(/\s+/);
-      // Keep everything except the partial value
-      const baseExpr = parts.slice(0, -1).join(' ');
-      // Check if there's already a partial value
-      const lastPart = parts[parts.length - 1];
-      const operators = ['==', '!=', '>', '<', '>=', '<=', 'contains'];
-      if (operators.includes(lastPart)) {
-        // No partial value yet
-        newValue = trimmed + ' ' + suggestion.value + ' ';
+      
+      if (currentToken) {
+        // There's a partial operator typed - remove it and add the full one
+        const withoutPartial = trimmed.slice(0, trimmed.length - currentToken.length).trimEnd();
+        newValue = withoutPartial + ' ' + suggestion.value + ' ';
       } else {
-        // Replace partial value
-        newValue = baseExpr + ' ' + suggestion.value + ' ';
+        // No partial operator, just append
+        newValue = trimmed + ' ' + suggestion.value + ' ';
+      }
+    } else if (type === 'value') {
+      // Keep field and operator, replace/add value
+      const trimmed = filterExpression.trimEnd();
+      
+      if (currentToken) {
+        // There's a partial value typed - remove it and add the full one
+        const withoutPartial = trimmed.slice(0, trimmed.length - currentToken.length).trimEnd();
+        newValue = withoutPartial + ' ' + suggestion.value + ' ';
+      } else {
+        // No partial value, just append
+        newValue = trimmed + ' ' + suggestion.value + ' ';
       }
     } else if (type === 'logical') {
       newValue = filterExpression.trimEnd() + ' ' + suggestion.value + ' ';
