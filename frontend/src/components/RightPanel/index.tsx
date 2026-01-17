@@ -1,4 +1,4 @@
-import type { Sample } from '../../types';
+import type { Sample, SearchField } from '../../types';
 import { NavigationBar } from './NavigationBar';
 import { ChatView } from './ChatView';
 
@@ -8,6 +8,7 @@ interface RightPanelProps {
   totalSamples: number;
   onNavigate: (direction: 'first' | 'prev' | 'next' | 'last') => void;
   searchTerm: string;
+  searchField: SearchField;
   isDarkMode: boolean;
   filePath: string;
   generateLink: (options: { file: string; rollout?: number; message?: number; highlight?: string }) => string;
@@ -22,6 +23,7 @@ export function RightPanel({
   totalSamples,
   onNavigate,
   searchTerm,
+  searchField,
   isDarkMode,
   filePath,
   generateLink,
@@ -45,7 +47,8 @@ export function RightPanel({
         {sample ? (
           <ChatView 
             sample={sample} 
-            searchTerm={searchTerm} 
+            searchTerm={searchTerm}
+            searchField={searchField}
             isDarkMode={isDarkMode}
             filePath={filePath}
             generateLink={generateLink}

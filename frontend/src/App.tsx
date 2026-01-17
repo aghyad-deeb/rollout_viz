@@ -7,7 +7,7 @@ import { useApi } from './hooks/useApi';
 import { useMarkedFiles } from './hooks/useMarkedFiles';
 import { useDarkMode } from './hooks/useDarkMode';
 import { useUrlState } from './hooks/useUrlState';
-import type { Sample } from './types';
+import type { Sample, SearchField } from './types';
 
 function App() {
   const [samples, setSamples] = useState<Sample[]>([]);
@@ -16,6 +16,7 @@ function App() {
   const [filePaths, setFilePaths] = useState<string[]>([]);
   const [isFileBrowserOpen, setIsFileBrowserOpen] = useState(false);
   const [searchTerm, setSearchTerm] = useState<string>('');
+  const [searchField, setSearchField] = useState<SearchField>('chat');
   const [highlightedMessageIndex, setHighlightedMessageIndex] = useState<number | null>(null);
   const [highlightedText, setHighlightedText] = useState<string | null>(null);
   const { loading, error, loadSamples, loadMultipleSamples } = useApi();
@@ -157,6 +158,8 @@ function App() {
             onOpenFileBrowser={() => setIsFileBrowserOpen(true)}
             searchTerm={searchTerm}
             onSearchTermChange={setSearchTerm}
+            searchField={searchField}
+            onSearchFieldChange={setSearchField}
             loading={loading}
             error={error}
             isDarkMode={isDarkMode}
@@ -173,6 +176,7 @@ function App() {
             totalSamples={samples.length}
             onNavigate={handleNavigate}
             searchTerm={searchTerm}
+            searchField={searchField}
             isDarkMode={isDarkMode}
             filePath={getFilePathForSample(selectedSample)}
             generateLink={generateLink}

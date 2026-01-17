@@ -14,6 +14,8 @@ interface LeftPanelProps {
   onOpenFileBrowser: () => void;
   searchTerm: string;
   onSearchTermChange: (term: string) => void;
+  searchField: SearchField;
+  onSearchFieldChange: (field: SearchField) => void;
   loading: boolean;
   error: string | null;
   isDarkMode: boolean;
@@ -30,6 +32,8 @@ export function LeftPanel({
   onOpenFileBrowser,
   searchTerm,
   onSearchTermChange,
+  searchField,
+  onSearchFieldChange,
   loading,
   error,
   isDarkMode,
@@ -38,7 +42,6 @@ export function LeftPanel({
   const [sortColumn, setSortColumn] = useState<SortColumn>('sample_index');
   const [sortOrder, setSortOrder] = useState<SortOrder>('asc');
   const [filterExpression, setFilterExpression] = useState('');
-  const [searchField, setSearchField] = useState<SearchField>('chat');
 
   // Filter and sort samples
   const filteredSamples = useMemo(() => {
@@ -304,7 +307,7 @@ export function LeftPanel({
           searchTerm={searchTerm}
           onSearchChange={onSearchTermChange}
           searchField={searchField}
-          onSearchFieldChange={setSearchField}
+          onSearchFieldChange={onSearchFieldChange}
           filterExpression={filterExpression}
           onFilterChange={setFilterExpression}
           onNavigateNext={handleNavigateNext}

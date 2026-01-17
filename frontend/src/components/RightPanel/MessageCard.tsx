@@ -1,10 +1,11 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
-import type { Message } from '../../types';
+import type { Message, SearchField } from '../../types';
 
 interface MessageCardProps {
   message: Message;
   index: number;
   searchTerm: string; // Global search term
+  searchField: SearchField; // Which field the search is filtering on
   localSearchTerm?: string; // Local search term for this chat
   isCurrentLocalMatch?: boolean; // Is this message the current local search match
   isDarkMode: boolean;
@@ -54,6 +55,7 @@ export function MessageCard({
   message, 
   index, 
   searchTerm,
+  searchField,
   localSearchTerm = '',
   isCurrentLocalMatch = false,
   isDarkMode,
@@ -127,9 +129,47 @@ export function MessageCard({
     return () => document.removeEventListener('mousedown', handleClick);
   }, [selectionPopup.show]);
 
+  // Check if this message should be highlighted based on search field
+  const shouldHighlightInContent = useMemo(() => {
+    // Check if the search field targets this message's role
+    switch (searchField) {
+      case 'chat':
+      case 'all':
+        return true; // Highlight in all messages
+      case 'system':
+        return message.role === 'system';
+      case 'user':
+        return message.role === 'user';
+      case 'assistant':
+        return message.role === 'assistant'; // Note: reasoning is handled separately
+      case 'tool':
+        return message.role === 'tool';
+      case 'reasoning':
+        return false; // Reasoning is handled in the reasoning block, not main content
+      default:
+        // For non-message fields (data_source, reward, etc.), don't highlight in messages
+        return false;
+    }
+  }, [searchField, message.role]);
+
+  // Check if this message's reasoning should be highlighted
+  const shouldHighlightInReasoning = useMemo(() => {
+    if (message.role !== 'assistant') return false;
+    switch (searchField) {
+      case 'chat':
+      case 'all':
+      case 'reasoning':
+        return true;
+      case 'assistant':
+        return false; // When searching assistant specifically, exclude reasoning
+      default:
+        return false;
+    }
+  }, [searchField, message.role]);
+
   // Function to highlight search terms in text
   const highlightSearchAndUrl = useMemo(() => {
-    return (text: string): React.ReactNode => {
+    return (text: string, isReasoning: boolean = false): React.ReactNode => {
       // Priority 1: URL highlight (from shareable links)
       if (highlightedText && text.includes(highlightedText)) {
         const parts: React.ReactNode[] = [];
@@ -194,7 +234,9 @@ export function MessageCard({
       }
 
       // Priority 3: Global search term (from left panel) - yellow highlight
-      if (!searchTerm || searchTerm.trim() === '') {
+      // Only highlight if this message/section matches the search field
+      const shouldHighlight = isReasoning ? shouldHighlightInReasoning : shouldHighlightInContent;
+      if (!searchTerm || searchTerm.trim() === '' || !shouldHighlight) {
         return text;
       }
 
@@ -226,7 +268,7 @@ export function MessageCard({
 
       return parts.length > 0 ? parts : text;
     };
-  }, [searchTerm, localSearchTerm, isCurrentLocalMatch, highlightedText, onClearHighlight]);
+  }, [searchTerm, searchField, shouldHighlightInContent, shouldHighlightInReasoning, localSearchTerm, isCurrentLocalMatch, highlightedText, onClearHighlight]);
 
   // Parse reasoning from assistant messages
   const parseContent = (content: string) => {
@@ -357,14 +399,14 @@ export function MessageCard({
                       reasoning
                     </div>
                     <div className={`px-2 py-1 text-sm ${textPrimary} whitespace-pre-wrap`}>
-                      {highlightSearchAndUrl(reasoning)}
+                      {highlightSearchAndUrl(reasoning, true)}
                     </div>
                   </div>
                 )}
 
                 {/* Main content */}
                 <div className={`mx-3 whitespace-pre-wrap text-sm ${textPrimary}`}>
-                  {highlightSearchAndUrl(mainContent)}
+                  {highlightSearchAndUrl(mainContent, false)}
                 </div>
               </div>
             </div>

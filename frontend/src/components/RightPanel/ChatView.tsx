@@ -1,10 +1,11 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
-import type { Sample } from '../../types';
+import type { Sample, SearchField } from '../../types';
 import { MessageCard } from './MessageCard';
 
 interface ChatViewProps {
   sample: Sample;
   searchTerm: string; // Global search term from left panel
+  searchField: SearchField; // Which field the search is filtering on
   isDarkMode: boolean;
   filePath: string;
   generateLink: (options: { file: string; rollout?: number; message?: number; highlight?: string }) => string;
@@ -20,7 +21,8 @@ interface LocalMatch {
 
 export function ChatView({ 
   sample, 
-  searchTerm, 
+  searchTerm,
+  searchField,
   isDarkMode,
   filePath,
   generateLink,
@@ -251,6 +253,7 @@ export function ChatView({
               message={message} 
               index={index}
               searchTerm={searchTerm}
+              searchField={searchField}
               localSearchTerm={localSearchTerm}
               isCurrentLocalMatch={currentMatchMessageIndex === index}
               isDarkMode={isDarkMode}
