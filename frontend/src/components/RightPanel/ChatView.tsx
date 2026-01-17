@@ -134,25 +134,23 @@ export function ChatView({
       return;
     }
     
-    // Find the first message containing the search term
-    const term = searchTerm.toLowerCase();
-    const firstMatchIndex = sample.messages.findIndex(msg => 
-      msg.content.toLowerCase().includes(term)
-    );
-    
-    if (firstMatchIndex !== -1) {
-      // Small delay to ensure refs are set after render
-      requestAnimationFrame(() => {
-        const messageElement = messageRefs.current.get(firstMatchIndex);
-        if (messageElement) {
-          messageElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        }
-      });
-    }
-    
-    // Remember what we scrolled to
+    // Remember what we scrolled to (do this early to prevent re-runs)
     lastScrolledSampleId.current = sample.id;
     lastScrolledSearchTerm.current = searchTerm;
+    
+    // Wait for the DOM to render with highlighted marks, then scroll to the first one
+    // Use a small timeout to ensure the highlights are rendered
+    const timeoutId = setTimeout(() => {
+      if (messagesContainerRef.current) {
+        // Find the first highlighted search term element
+        const firstHighlight = messagesContainerRef.current.querySelector('.global-search-highlight');
+        if (firstHighlight) {
+          firstHighlight.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      }
+    }, 50);
+    
+    return () => clearTimeout(timeoutId);
   }, [sample.id, sample.messages, searchTerm]);
 
   // Get the message index for the current match (for highlighting)

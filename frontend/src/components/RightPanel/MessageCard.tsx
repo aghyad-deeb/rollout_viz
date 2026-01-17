@@ -211,7 +211,7 @@ export function MessageCard({
         parts.push(
           <mark
             key={matchIndex}
-            className="bg-yellow-300 text-yellow-900 px-0.5 rounded"
+            className="bg-yellow-300 text-yellow-900 px-0.5 rounded global-search-highlight"
           >
             {text.slice(matchIndex, matchIndex + searchTerm.length)}
           </mark>
