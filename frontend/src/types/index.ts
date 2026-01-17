@@ -43,3 +43,5 @@ export type SearchField =
   | 'step' 
   | 'timestamp' 
   | 'experiment_name';
+
+export type ViewMode = 'eval' | 'meta' | 'chat' | 'analysis';

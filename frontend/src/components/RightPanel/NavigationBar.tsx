@@ -1,5 +1,4 @@
-import { useState } from 'react';
-import type { Sample } from '../../types';
+import type { Sample, ViewMode } from '../../types';
 
 interface NavigationBarProps {
   sample: Sample | null;
@@ -9,9 +8,9 @@ interface NavigationBarProps {
   isDarkMode: boolean;
   filePath: string;
   generateLink: (options: { file: string; rollout?: number; message?: number; highlight?: string }) => string;
+  viewMode: ViewMode;
+  onViewModeChange: (mode: ViewMode) => void;
 }
-
-type ViewMode = 'eval' | 'meta' | 'chat';
 
 export function NavigationBar({
   sample,
@@ -21,8 +20,9 @@ export function NavigationBar({
   isDarkMode,
   filePath,
   generateLink,
+  viewMode,
+  onViewModeChange,
 }: NavigationBarProps) {
-  const [viewMode, setViewMode] = useState<ViewMode>('chat');
   void totalSamples; // Mark as intentionally unused for now
 
   const copyLink = () => {
@@ -48,7 +48,7 @@ export function NavigationBar({
                 ? 'bg-sky-600 text-white' 
                 : isDarkMode ? 'bg-gray-800 text-gray-300 hover:bg-gray-700' : 'bg-white text-gray-700 hover:bg-gray-50'
             } rounded-l-md`}
-            onClick={() => setViewMode('eval')}
+            onClick={() => onViewModeChange('eval')}
           >
             <span className="material-symbols-outlined" style={{ fontSize: 17 }}>dashboard</span>
             Eval
@@ -59,7 +59,7 @@ export function NavigationBar({
                 ? 'bg-sky-600 text-white' 
                 : isDarkMode ? 'bg-gray-800 text-gray-300 hover:bg-gray-700' : 'bg-white text-gray-700 hover:bg-gray-50'
             } border-l ${isDarkMode ? 'border-gray-600' : 'border-gray-300'}`}
-            onClick={() => setViewMode('meta')}
+            onClick={() => onViewModeChange('meta')}
           >
             <span className="material-symbols-outlined" style={{ fontSize: 17 }}>candlestick_chart</span>
             Meta
@@ -69,11 +69,22 @@ export function NavigationBar({
               viewMode === 'chat' 
                 ? 'bg-sky-600 text-white' 
                 : isDarkMode ? 'bg-gray-800 text-gray-300 hover:bg-gray-700' : 'bg-white text-gray-700 hover:bg-gray-50'
-            } rounded-r-md border-l ${isDarkMode ? 'border-gray-600' : 'border-gray-300'}`}
-            onClick={() => setViewMode('chat')}
+            } border-l ${isDarkMode ? 'border-gray-600' : 'border-gray-300'}`}
+            onClick={() => onViewModeChange('chat')}
           >
             <span className="material-symbols-outlined" style={{ fontSize: 17 }}>chat</span>
             Chat
+          </button>
+          <button
+            className={`px-3 py-2 text-sm font-medium flex items-center gap-1.5 ${
+              viewMode === 'analysis' 
+                ? 'bg-sky-600 text-white' 
+                : isDarkMode ? 'bg-gray-800 text-gray-300 hover:bg-gray-700' : 'bg-white text-gray-700 hover:bg-gray-50'
+            } rounded-r-md border-l ${isDarkMode ? 'border-gray-600' : 'border-gray-300'}`}
+            onClick={() => onViewModeChange('analysis')}
+          >
+            <span className="material-symbols-outlined" style={{ fontSize: 17 }}>analytics</span>
+            Analysis
           </button>
         </div>
       </div>

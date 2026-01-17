@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback } from 'react';
+import { useState, useMemo, useCallback, useEffect } from 'react';
 import type { Sample, SortColumn, SortOrder, SearchField } from '../../types';
 import { SampleTable } from './SampleTable';
 import { FilterBar } from './FilterBar';
@@ -20,6 +20,7 @@ interface LeftPanelProps {
   error: string | null;
   isDarkMode: boolean;
   onToggleDarkMode: () => void;
+  onFilteredSamplesChange?: (samples: Sample[]) => void;
 }
 
 export function LeftPanel({
@@ -38,6 +39,7 @@ export function LeftPanel({
   error,
   isDarkMode,
   onToggleDarkMode,
+  onFilteredSamplesChange,
 }: LeftPanelProps) {
   const [sortColumn, setSortColumn] = useState<SortColumn>('sample_index');
   const [sortOrder, setSortOrder] = useState<SortOrder>('asc');
@@ -270,6 +272,11 @@ export function LeftPanel({
       setSortOrder('asc');
     }
   };
+
+  // Notify parent of filtered samples changes
+  useEffect(() => {
+    onFilteredSamplesChange?.(filteredSamples);
+  }, [filteredSamples, onFilteredSamplesChange]);
 
   // Calculate current match index based on selected sample
   const currentMatchIndex = useMemo(() => {

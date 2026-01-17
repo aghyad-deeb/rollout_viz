@@ -11,6 +11,7 @@ import type { Sample, SearchField } from './types';
 
 function App() {
   const [samples, setSamples] = useState<Sample[]>([]);
+  const [filteredSamples, setFilteredSamples] = useState<Sample[]>([]);
   const [selectedSampleId, setSelectedSampleId] = useState<number | null>(null);
   const [experimentName, setExperimentName] = useState<string>('');
   const [filePaths, setFilePaths] = useState<string[]>([]);
@@ -164,6 +165,7 @@ function App() {
             error={error}
             isDarkMode={isDarkMode}
             onToggleDarkMode={toggleDarkMode}
+            onFilteredSamplesChange={setFilteredSamples}
           />
         </Panel>
         
@@ -172,6 +174,7 @@ function App() {
         <Panel id="right" defaultSize="65%" minSize="10%">
           <RightPanel
             sample={selectedSample}
+            filteredSamples={filteredSamples}
             experimentName={experimentName}
             totalSamples={samples.length}
             onNavigate={handleNavigate}

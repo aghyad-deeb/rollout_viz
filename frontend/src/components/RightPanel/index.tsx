@@ -1,9 +1,12 @@
-import type { Sample, SearchField } from '../../types';
+import { useState } from 'react';
+import type { Sample, SearchField, ViewMode } from '../../types';
 import { NavigationBar } from './NavigationBar';
 import { ChatView } from './ChatView';
+import { AnalysisView } from './AnalysisView';
 
 interface RightPanelProps {
   sample: Sample | null;
+  filteredSamples: Sample[];
   experimentName: string;
   totalSamples: number;
   onNavigate: (direction: 'first' | 'prev' | 'next' | 'last') => void;
@@ -19,6 +22,7 @@ interface RightPanelProps {
 
 export function RightPanel({
   sample,
+  filteredSamples,
   experimentName,
   totalSamples,
   onNavigate,
@@ -31,6 +35,54 @@ export function RightPanel({
   highlightedText,
   onClearHighlight,
 }: RightPanelProps) {
+  const [viewMode, setViewMode] = useState<ViewMode>('chat');
+
+  const renderContent = () => {
+    if (viewMode === 'analysis') {
+      return <AnalysisView samples={filteredSamples} isDarkMode={isDarkMode} />;
+    }
+
+    // Chat view (default) and placeholders for eval/meta
+    if (viewMode === 'eval' || viewMode === 'meta') {
+      return (
+        <div className={`h-full flex items-center justify-center ${isDarkMode ? 'text-gray-500' : 'text-gray-400'}`}>
+          <div className="text-center">
+            <span className="material-symbols-outlined" style={{ fontSize: 48 }}>
+              {viewMode === 'eval' ? 'dashboard' : 'candlestick_chart'}
+            </span>
+            <p className="mt-2">{viewMode === 'eval' ? 'Eval' : 'Meta'} view coming soon</p>
+          </div>
+        </div>
+      );
+    }
+
+    // Chat view
+    if (sample) {
+      return (
+        <ChatView 
+          sample={sample} 
+          searchTerm={searchTerm}
+          searchField={searchField}
+          isDarkMode={isDarkMode}
+          filePath={filePath}
+          generateLink={generateLink}
+          highlightedMessageIndex={highlightedMessageIndex}
+          highlightedText={highlightedText}
+          onClearHighlight={onClearHighlight}
+        />
+      );
+    }
+
+    return (
+      <div className={`h-full flex items-center justify-center ${isDarkMode ? 'text-gray-500' : 'text-gray-400'}`}>
+        <div className="text-center">
+          <span className="material-symbols-outlined" style={{ fontSize: 48 }}>chat</span>
+          <p className="mt-2">Select a sample to view the conversation</p>
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div className={`h-full flex flex-col ${isDarkMode ? 'bg-[#1a1a2e]' : 'bg-white'}`}>
       <NavigationBar
@@ -41,29 +93,12 @@ export function RightPanel({
         isDarkMode={isDarkMode}
         filePath={filePath}
         generateLink={generateLink}
+        viewMode={viewMode}
+        onViewModeChange={setViewMode}
       />
       
       <div className="flex-1 overflow-hidden">
-        {sample ? (
-          <ChatView 
-            sample={sample} 
-            searchTerm={searchTerm}
-            searchField={searchField}
-            isDarkMode={isDarkMode}
-            filePath={filePath}
-            generateLink={generateLink}
-            highlightedMessageIndex={highlightedMessageIndex}
-            highlightedText={highlightedText}
-            onClearHighlight={onClearHighlight}
-          />
-        ) : (
-          <div className={`h-full flex items-center justify-center ${isDarkMode ? 'text-gray-500' : 'text-gray-400'}`}>
-            <div className="text-center">
-              <span className="material-symbols-outlined" style={{ fontSize: 48 }}>chat</span>
-              <p className="mt-2">Select a sample to view the conversation</p>
-            </div>
-          </div>
-        )}
+        {renderContent()}
       </div>
     </div>
   );
