@@ -33,6 +33,8 @@ export function ChatView({
   const [isSearchOpen, setIsSearchOpen] = useState(false);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const messageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+  const lastScrolledSampleId = useRef<number | null>(null);
+  const lastScrolledSearchTerm = useRef<string>('');
 
   // Find all matches in the current chat
   const localMatches = useMemo((): LocalMatch[] => {
@@ -115,6 +117,43 @@ export function ChatView({
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
+
+  // Auto-scroll to first global search match when sample changes or search term changes
+  useEffect(() => {
+    // Skip if no search term
+    if (!searchTerm.trim()) {
+      lastScrolledSearchTerm.current = '';
+      return;
+    }
+    
+    // Skip if we already scrolled for this sample+searchTerm combination
+    if (
+      lastScrolledSampleId.current === sample.id &&
+      lastScrolledSearchTerm.current === searchTerm
+    ) {
+      return;
+    }
+    
+    // Find the first message containing the search term
+    const term = searchTerm.toLowerCase();
+    const firstMatchIndex = sample.messages.findIndex(msg => 
+      msg.content.toLowerCase().includes(term)
+    );
+    
+    if (firstMatchIndex !== -1) {
+      // Small delay to ensure refs are set after render
+      requestAnimationFrame(() => {
+        const messageElement = messageRefs.current.get(firstMatchIndex);
+        if (messageElement) {
+          messageElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      });
+    }
+    
+    // Remember what we scrolled to
+    lastScrolledSampleId.current = sample.id;
+    lastScrolledSearchTerm.current = searchTerm;
+  }, [sample.id, sample.messages, searchTerm]);
 
   // Get the message index for the current match (for highlighting)
   const currentMatchMessageIndex = localMatches.length > 0 ? localMatches[currentMatchIndex]?.messageIndex : null;
