@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useMemo } from 'react';
-import type { SearchField, Sample } from '../../types';
+import type { SearchField, Sample, SearchCondition, SearchLogic, SearchOperator } from '../../types';
 
 const SEARCH_FIELD_OPTIONS: { value: SearchField; label: string }[] = [
   { value: 'chat', label: 'All messages' },
@@ -15,6 +15,14 @@ const SEARCH_FIELD_OPTIONS: { value: SearchField; label: string }[] = [
   { value: 'timestamp', label: 'Timestamp' },
   { value: 'experiment_name', label: 'Experiment' },
 ];
+
+const SEARCH_OPERATORS: { value: SearchOperator; label: string }[] = [
+  { value: 'contains', label: 'contains' },
+  { value: 'not_contains', label: 'doesn\'t contain' },
+];
+
+// Helper to generate unique IDs
+const generateId = () => Math.random().toString(36).substring(2, 9);
 
 // Field definitions with types
 const FILTER_FIELDS: { name: string; type: 'number' | 'string' | 'boolean' }[] = [
@@ -64,31 +72,37 @@ interface Suggestion {
 }
 
 interface FilterBarProps {
-  searchTerm: string;
-  onSearchChange: (value: string) => void;
-  searchField: SearchField;
-  onSearchFieldChange: (field: SearchField) => void;
+  searchConditions: SearchCondition[];
+  onSearchConditionsChange: (conditions: SearchCondition[]) => void;
+  searchLogic: SearchLogic;
+  onSearchLogicChange: (logic: SearchLogic) => void;
   filterExpression: string;
   onFilterChange: (value: string) => void;
-  onNavigateNext: () => void;
-  onNavigatePrev: () => void;
+  onNavigateNextOccurrence: () => void; // Enter: next occurrence in sample, or next sample
+  onNavigateNextSample: () => void; // Shift+Enter: next sample
+  onNavigatePrevSample: () => void; // Arrow left: previous sample
   matchCount: number;
   currentMatchIndex: number;
+  matchesInCurrentSample: number;
+  currentOccurrenceIndex: number;
   isDarkMode: boolean;
-  samples: Sample[]; // Added to extract unique values
+  samples: Sample[];
 }
 
 export function FilterBar({
-  searchTerm,
-  onSearchChange,
-  searchField,
-  onSearchFieldChange,
+  searchConditions,
+  onSearchConditionsChange,
+  searchLogic,
+  onSearchLogicChange,
   filterExpression,
   onFilterChange,
-  onNavigateNext,
-  onNavigatePrev,
+  onNavigateNextOccurrence,
+  onNavigateNextSample,
+  onNavigatePrevSample,
   matchCount,
   currentMatchIndex,
+  matchesInCurrentSample,
+  currentOccurrenceIndex,
   isDarkMode,
   samples,
 }: FilterBarProps) {
@@ -277,17 +291,6 @@ export function FilterBar({
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      if (e.shiftKey) {
-        onNavigatePrev();
-      } else {
-        onNavigateNext();
-      }
-    }
-  };
-
   const handleFilterKeyDown = (e: React.KeyboardEvent) => {
     if (!showFilterSuggestions || suggestions.length === 0) {
       if (e.key === 'Escape') {
@@ -381,6 +384,39 @@ export function FilterBar({
   };
 
   const hasMatches = matchCount > 0;
+
+  // Search condition helpers
+  const updateCondition = (id: string, updates: Partial<SearchCondition>) => {
+    onSearchConditionsChange(
+      searchConditions.map(c => c.id === id ? { ...c, ...updates } : c)
+    );
+  };
+
+  const addCondition = () => {
+    onSearchConditionsChange([
+      ...searchConditions,
+      { id: generateId(), field: 'chat', operator: 'contains', term: '' }
+    ]);
+  };
+
+  const removeCondition = (id: string) => {
+    if (searchConditions.length > 1) {
+      onSearchConditionsChange(searchConditions.filter(c => c.id !== id));
+    }
+  };
+
+  const handleSearchKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (e.shiftKey) {
+        // Shift+Enter: go to next sample directly
+        onNavigateNextSample();
+      } else {
+        // Enter: go to next occurrence (within sample first, then next sample)
+        onNavigateNextOccurrence();
+      }
+    }
+  };
 
   const getSuggestionTypeLabel = (type: SuggestionType): string => {
     switch (type) {
@@ -488,51 +524,118 @@ export function FilterBar({
         </button>
       </div>
 
-      {/* Search in conversations */}
-      <div className="h-7 flex items-center gap-1">
-        <span className={`material-symbols-outlined ${isDarkMode ? 'text-gray-500' : 'text-gray-500'}`} style={{ fontSize: 17 }}>search</span>
-        <select
-          value={searchField}
-          onChange={(e) => onSearchFieldChange(e.target.value as SearchField)}
-          className={`px-1.5 py-0.5 text-sm border rounded-md focus:outline-none focus:ring focus:ring-blue-500 focus:border-blue-500 ${isDarkMode ? 'bg-gray-800 border-gray-600 text-gray-200' : 'bg-white border-gray-300'}`}
-          title="Select search field"
+      {/* Search conditions */}
+      <div className="space-y-1.5">
+        {searchConditions.map((condition, index) => (
+          <div key={condition.id} className="flex items-center gap-1">
+            {/* Logic indicator/selector (shown between conditions) */}
+            {index > 0 && (
+              <button
+                onClick={() => onSearchLogicChange(searchLogic === 'AND' ? 'OR' : 'AND')}
+                className={`px-1.5 py-0.5 text-xs font-medium rounded ${
+                  searchLogic === 'AND'
+                    ? isDarkMode ? 'bg-blue-900 text-blue-300' : 'bg-blue-100 text-blue-700'
+                    : isDarkMode ? 'bg-orange-900 text-orange-300' : 'bg-orange-100 text-orange-700'
+                }`}
+                title="Click to toggle AND/OR"
+              >
+                {searchLogic}
+              </button>
+            )}
+            {index === 0 && (
+              <span className={`material-symbols-outlined ${isDarkMode ? 'text-gray-500' : 'text-gray-500'}`} style={{ fontSize: 17 }}>search</span>
+            )}
+            
+            {/* Field selector */}
+            <select
+              value={condition.field}
+              onChange={(e) => updateCondition(condition.id, { field: e.target.value as SearchField })}
+              className={`px-1.5 py-0.5 text-sm border rounded-md focus:outline-none focus:ring focus:ring-blue-500 focus:border-blue-500 ${isDarkMode ? 'bg-gray-800 border-gray-600 text-gray-200' : 'bg-white border-gray-300'}`}
+              title="Select search field"
+            >
+              {SEARCH_FIELD_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+            
+            {/* Operator selector */}
+            <select
+              value={condition.operator}
+              onChange={(e) => updateCondition(condition.id, { operator: e.target.value as SearchOperator })}
+              className={`px-1.5 py-0.5 text-sm border rounded-md focus:outline-none focus:ring focus:ring-blue-500 focus:border-blue-500 ${isDarkMode ? 'bg-gray-800 border-gray-600 text-gray-200' : 'bg-white border-gray-300'}`}
+              title="Select operator"
+            >
+              {SEARCH_OPERATORS.map((op) => (
+                <option key={op.value} value={op.value}>
+                  {op.label}
+                </option>
+              ))}
+            </select>
+            
+            {/* Search term input */}
+            <div className="flex-1">
+              <input
+                type="text"
+                placeholder={getSearchPlaceholder(condition.field)}
+                value={condition.term}
+                onChange={(e) => updateCondition(condition.id, { term: e.target.value })}
+                onKeyDown={handleSearchKeyDown}
+                className={`w-full px-1.5 py-0.5 text-sm border rounded-md focus:outline-none focus:ring focus:ring-blue-500 focus:border-blue-500 ${isDarkMode ? 'bg-gray-800 border-gray-600 text-gray-200 placeholder-gray-500' : 'border-gray-300'}`}
+              />
+            </div>
+            
+            {/* Remove button (only if more than one condition) */}
+            {searchConditions.length > 1 && (
+              <button
+                onClick={() => removeCondition(condition.id)}
+                className={`flex items-center justify-center w-6 h-6 rounded-md ${isDarkMode ? 'text-gray-400 hover:text-red-400 hover:bg-gray-700' : 'text-gray-400 hover:text-red-500 hover:bg-gray-100'}`}
+                title="Remove condition"
+              >
+                <span className="material-symbols-outlined" style={{ fontSize: 16 }}>close</span>
+              </button>
+            )}
+            
+            {/* Navigation and count (only on first row) */}
+            {index === 0 && (
+              <>
+                {hasMatches && (
+                  <span className={`text-xs whitespace-nowrap ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>
+                    {matchesInCurrentSample > 1 
+                      ? `${currentOccurrenceIndex + 1}/${matchesInCurrentSample} in chat ${currentMatchIndex + 1}/${matchCount}`
+                      : `${currentMatchIndex + 1}/${matchCount}`
+                    }
+                  </span>
+                )}
+                <button 
+                  className={`flex items-center justify-center w-6 h-6 rounded-md disabled:opacity-50 disabled:cursor-not-allowed ${isDarkMode ? 'text-gray-300 bg-gray-700 hover:bg-gray-600' : 'text-gray-600 bg-gray-200 hover:bg-gray-300'}`}
+                  title="Previous chat"
+                  disabled={!hasMatches}
+                  onClick={onNavigatePrevSample}
+                >
+                  <span className="material-symbols-outlined" style={{ fontSize: 16 }}>arrow_left</span>
+                </button>
+                <button 
+                  className={`flex items-center justify-center w-6 h-6 rounded-md disabled:opacity-50 disabled:cursor-not-allowed ${isDarkMode ? 'text-gray-300 bg-gray-700 hover:bg-gray-600' : 'text-gray-600 bg-gray-200 hover:bg-gray-300'}`}
+                  title="Next occurrence (Enter) / Next chat (Shift+Enter)"
+                  disabled={!hasMatches}
+                  onClick={onNavigateNextOccurrence}
+                >
+                  <span className="material-symbols-outlined" style={{ fontSize: 16 }}>arrow_right</span>
+                </button>
+              </>
+            )}
+          </div>
+        ))}
+        
+        {/* Add condition button */}
+        <button
+          onClick={addCondition}
+          className={`flex items-center gap-1 px-2 py-0.5 text-xs rounded-md ${isDarkMode ? 'text-gray-400 hover:text-gray-200 hover:bg-gray-700' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-100'}`}
         >
-          {SEARCH_FIELD_OPTIONS.map((option) => (
-            <option key={option.value} value={option.value}>
-              {option.label}
-            </option>
-          ))}
-        </select>
-        <div className="flex-1">
-          <input
-            type="text"
-            placeholder={getSearchPlaceholder(searchField)}
-            value={searchTerm}
-            onChange={(e) => onSearchChange(e.target.value)}
-            onKeyDown={handleKeyDown}
-            className={`w-full px-1.5 py-0.5 text-sm border rounded-md focus:outline-none focus:ring focus:ring-blue-500 focus:border-blue-500 ${isDarkMode ? 'bg-gray-800 border-gray-600 text-gray-200 placeholder-gray-500' : 'border-gray-300'}`}
-          />
-        </div>
-        {hasMatches && (
-          <span className={`text-xs whitespace-nowrap ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>
-            {currentMatchIndex + 1}/{matchCount}
-          </span>
-        )}
-        <button 
-          className={`flex items-center justify-center w-7 h-7 rounded-md disabled:opacity-50 disabled:cursor-not-allowed ${isDarkMode ? 'text-gray-300 bg-gray-700 hover:bg-gray-600' : 'text-gray-600 bg-gray-200 hover:bg-gray-300'}`}
-          title="Previous match (Shift+Enter)"
-          disabled={!hasMatches}
-          onClick={onNavigatePrev}
-        >
-          <span className="material-symbols-outlined" style={{ fontSize: 17 }}>arrow_left</span>
-        </button>
-        <button 
-          className={`flex items-center justify-center w-7 h-7 rounded-md disabled:opacity-50 disabled:cursor-not-allowed ${isDarkMode ? 'text-gray-300 bg-gray-700 hover:bg-gray-600' : 'text-gray-600 bg-gray-200 hover:bg-gray-300'}`}
-          title="Next match (Enter)"
-          disabled={!hasMatches}
-          onClick={onNavigateNext}
-        >
-          <span className="material-symbols-outlined" style={{ fontSize: 17 }}>arrow_right</span>
+          <span className="material-symbols-outlined" style={{ fontSize: 14 }}>add</span>
+          Add condition
         </button>
       </div>
     </div>

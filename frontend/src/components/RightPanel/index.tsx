@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import type { Sample, SearchField, ViewMode } from '../../types';
+import type { Sample, ViewMode, SearchCondition } from '../../types';
 import { NavigationBar } from './NavigationBar';
 import { ChatView } from './ChatView';
 import { AnalysisView } from './AnalysisView';
@@ -10,8 +10,8 @@ interface RightPanelProps {
   experimentName: string;
   totalSamples: number;
   onNavigate: (direction: 'first' | 'prev' | 'next' | 'last') => void;
-  searchTerm: string;
-  searchField: SearchField;
+  searchConditions: SearchCondition[];
+  currentOccurrenceIndex: number;
   isDarkMode: boolean;
   filePath: string;
   generateLink: (options: { file: string; rollout?: number; message?: number; highlight?: string }) => string;
@@ -26,8 +26,8 @@ export function RightPanel({
   experimentName,
   totalSamples,
   onNavigate,
-  searchTerm,
-  searchField,
+  searchConditions,
+  currentOccurrenceIndex,
   isDarkMode,
   filePath,
   generateLink,
@@ -61,8 +61,8 @@ export function RightPanel({
       return (
         <ChatView 
           sample={sample} 
-          searchTerm={searchTerm}
-          searchField={searchField}
+          searchConditions={searchConditions}
+          currentOccurrenceIndex={currentOccurrenceIndex}
           isDarkMode={isDarkMode}
           filePath={filePath}
           generateLink={generateLink}

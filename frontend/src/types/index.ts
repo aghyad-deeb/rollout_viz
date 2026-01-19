@@ -45,3 +45,14 @@ export type SearchField =
   | 'experiment_name';
 
 export type ViewMode = 'eval' | 'meta' | 'chat' | 'analysis';
+
+export type SearchOperator = 'contains' | 'not_contains';
+
+export interface SearchCondition {
+  id: string;
+  field: SearchField;
+  operator: SearchOperator;
+  term: string;
+}
+
+export type SearchLogic = 'AND' | 'OR';

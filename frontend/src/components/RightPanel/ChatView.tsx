@@ -1,11 +1,11 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
-import type { Sample, SearchField } from '../../types';
+import type { Sample, SearchCondition } from '../../types';
 import { MessageCard } from './MessageCard';
 
 interface ChatViewProps {
   sample: Sample;
-  searchTerm: string; // Global search term from left panel
-  searchField: SearchField; // Which field the search is filtering on
+  searchConditions: SearchCondition[]; // Global search conditions from left panel
+  currentOccurrenceIndex: number; // Which occurrence to scroll to (0-indexed)
   isDarkMode: boolean;
   filePath: string;
   generateLink: (options: { file: string; rollout?: number; message?: number; highlight?: string }) => string;
@@ -21,8 +21,8 @@ interface LocalMatch {
 
 export function ChatView({ 
   sample, 
-  searchTerm,
-  searchField,
+  searchConditions,
+  currentOccurrenceIndex,
   isDarkMode,
   filePath,
   generateLink,
@@ -30,6 +30,16 @@ export function ChatView({
   highlightedText,
   onClearHighlight,
 }: ChatViewProps) {
+  // Get active search terms for highlighting (only 'contains' conditions with non-empty terms)
+  const activeSearchTerms = useMemo(() => 
+    searchConditions
+      .filter(c => c.operator === 'contains' && c.term.trim())
+      .map(c => c.term.trim()),
+    [searchConditions]
+  );
+  
+  // Get the first active condition for scroll targeting
+  const primarySearchTerm = activeSearchTerms[0] || '';
   const [localSearchTerm, setLocalSearchTerm] = useState('');
   const [currentMatchIndex, setCurrentMatchIndex] = useState(0);
   const [isSearchOpen, setIsSearchOpen] = useState(false);
@@ -120,40 +130,49 @@ export function ChatView({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
 
-  // Auto-scroll to first global search match when sample changes or search term changes
+  // Track which occurrence we last scrolled to
+  const lastScrolledOccurrenceIndex = useRef<number>(-1);
+
+  // Auto-scroll to the Nth global search match
   useEffect(() => {
     // Skip if no search term
-    if (!searchTerm.trim()) {
+    if (!primarySearchTerm) {
       lastScrolledSearchTerm.current = '';
+      lastScrolledOccurrenceIndex.current = -1;
       return;
     }
     
-    // Skip if we already scrolled for this sample+searchTerm combination
+    // Skip if we already scrolled to this exact occurrence for this sample
     if (
       lastScrolledSampleId.current === sample.id &&
-      lastScrolledSearchTerm.current === searchTerm
+      lastScrolledSearchTerm.current === primarySearchTerm &&
+      lastScrolledOccurrenceIndex.current === currentOccurrenceIndex
     ) {
       return;
     }
     
     // Remember what we scrolled to (do this early to prevent re-runs)
     lastScrolledSampleId.current = sample.id;
-    lastScrolledSearchTerm.current = searchTerm;
+    lastScrolledSearchTerm.current = primarySearchTerm;
+    lastScrolledOccurrenceIndex.current = currentOccurrenceIndex;
     
-    // Wait for the DOM to render with highlighted marks, then scroll to the first one
-    // Use a small timeout to ensure the highlights are rendered
+    // Wait for the DOM to render with highlighted marks, then scroll to the Nth one
     const timeoutId = setTimeout(() => {
       if (messagesContainerRef.current) {
-        // Find the first highlighted search term element
-        const firstHighlight = messagesContainerRef.current.querySelector('.global-search-highlight');
-        if (firstHighlight) {
-          firstHighlight.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        // Find all highlighted search term elements
+        const highlights = messagesContainerRef.current.querySelectorAll('.global-search-highlight');
+        const targetHighlight = highlights[currentOccurrenceIndex];
+        if (targetHighlight) {
+          targetHighlight.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        } else if (highlights.length > 0) {
+          // Fallback to first if index is out of range
+          highlights[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
         }
       }
     }, 50);
     
     return () => clearTimeout(timeoutId);
-  }, [sample.id, sample.messages, searchTerm]);
+  }, [sample.id, sample.messages, primarySearchTerm, currentOccurrenceIndex]);
 
   // Get the message index for the current match (for highlighting)
   const currentMatchMessageIndex = localMatches.length > 0 ? localMatches[currentMatchIndex]?.messageIndex : null;
@@ -252,8 +271,7 @@ export function ChatView({
             <MessageCard 
               message={message} 
               index={index}
-              searchTerm={searchTerm}
-              searchField={searchField}
+              searchConditions={searchConditions}
               localSearchTerm={localSearchTerm}
               isCurrentLocalMatch={currentMatchMessageIndex === index}
               isDarkMode={isDarkMode}

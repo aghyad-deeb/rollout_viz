@@ -1,5 +1,5 @@
 import { useState, useMemo, useCallback, useEffect } from 'react';
-import type { Sample, SortColumn, SortOrder, SearchField } from '../../types';
+import type { Sample, SortColumn, SortOrder, SearchCondition, SearchLogic } from '../../types';
 import { SampleTable } from './SampleTable';
 import { FilterBar } from './FilterBar';
 import { MetadataHeader } from './MetadataHeader';
@@ -12,15 +12,16 @@ interface LeftPanelProps {
   filePaths: string[];
   onFilePathsChange: (paths: string[]) => void;
   onOpenFileBrowser: () => void;
-  searchTerm: string;
-  onSearchTermChange: (term: string) => void;
-  searchField: SearchField;
-  onSearchFieldChange: (field: SearchField) => void;
+  searchConditions: SearchCondition[];
+  onSearchConditionsChange: (conditions: SearchCondition[]) => void;
+  searchLogic: SearchLogic;
+  onSearchLogicChange: (logic: SearchLogic) => void;
   loading: boolean;
   error: string | null;
   isDarkMode: boolean;
   onToggleDarkMode: () => void;
   onFilteredSamplesChange?: (samples: Sample[]) => void;
+  onCurrentOccurrenceIndexChange?: (index: number) => void;
 }
 
 export function LeftPanel({
@@ -31,19 +32,21 @@ export function LeftPanel({
   filePaths,
   onFilePathsChange,
   onOpenFileBrowser,
-  searchTerm,
-  onSearchTermChange,
-  searchField,
-  onSearchFieldChange,
+  searchConditions,
+  onSearchConditionsChange,
+  searchLogic,
+  onSearchLogicChange,
   loading,
   error,
   isDarkMode,
   onToggleDarkMode,
   onFilteredSamplesChange,
+  onCurrentOccurrenceIndexChange,
 }: LeftPanelProps) {
   const [sortColumn, setSortColumn] = useState<SortColumn>('sample_index');
   const [sortOrder, setSortOrder] = useState<SortOrder>('asc');
   const [filterExpression, setFilterExpression] = useState('');
+  const [currentOccurrenceIndex, setCurrentOccurrenceIndex] = useState(0); // Which occurrence within current sample
 
   // Filter and sort samples
   const filteredSamples = useMemo(() => {
@@ -56,86 +59,107 @@ export function LeftPanel({
       return thinkMatch?.[1] || reasoningMatch?.[1] || null;
     };
 
-    // Apply search filter based on selected field
-    if (searchTerm) {
-      const term = searchTerm.toLowerCase();
-      result = result.filter(sample => {
-        const attrs = sample.attributes;
+    // Helper to check if a sample matches a single search condition
+    const matchesCondition = (sample: Sample, condition: SearchCondition): boolean => {
+      if (!condition.term.trim()) return true; // Empty term matches all
+      
+      const term = condition.term.toLowerCase();
+      const attrs = sample.attributes;
+      const field = condition.field;
+      
+      let matches = false;
+      
+      switch (field) {
+        case 'chat':
+          matches = sample.messages.some(msg => 
+            msg.content.toLowerCase().includes(term)
+          );
+          break;
         
-        switch (searchField) {
-          case 'chat':
-            // Search in all messages
-            return sample.messages.some(msg => 
-              msg.content.toLowerCase().includes(term)
-            );
-          
-          case 'system':
-            // Search only in system messages
-            return sample.messages.some(msg => 
-              msg.role === 'system' && msg.content.toLowerCase().includes(term)
-            );
-          
-          case 'user':
-            // Search only in user messages
-            return sample.messages.some(msg => 
-              msg.role === 'user' && msg.content.toLowerCase().includes(term)
-            );
-          
-          case 'assistant':
-            // Search only in assistant messages (excluding reasoning)
-            return sample.messages.some(msg => {
-              if (msg.role !== 'assistant') return false;
-              // Remove reasoning blocks from content before searching
-              const contentWithoutReasoning = msg.content
-                .replace(/<think>[\s\S]*?<\/think>/g, '')
-                .replace(/<reasoning>[\s\S]*?<\/reasoning>/g, '');
-              return contentWithoutReasoning.toLowerCase().includes(term);
-            });
-          
-          case 'tool':
-            // Search only in tool messages
-            return sample.messages.some(msg => 
-              msg.role === 'tool' && msg.content.toLowerCase().includes(term)
-            );
-          
-          case 'reasoning':
-            // Search only in reasoning/thinking blocks within assistant messages
-            return sample.messages.some(msg => {
-              if (msg.role !== 'assistant') return false;
-              const reasoning = getReasoningContent(msg.content);
-              return reasoning ? reasoning.toLowerCase().includes(term) : false;
-            });
-          
-          case 'data_source':
-            return attrs.data_source.toLowerCase().includes(term);
-          
-          case 'reward':
-            return String(attrs.reward).includes(term);
-          
-          case 'step':
-            return String(attrs.step).includes(term);
-          
-          case 'timestamp':
-            return sample.timestamp.toLowerCase().includes(term);
-          
-          case 'experiment_name':
-            return attrs.experiment_name.toLowerCase().includes(term);
-          
-          case 'all':
-          default:
-            // Search across all fields
-            const inMessages = sample.messages.some(msg => 
-              msg.content.toLowerCase().includes(term)
-            );
-            const inAttributes = 
-              attrs.data_source.toLowerCase().includes(term) ||
-              attrs.experiment_name.toLowerCase().includes(term) ||
-              String(attrs.reward).includes(term) ||
-              String(attrs.step).includes(term) ||
-              String(attrs.rollout_n).includes(term) ||
-              String(attrs.sample_index).includes(term);
-            const inTimestamp = sample.timestamp.toLowerCase().includes(term);
-            return inMessages || inAttributes || inTimestamp;
+        case 'system':
+          matches = sample.messages.some(msg => 
+            msg.role === 'system' && msg.content.toLowerCase().includes(term)
+          );
+          break;
+        
+        case 'user':
+          matches = sample.messages.some(msg => 
+            msg.role === 'user' && msg.content.toLowerCase().includes(term)
+          );
+          break;
+        
+        case 'assistant':
+          matches = sample.messages.some(msg => {
+            if (msg.role !== 'assistant') return false;
+            const contentWithoutReasoning = msg.content
+              .replace(/<think>[\s\S]*?<\/think>/g, '')
+              .replace(/<reasoning>[\s\S]*?<\/reasoning>/g, '');
+            return contentWithoutReasoning.toLowerCase().includes(term);
+          });
+          break;
+        
+        case 'tool':
+          matches = sample.messages.some(msg => 
+            msg.role === 'tool' && msg.content.toLowerCase().includes(term)
+          );
+          break;
+        
+        case 'reasoning':
+          matches = sample.messages.some(msg => {
+            if (msg.role !== 'assistant') return false;
+            const reasoning = getReasoningContent(msg.content);
+            return reasoning ? reasoning.toLowerCase().includes(term) : false;
+          });
+          break;
+        
+        case 'data_source':
+          matches = attrs.data_source.toLowerCase().includes(term);
+          break;
+        
+        case 'reward':
+          matches = String(attrs.reward).includes(term);
+          break;
+        
+        case 'step':
+          matches = String(attrs.step).includes(term);
+          break;
+        
+        case 'timestamp':
+          matches = sample.timestamp.toLowerCase().includes(term);
+          break;
+        
+        case 'experiment_name':
+          matches = attrs.experiment_name.toLowerCase().includes(term);
+          break;
+        
+        case 'all':
+        default:
+          const inMessages = sample.messages.some(msg => 
+            msg.content.toLowerCase().includes(term)
+          );
+          const inAttributes = 
+            attrs.data_source.toLowerCase().includes(term) ||
+            attrs.experiment_name.toLowerCase().includes(term) ||
+            String(attrs.reward).includes(term) ||
+            String(attrs.step).includes(term) ||
+            String(attrs.rollout_n).includes(term) ||
+            String(attrs.sample_index).includes(term);
+          const inTimestamp = sample.timestamp.toLowerCase().includes(term);
+          matches = inMessages || inAttributes || inTimestamp;
+      }
+      
+      // Apply operator (contains or not_contains)
+      return condition.operator === 'contains' ? matches : !matches;
+    };
+
+    // Apply search conditions
+    const activeConditions = searchConditions.filter(c => c.term.trim());
+    if (activeConditions.length > 0) {
+      result = result.filter(sample => {
+        if (searchLogic === 'AND') {
+          return activeConditions.every(condition => matchesCondition(sample, condition));
+        } else {
+          return activeConditions.some(condition => matchesCondition(sample, condition));
         }
       });
     }
@@ -262,7 +286,7 @@ export function LeftPanel({
     });
 
     return result;
-  }, [samples, searchTerm, searchField, filterExpression, sortColumn, sortOrder]);
+  }, [samples, searchConditions, searchLogic, filterExpression, sortColumn, sortOrder]);
 
   const handleSort = (column: SortColumn) => {
     if (sortColumn === column) {
@@ -278,31 +302,93 @@ export function LeftPanel({
     onFilteredSamplesChange?.(filteredSamples);
   }, [filteredSamples, onFilteredSamplesChange]);
 
+  // Notify parent of current occurrence index changes
+  useEffect(() => {
+    onCurrentOccurrenceIndexChange?.(currentOccurrenceIndex);
+  }, [currentOccurrenceIndex, onCurrentOccurrenceIndexChange]);
+
   // Calculate current match index based on selected sample
   const currentMatchIndex = useMemo(() => {
     if (!selectedSampleId || filteredSamples.length === 0) return -1;
     return filteredSamples.findIndex(s => s.id === selectedSampleId);
   }, [selectedSampleId, filteredSamples]);
 
-  // Navigate to next matching sample
-  const handleNavigateNext = useCallback(() => {
+  // Count occurrences in the current sample for message-based searches
+  const matchesInCurrentSample = useMemo(() => {
+    if (!selectedSampleId) return 0;
+    
+    const sample = samples.find(s => s.id === selectedSampleId);
+    if (!sample) return 0;
+
+    // Only count for message-based search conditions
+    const messageFields = ['chat', 'system', 'user', 'assistant', 'tool', 'reasoning', 'all'];
+    const activeMessageConditions = searchConditions.filter(
+      c => c.operator === 'contains' && c.term.trim() && messageFields.includes(c.field)
+    );
+    
+    if (activeMessageConditions.length === 0) return 0;
+
+    let count = 0;
+    const firstCondition = activeMessageConditions[0]; // Use first condition for counting
+    const term = firstCondition.term.toLowerCase();
+
+    sample.messages.forEach(msg => {
+      const content = msg.content.toLowerCase();
+      let searchIndex = 0;
+      while ((searchIndex = content.indexOf(term, searchIndex)) !== -1) {
+        count++;
+        searchIndex += term.length;
+      }
+    });
+
+    return count;
+  }, [selectedSampleId, samples, searchConditions]);
+
+  // Reset occurrence index when sample changes
+  useEffect(() => {
+    setCurrentOccurrenceIndex(0);
+  }, [selectedSampleId]);
+
+  // Navigate to next occurrence (Enter) - within sample first, then next sample
+  const handleNavigateNextOccurrence = useCallback(() => {
+    if (filteredSamples.length === 0) return;
+    
+    // If there are more occurrences in current sample, go to next occurrence
+    if (matchesInCurrentSample > 1 && currentOccurrenceIndex < matchesInCurrentSample - 1) {
+      setCurrentOccurrenceIndex(prev => prev + 1);
+      return;
+    }
+    
+    // Otherwise, go to next sample and reset occurrence index
+    const nextIndex = currentMatchIndex < 0 
+      ? 0 
+      : (currentMatchIndex + 1) % filteredSamples.length;
+    
+    setCurrentOccurrenceIndex(0);
+    onSelectSample(filteredSamples[nextIndex].id);
+  }, [filteredSamples, currentMatchIndex, matchesInCurrentSample, currentOccurrenceIndex, onSelectSample]);
+
+  // Navigate to next sample (Shift+Enter) - always go to next sample
+  const handleNavigateNextSample = useCallback(() => {
     if (filteredSamples.length === 0) return;
     
     const nextIndex = currentMatchIndex < 0 
       ? 0 
       : (currentMatchIndex + 1) % filteredSamples.length;
     
+    setCurrentOccurrenceIndex(0);
     onSelectSample(filteredSamples[nextIndex].id);
   }, [filteredSamples, currentMatchIndex, onSelectSample]);
 
-  // Navigate to previous matching sample
-  const handleNavigatePrev = useCallback(() => {
+  // Navigate to previous sample
+  const handleNavigatePrevSample = useCallback(() => {
     if (filteredSamples.length === 0) return;
     
     const prevIndex = currentMatchIndex <= 0 
       ? filteredSamples.length - 1 
       : currentMatchIndex - 1;
     
+    setCurrentOccurrenceIndex(0);
     onSelectSample(filteredSamples[prevIndex].id);
   }, [filteredSamples, currentMatchIndex, onSelectSample]);
 
@@ -361,16 +447,19 @@ export function LeftPanel({
         />
 
         <FilterBar
-          searchTerm={searchTerm}
-          onSearchChange={onSearchTermChange}
-          searchField={searchField}
-          onSearchFieldChange={onSearchFieldChange}
+          searchConditions={searchConditions}
+          onSearchConditionsChange={onSearchConditionsChange}
+          searchLogic={searchLogic}
+          onSearchLogicChange={onSearchLogicChange}
           filterExpression={filterExpression}
           onFilterChange={setFilterExpression}
-          onNavigateNext={handleNavigateNext}
-          onNavigatePrev={handleNavigatePrev}
+          onNavigateNextOccurrence={handleNavigateNextOccurrence}
+          onNavigateNextSample={handleNavigateNextSample}
+          onNavigatePrevSample={handleNavigatePrevSample}
           matchCount={filteredSamples.length}
           currentMatchIndex={currentMatchIndex}
+          matchesInCurrentSample={matchesInCurrentSample}
+          currentOccurrenceIndex={currentOccurrenceIndex}
           isDarkMode={isDarkMode}
           samples={samples}
         />

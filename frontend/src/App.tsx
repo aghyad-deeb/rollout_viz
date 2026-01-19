@@ -7,7 +7,10 @@ import { useApi } from './hooks/useApi';
 import { useMarkedFiles } from './hooks/useMarkedFiles';
 import { useDarkMode } from './hooks/useDarkMode';
 import { useUrlState } from './hooks/useUrlState';
-import type { Sample, SearchField } from './types';
+import type { Sample, SearchCondition, SearchLogic } from './types';
+
+// Helper to generate unique IDs
+const generateId = () => Math.random().toString(36).substring(2, 9);
 
 function App() {
   const [samples, setSamples] = useState<Sample[]>([]);
@@ -16,8 +19,11 @@ function App() {
   const [experimentName, setExperimentName] = useState<string>('');
   const [filePaths, setFilePaths] = useState<string[]>([]);
   const [isFileBrowserOpen, setIsFileBrowserOpen] = useState(false);
-  const [searchTerm, setSearchTerm] = useState<string>('');
-  const [searchField, setSearchField] = useState<SearchField>('chat');
+  const [searchConditions, setSearchConditions] = useState<SearchCondition[]>([
+    { id: generateId(), field: 'chat', operator: 'contains', term: '' }
+  ]);
+  const [searchLogic, setSearchLogic] = useState<SearchLogic>('AND');
+  const [currentOccurrenceIndex, setCurrentOccurrenceIndex] = useState(0);
   const [highlightedMessageIndex, setHighlightedMessageIndex] = useState<number | null>(null);
   const [highlightedText, setHighlightedText] = useState<string | null>(null);
   const { loading, error, loadSamples, loadMultipleSamples } = useApi();
@@ -157,15 +163,16 @@ function App() {
             filePaths={filePaths}
             onFilePathsChange={setFilePaths}
             onOpenFileBrowser={() => setIsFileBrowserOpen(true)}
-            searchTerm={searchTerm}
-            onSearchTermChange={setSearchTerm}
-            searchField={searchField}
-            onSearchFieldChange={setSearchField}
+            searchConditions={searchConditions}
+            onSearchConditionsChange={setSearchConditions}
+            searchLogic={searchLogic}
+            onSearchLogicChange={setSearchLogic}
             loading={loading}
             error={error}
             isDarkMode={isDarkMode}
             onToggleDarkMode={toggleDarkMode}
             onFilteredSamplesChange={setFilteredSamples}
+            onCurrentOccurrenceIndexChange={setCurrentOccurrenceIndex}
           />
         </Panel>
         
@@ -178,8 +185,8 @@ function App() {
             experimentName={experimentName}
             totalSamples={samples.length}
             onNavigate={handleNavigate}
-            searchTerm={searchTerm}
-            searchField={searchField}
+            searchConditions={searchConditions}
+            currentOccurrenceIndex={currentOccurrenceIndex}
             isDarkMode={isDarkMode}
             filePath={getFilePathForSample(selectedSample)}
             generateLink={generateLink}

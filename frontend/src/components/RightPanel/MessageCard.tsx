@@ -1,11 +1,10 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
-import type { Message, SearchField } from '../../types';
+import type { Message, SearchCondition, SearchField } from '../../types';
 
 interface MessageCardProps {
   message: Message;
   index: number;
-  searchTerm: string; // Global search term
-  searchField: SearchField; // Which field the search is filtering on
+  searchConditions: SearchCondition[]; // Global search conditions
   localSearchTerm?: string; // Local search term for this chat
   isCurrentLocalMatch?: boolean; // Is this message the current local search match
   isDarkMode: boolean;
@@ -54,8 +53,7 @@ interface SelectionPopup {
 export function MessageCard({ 
   message, 
   index, 
-  searchTerm,
-  searchField,
+  searchConditions,
   localSearchTerm = '',
   isCurrentLocalMatch = false,
   isDarkMode,
@@ -129,33 +127,31 @@ export function MessageCard({
     return () => document.removeEventListener('mousedown', handleClick);
   }, [selectionPopup.show]);
 
-  // Check if this message should be highlighted based on search field
-  const shouldHighlightInContent = useMemo(() => {
-    // Check if the search field targets this message's role
-    switch (searchField) {
+  // Helper to check if a search field applies to message content (not reasoning)
+  const fieldAppliesToContent = (field: SearchField): boolean => {
+    switch (field) {
       case 'chat':
       case 'all':
-        return true; // Highlight in all messages
+        return true;
       case 'system':
         return message.role === 'system';
       case 'user':
         return message.role === 'user';
       case 'assistant':
-        return message.role === 'assistant'; // Note: reasoning is handled separately
+        return message.role === 'assistant';
       case 'tool':
         return message.role === 'tool';
       case 'reasoning':
-        return false; // Reasoning is handled in the reasoning block, not main content
+        return false; // Reasoning is handled separately
       default:
-        // For non-message fields (data_source, reward, etc.), don't highlight in messages
         return false;
     }
-  }, [searchField, message.role]);
+  };
 
-  // Check if this message's reasoning should be highlighted
-  const shouldHighlightInReasoning = useMemo(() => {
+  // Helper to check if a search field applies to reasoning blocks
+  const fieldAppliesToReasoning = (field: SearchField): boolean => {
     if (message.role !== 'assistant') return false;
-    switch (searchField) {
+    switch (field) {
       case 'chat':
       case 'all':
       case 'reasoning':
@@ -165,7 +161,17 @@ export function MessageCard({
       default:
         return false;
     }
-  }, [searchField, message.role]);
+  };
+
+  // Get search terms that should be highlighted in content/reasoning
+  const getApplicableSearchTerms = useMemo(() => {
+    return (isReasoning: boolean): string[] => {
+      return searchConditions
+        .filter(c => c.operator === 'contains' && c.term.trim())
+        .filter(c => isReasoning ? fieldAppliesToReasoning(c.field) : fieldAppliesToContent(c.field))
+        .map(c => c.term.trim());
+    };
+  }, [searchConditions, message.role]);
 
   // Function to highlight search terms in text
   const highlightSearchAndUrl = useMemo(() => {
@@ -233,34 +239,58 @@ export function MessageCard({
         return parts.length > 0 ? parts : text;
       }
 
-      // Priority 3: Global search term (from left panel) - yellow highlight
-      // Only highlight if this message/section matches the search field
-      const shouldHighlight = isReasoning ? shouldHighlightInReasoning : shouldHighlightInContent;
-      if (!searchTerm || searchTerm.trim() === '' || !shouldHighlight) {
+      // Priority 3: Global search terms (from left panel) - yellow highlight
+      const applicableTerms = getApplicableSearchTerms(isReasoning);
+      if (applicableTerms.length === 0) {
         return text;
       }
 
-      const term = searchTerm.toLowerCase();
+      // Build a list of all match positions
+      const matches: { start: number; end: number; term: string }[] = [];
+      const textLower = text.toLowerCase();
+      
+      applicableTerms.forEach(term => {
+        const termLower = term.toLowerCase();
+        let searchIndex = 0;
+        let matchIndex = textLower.indexOf(termLower, searchIndex);
+        
+        while (matchIndex !== -1) {
+          matches.push({
+            start: matchIndex,
+            end: matchIndex + term.length,
+            term: text.slice(matchIndex, matchIndex + term.length)
+          });
+          searchIndex = matchIndex + term.length;
+          matchIndex = textLower.indexOf(termLower, searchIndex);
+        }
+      });
+
+      if (matches.length === 0) {
+        return text;
+      }
+
+      // Sort matches by position and merge overlapping
+      matches.sort((a, b) => a.start - b.start);
+      
       const parts: React.ReactNode[] = [];
       let lastIndex = 0;
-      const textLower = text.toLowerCase();
-      let matchIndex = textLower.indexOf(term, lastIndex);
 
-      while (matchIndex !== -1) {
-        if (matchIndex > lastIndex) {
-          parts.push(text.slice(lastIndex, matchIndex));
+      matches.forEach((match, idx) => {
+        if (match.start < lastIndex) return; // Skip overlapping
+        
+        if (match.start > lastIndex) {
+          parts.push(text.slice(lastIndex, match.start));
         }
         parts.push(
           <mark
-            key={matchIndex}
+            key={`global-${idx}-${match.start}`}
             className="bg-yellow-300 text-yellow-900 px-0.5 rounded global-search-highlight"
           >
-            {text.slice(matchIndex, matchIndex + searchTerm.length)}
+            {match.term}
           </mark>
         );
-        lastIndex = matchIndex + searchTerm.length;
-        matchIndex = textLower.indexOf(term, lastIndex);
-      }
+        lastIndex = match.end;
+      });
 
       if (lastIndex < text.length) {
         parts.push(text.slice(lastIndex));
@@ -268,7 +298,7 @@ export function MessageCard({
 
       return parts.length > 0 ? parts : text;
     };
-  }, [searchTerm, searchField, shouldHighlightInContent, shouldHighlightInReasoning, localSearchTerm, isCurrentLocalMatch, highlightedText, onClearHighlight]);
+  }, [searchConditions, getApplicableSearchTerms, localSearchTerm, isCurrentLocalMatch, highlightedText, onClearHighlight]);
 
   // Parse reasoning from assistant messages
   const parseContent = (content: string) => {
