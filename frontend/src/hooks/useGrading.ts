@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import type { 
   GradeRequest, 
   GradeResponse, 
@@ -8,7 +8,7 @@ import type {
   Sample,
 } from '../types';
 
-type GradingStatus = 'idle' | 'connecting' | 'grading' | 'saving' | 'complete' | 'error';
+type GradingStatus = 'idle' | 'connecting' | 'grading' | 'saving' | 'complete' | 'error' | 'cancelled';
 
 interface GradingProgress {
   total: number;
@@ -57,6 +57,23 @@ export function useGrading() {
   const [lastModel, setLastModel] = useState<string>(() => {
     return localStorage.getItem(MODEL_STORAGE_KEY) || 'gpt-4o';
   });
+
+  // Abort controller for cancellation
+  const abortControllerRef = useRef<AbortController | null>(null);
+
+  // Cancel current grading job
+  const cancelGrading = useCallback(() => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    setProgress(prev => ({
+      ...prev,
+      isRunning: false,
+      status: 'cancelled',
+      statusMessage: 'Grading cancelled',
+    }));
+  }, []);
 
   // Save API keys to localStorage
   const saveApiKey = useCallback((provider: LLMProvider, key: string) => {
@@ -109,6 +126,11 @@ export function useGrading() {
     }
 
     setError(null);
+    
+    // Create new abort controller for this request
+    abortControllerRef.current = new AbortController();
+    const signal = abortControllerRef.current.signal;
+
     setProgress({
       total: sampleIds.length,
       completed: 0,
@@ -140,6 +162,7 @@ export function useGrading() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(request),
+        signal,
       });
 
       if (!response.ok) {
@@ -164,6 +187,11 @@ export function useGrading() {
 
       return data;
     } catch (err) {
+      // Check if this was an abort
+      if (err instanceof Error && err.name === 'AbortError') {
+        // Already handled by cancelGrading
+        return null;
+      }
       const message = err instanceof Error ? err.message : 'Unknown error';
       setError(message);
       setProgress(prev => ({ 
@@ -173,6 +201,8 @@ export function useGrading() {
         statusMessage: 'Grading failed',
       }));
       return null;
+    } finally {
+      abortControllerRef.current = null;
     }
   }, [getApiKey, saveLastProvider, saveLastModel]);
 
@@ -294,6 +324,7 @@ export function useGrading() {
     gradeSamples,
     saveGradedSamples,
     gradeAndSave,
+    cancelGrading,
     saveApiKey,
     getApiKey,
     saveLastProvider,
