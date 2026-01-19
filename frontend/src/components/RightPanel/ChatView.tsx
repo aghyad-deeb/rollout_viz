@@ -40,6 +40,33 @@ export function ChatView({
   
   // Get the first active condition for scroll targeting
   const primarySearchTerm = activeSearchTerms[0] || '';
+
+  // Calculate the starting occurrence index for each message (cumulative count)
+  // This tells MessageCard which global index its first occurrence corresponds to
+  const messageOccurrenceStarts = useMemo(() => {
+    const starts: number[] = [];
+    let cumulativeCount = 0;
+    
+    sample.messages.forEach((message) => {
+      starts.push(cumulativeCount);
+      
+      // Count occurrences in this message for all active search terms
+      if (activeSearchTerms.length > 0) {
+        const contentLower = message.content.toLowerCase();
+        activeSearchTerms.forEach(term => {
+          const termLower = term.toLowerCase();
+          let searchIndex = 0;
+          while ((searchIndex = contentLower.indexOf(termLower, searchIndex)) !== -1) {
+            cumulativeCount++;
+            searchIndex += term.length;
+          }
+        });
+      }
+    });
+    
+    return starts;
+  }, [sample.messages, activeSearchTerms]);
+
   const [localSearchTerm, setLocalSearchTerm] = useState('');
   const [currentMatchIndex, setCurrentMatchIndex] = useState(0);
   const [isSearchOpen, setIsSearchOpen] = useState(false);
@@ -281,6 +308,8 @@ export function ChatView({
               isHighlighted={highlightedMessageIndex === index}
               highlightedText={highlightedMessageIndex === index ? highlightedText : null}
               onClearHighlight={onClearHighlight}
+              messageOccurrenceStart={messageOccurrenceStarts[index] ?? 0}
+              currentOccurrenceIndex={currentOccurrenceIndex}
             />
           </div>
         ))}

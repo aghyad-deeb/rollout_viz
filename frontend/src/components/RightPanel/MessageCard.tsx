@@ -14,6 +14,9 @@ interface MessageCardProps {
   isHighlighted: boolean;
   highlightedText: string | null;
   onClearHighlight: () => void;
+  // For tracking which occurrence is "current" in global search
+  messageOccurrenceStart: number; // Starting index of occurrences in this message (0-based global)
+  currentOccurrenceIndex: number; // Which occurrence is currently focused
 }
 
 const ROLE_CONFIG = {
@@ -63,6 +66,8 @@ export function MessageCard({
   isHighlighted,
   highlightedText,
   onClearHighlight,
+  messageOccurrenceStart,
+  currentOccurrenceIndex,
 }: MessageCardProps) {
   const [isExpanded, setIsExpanded] = useState(true);
   const [selectionPopup, setSelectionPopup] = useState<SelectionPopup>({ show: false, x: 0, y: 0, text: '' });
@@ -239,7 +244,7 @@ export function MessageCard({
         return parts.length > 0 ? parts : text;
       }
 
-      // Priority 3: Global search terms (from left panel) - yellow highlight
+      // Priority 3: Global search terms (from left panel) - yellow highlight, current = orange
       const applicableTerms = getApplicableSearchTerms(isReasoning);
       if (applicableTerms.length === 0) {
         return text;
@@ -274,22 +279,33 @@ export function MessageCard({
       
       const parts: React.ReactNode[] = [];
       let lastIndex = 0;
+      let occurrenceIdx = 0; // Track occurrence within this message
 
-      matches.forEach((match, idx) => {
+      matches.forEach((match) => {
         if (match.start < lastIndex) return; // Skip overlapping
         
         if (match.start > lastIndex) {
           parts.push(text.slice(lastIndex, match.start));
         }
+        
+        // Calculate global occurrence index for this match
+        const globalIdx = messageOccurrenceStart + occurrenceIdx;
+        const isCurrent = globalIdx === currentOccurrenceIndex;
+        
         parts.push(
           <mark
-            key={`global-${idx}-${match.start}`}
-            className="bg-yellow-300 text-yellow-900 px-0.5 rounded global-search-highlight"
+            key={`global-${occurrenceIdx}-${match.start}`}
+            className={`px-0.5 rounded global-search-highlight ${
+              isCurrent 
+                ? 'bg-orange-400 text-orange-950 ring-2 ring-orange-500 ring-offset-1' 
+                : 'bg-yellow-300 text-yellow-900'
+            }`}
           >
             {match.term}
           </mark>
         );
         lastIndex = match.end;
+        occurrenceIdx++;
       });
 
       if (lastIndex < text.length) {
@@ -298,7 +314,7 @@ export function MessageCard({
 
       return parts.length > 0 ? parts : text;
     };
-  }, [searchConditions, getApplicableSearchTerms, localSearchTerm, isCurrentLocalMatch, highlightedText, onClearHighlight]);
+  }, [searchConditions, getApplicableSearchTerms, localSearchTerm, isCurrentLocalMatch, highlightedText, onClearHighlight, messageOccurrenceStart, currentOccurrenceIndex]);
 
   // Parse reasoning from assistant messages
   const parseContent = (content: string) => {
