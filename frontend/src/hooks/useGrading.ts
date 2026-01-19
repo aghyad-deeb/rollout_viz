@@ -8,11 +8,15 @@ import type {
   Sample,
 } from '../types';
 
+type GradingStatus = 'idle' | 'connecting' | 'grading' | 'saving' | 'complete' | 'error';
+
 interface GradingProgress {
   total: number;
   completed: number;
   errors: number;
   isRunning: boolean;
+  status: GradingStatus;
+  statusMessage: string;
 }
 
 interface StoredAPIKeys {
@@ -29,6 +33,8 @@ export function useGrading() {
     completed: 0,
     errors: 0,
     isRunning: false,
+    status: 'idle',
+    statusMessage: '',
   });
   const [error, setError] = useState<string | null>(null);
   const [presetMetrics, setPresetMetrics] = useState<Record<string, PresetMetric>>({});
@@ -108,6 +114,8 @@ export function useGrading() {
       completed: 0,
       errors: 0,
       isRunning: true,
+      status: 'connecting',
+      statusMessage: `Connecting to ${provider}...`,
     });
 
     try {
@@ -121,6 +129,12 @@ export function useGrading() {
         model,
         api_key: apiKey,
       };
+
+      setProgress(prev => ({
+        ...prev,
+        status: 'grading',
+        statusMessage: `Grading ${sampleIds.length} sample${sampleIds.length !== 1 ? 's' : ''} with ${model}...`,
+      }));
 
       const response = await fetch('/api/grade', {
         method: 'POST',
@@ -140,6 +154,8 @@ export function useGrading() {
         completed: data.graded_count,
         errors: data.errors.length,
         isRunning: false,
+        status: 'complete',
+        statusMessage: `Graded ${data.graded_count} sample${data.graded_count !== 1 ? 's' : ''}${data.errors.length > 0 ? ` (${data.errors.length} error${data.errors.length !== 1 ? 's' : ''})` : ''}`,
       });
 
       // Save preferences
@@ -150,7 +166,12 @@ export function useGrading() {
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unknown error';
       setError(message);
-      setProgress(prev => ({ ...prev, isRunning: false }));
+      setProgress(prev => ({ 
+        ...prev, 
+        isRunning: false,
+        status: 'error',
+        statusMessage: 'Grading failed',
+      }));
       return null;
     }
   }, [getApiKey, saveLastProvider, saveLastModel]);
@@ -207,6 +228,14 @@ export function useGrading() {
       return gradeResult;
     }
 
+    // Show saving status
+    setProgress(prev => ({
+      ...prev,
+      isRunning: true,
+      status: 'saving',
+      statusMessage: 'Saving grades to file...',
+    }));
+
     // Convert grades to the save format
     const gradesToSave: { [sampleId: number]: { [metricName: string]: GradeEntry } } = {};
     for (const [sampleIdStr, grade] of Object.entries(gradeResult.grades)) {
@@ -217,6 +246,19 @@ export function useGrading() {
     const saved = await saveGradedSamples(filePath, gradesToSave);
     if (!saved) {
       setError('Grades computed but failed to save');
+      setProgress(prev => ({
+        ...prev,
+        isRunning: false,
+        status: 'error',
+        statusMessage: 'Failed to save grades',
+      }));
+    } else {
+      setProgress(prev => ({
+        ...prev,
+        isRunning: false,
+        status: 'complete',
+        statusMessage: `Successfully graded and saved ${gradeResult.graded_count} sample${gradeResult.graded_count !== 1 ? 's' : ''}!`,
+      }));
     }
 
     return gradeResult;

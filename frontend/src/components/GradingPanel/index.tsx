@@ -255,24 +255,46 @@ export function GradingPanel({
         </p>
       </div>
 
-      {/* Grade button */}
-      <div className="pt-2">
+      {/* Grade button and status */}
+      <div className="pt-2 space-y-3">
+        {/* Success message */}
+        {progress.status === 'complete' && !progress.isRunning && (
+          <div className="p-3 rounded-lg bg-green-100 dark:bg-green-900/30 border border-green-300 dark:border-green-700">
+            <div className="flex items-center gap-2">
+              <span className="material-symbols-outlined text-green-600 dark:text-green-400" style={{ fontSize: 18 }}>check_circle</span>
+              <span className="text-green-700 dark:text-green-300 text-sm">{progress.statusMessage}</span>
+            </div>
+          </div>
+        )}
+
         {progress.isRunning ? (
           <div className="space-y-2">
-            <div className="flex items-center justify-between text-sm">
-              <span className={textClass}>
-                Grading... {progress.completed}/{progress.total}
-              </span>
-              {progress.errors > 0 && (
-                <span className="text-red-500">{progress.errors} errors</span>
-              )}
+            <div className="flex items-center gap-2 text-sm">
+              {/* Spinner */}
+              <svg className="animate-spin h-4 w-4 text-blue-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+              </svg>
+              <span className={textClass}>{progress.statusMessage}</span>
             </div>
-            <div className="w-full h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
-              <div 
-                className="h-full bg-blue-500 transition-all duration-300"
-                style={{ width: `${(progress.completed / progress.total) * 100}%` }}
-              />
-            </div>
+            
+            {/* Progress bar - only show during grading */}
+            {progress.status === 'grading' && progress.total > 0 && (
+              <div className="space-y-1">
+                <div className="w-full h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
+                  <div 
+                    className="h-full bg-blue-500 transition-all duration-300"
+                    style={{ width: `${(progress.completed / progress.total) * 100}%` }}
+                  />
+                </div>
+                <div className="flex justify-between text-xs">
+                  <span className={mutedClass}>{progress.completed}/{progress.total} samples</span>
+                  {progress.errors > 0 && (
+                    <span className="text-red-500">{progress.errors} error{progress.errors !== 1 ? 's' : ''}</span>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
         ) : (
           <button
