@@ -35,9 +35,19 @@ class GradeResult(BaseModel):
 class LLMProvider(ABC):
     """Abstract base class for LLM providers."""
     
-    def __init__(self, api_key: str, model: str):
+    def __init__(
+        self, 
+        api_key: str, 
+        model: str,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
+    ):
         self.api_key = api_key
         self.model = model
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.top_p = top_p
     
     @abstractmethod
     async def grade_sample(
@@ -192,12 +202,20 @@ class OpenAIProvider(LLMProvider):
         client = AsyncOpenAI(api_key=self.api_key)
         prompt = self._build_grading_prompt(messages, metric_prompt, grade_type)
         
-        response = await client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            response_format={"type": "json_object"},
-        )
+        # Build kwargs with optional parameters
+        kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "response_format": {"type": "json_object"},
+        }
+        if self.temperature is not None:
+            kwargs["temperature"] = self.temperature
+        if self.max_tokens is not None:
+            kwargs["max_tokens"] = self.max_tokens
+        if self.top_p is not None:
+            kwargs["top_p"] = self.top_p
+        
+        response = await client.chat.completions.create(**kwargs)
         
         response_text = response.choices[0].message.content or ""
         parsed = self._parse_grade_response(response_text, grade_type)
@@ -227,11 +245,18 @@ class AnthropicProvider(LLMProvider):
         client = AsyncAnthropic(api_key=self.api_key)
         prompt = self._build_grading_prompt(messages, metric_prompt, grade_type)
         
-        response = await client.messages.create(
-            model=self.model,
-            max_tokens=2048,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        # Build kwargs with optional parameters
+        kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": self.max_tokens or 2048,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if self.temperature is not None:
+            kwargs["temperature"] = self.temperature
+        if self.top_p is not None:
+            kwargs["top_p"] = self.top_p
+        
+        response = await client.messages.create(**kwargs)
         
         response_text = response.content[0].text if response.content else ""
         parsed = self._parse_grade_response(response_text, grade_type)
@@ -263,13 +288,21 @@ class GoogleProvider(LLMProvider):
         
         prompt = self._build_grading_prompt(messages, metric_prompt, grade_type)
         
+        # Build generation config with optional parameters
+        config_kwargs: Dict[str, Any] = {
+            "response_mime_type": "application/json",
+        }
+        if self.temperature is not None:
+            config_kwargs["temperature"] = self.temperature
+        if self.max_tokens is not None:
+            config_kwargs["max_output_tokens"] = self.max_tokens
+        if self.top_p is not None:
+            config_kwargs["top_p"] = self.top_p
+        
         # Google's async API
         response = await model.generate_content_async(
             prompt,
-            generation_config=genai.types.GenerationConfig(
-                temperature=0.0,
-                response_mime_type="application/json",
-            ),
+            generation_config=genai.types.GenerationConfig(**config_kwargs),
         )
         
         response_text = response.text or ""
@@ -299,6 +332,18 @@ class OpenRouterProvider(LLMProvider):
         
         prompt = self._build_grading_prompt(messages, metric_prompt, grade_type)
         
+        # Build request body with optional parameters
+        body: Dict[str, Any] = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if self.temperature is not None:
+            body["temperature"] = self.temperature
+        if self.max_tokens is not None:
+            body["max_tokens"] = self.max_tokens
+        if self.top_p is not None:
+            body["top_p"] = self.top_p
+        
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 "https://openrouter.ai/api/v1/chat/completions",
@@ -306,11 +351,7 @@ class OpenRouterProvider(LLMProvider):
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json",
                 },
-                json={
-                    "model": self.model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.0,
-                },
+                json=body,
                 timeout=120.0,
             )
             response.raise_for_status()
@@ -330,7 +371,14 @@ class OpenRouterProvider(LLMProvider):
         )
 
 
-def get_provider(provider_name: str, api_key: str, model: str) -> LLMProvider:
+def get_provider(
+    provider_name: str, 
+    api_key: str, 
+    model: str,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+    top_p: Optional[float] = None,
+) -> LLMProvider:
     """Factory function to get the appropriate LLM provider."""
     providers = {
         "openai": OpenAIProvider,
@@ -343,7 +391,13 @@ def get_provider(provider_name: str, api_key: str, model: str) -> LLMProvider:
     if not provider_class:
         raise ValueError(f"Unknown provider: {provider_name}. Supported: {list(providers.keys())}")
     
-    return provider_class(api_key=api_key, model=model)
+    return provider_class(
+        api_key=api_key, 
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        top_p=top_p,
+    )
 
 
 # Preset metrics with default prompts

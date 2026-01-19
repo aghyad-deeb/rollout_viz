@@ -56,6 +56,10 @@ export interface GradeRequest {
   model: string;
   api_key?: string;  // Optional - server will use .env if not provided
   parallel_size?: number;  // Number of concurrent requests (default: 100)
+  // Advanced settings
+  temperature?: number;  // 0.0 - 2.0, undefined = model default
+  max_tokens?: number;  // Max output tokens
+  top_p?: number;  // 0.0 - 1.0
 }
 
 export interface GradeResponse {

@@ -44,6 +44,12 @@ export function GradingPanel({
   const [apiKeyInput, setApiKeyInput] = useState('');
   const [showApiKey, setShowApiKey] = useState(false);
   const [parallelSize, setParallelSize] = useState(100);
+  
+  // Advanced settings
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [temperature, setTemperature] = useState<number | undefined>(undefined);
+  const [maxTokens, setMaxTokens] = useState<number | undefined>(undefined);
+  const [topP, setTopP] = useState<number | undefined>(undefined);
 
   // Check if we have a valid API key (local or server-side)
   const hasApiKey = useMemo(() => {
@@ -94,6 +100,12 @@ export function GradingPanel({
   const handleGrade = async () => {
     if (!currentMetric || !filePath || filteredSampleIds.length === 0) return;
 
+    const advancedSettings = {
+      ...(temperature !== undefined ? { temperature } : {}),
+      ...(maxTokens !== undefined ? { maxTokens } : {}),
+      ...(topP !== undefined ? { topP } : {}),
+    };
+
     const result = await gradeAndSave(
       filePath,
       filteredSampleIds,
@@ -103,6 +115,7 @@ export function GradingPanel({
       provider,
       model,
       parallelSize,
+      Object.keys(advancedSettings).length > 0 ? advancedSettings : undefined,
     );
 
     if (result && result.graded_count > 0) {
@@ -234,6 +247,108 @@ export function GradingPanel({
           />
           <span className={`text-xs ${mutedClass}`}>concurrent requests (1-500)</span>
         </div>
+      </div>
+
+      {/* Advanced Settings */}
+      <div className="space-y-2">
+        <button
+          onClick={() => setShowAdvanced(!showAdvanced)}
+          className={`flex items-center gap-1 text-sm font-medium ${textClass} hover:opacity-80`}
+        >
+          <span className="material-symbols-outlined" style={{ fontSize: 18 }}>
+            {showAdvanced ? 'expand_less' : 'expand_more'}
+          </span>
+          Advanced Settings
+        </button>
+        
+        {showAdvanced && (
+          <div className={`space-y-3 p-3 rounded border ${isDarkMode ? 'border-gray-700 bg-gray-900/50' : 'border-gray-200 bg-gray-50'}`}>
+            {/* Temperature */}
+            <div className="space-y-1">
+              <label className={`text-xs font-medium ${textClass}`}>
+                Temperature
+                <span className={`ml-1 ${mutedClass}`}>(default: model default)</span>
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="number"
+                  min="0"
+                  max="2"
+                  step="0.1"
+                  value={temperature ?? ''}
+                  onChange={(e) => setTemperature(e.target.value ? parseFloat(e.target.value) : undefined)}
+                  placeholder="Model default"
+                  className={`w-32 px-2 py-1 rounded border text-sm ${inputClass}`}
+                />
+                <span className={`text-xs ${mutedClass}`}>0.0 - 2.0</span>
+                {temperature !== undefined && (
+                  <button
+                    onClick={() => setTemperature(undefined)}
+                    className={`text-xs ${mutedClass} hover:opacity-80`}
+                  >
+                    Reset
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Max Tokens */}
+            <div className="space-y-1">
+              <label className={`text-xs font-medium ${textClass}`}>
+                Max Output Tokens
+                <span className={`ml-1 ${mutedClass}`}>(default: model default)</span>
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="number"
+                  min="1"
+                  max="128000"
+                  value={maxTokens ?? ''}
+                  onChange={(e) => setMaxTokens(e.target.value ? parseInt(e.target.value) : undefined)}
+                  placeholder="Model default"
+                  className={`w-32 px-2 py-1 rounded border text-sm ${inputClass}`}
+                />
+                {maxTokens !== undefined && (
+                  <button
+                    onClick={() => setMaxTokens(undefined)}
+                    className={`text-xs ${mutedClass} hover:opacity-80`}
+                  >
+                    Reset
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Top P */}
+            <div className="space-y-1">
+              <label className={`text-xs font-medium ${textClass}`}>
+                Top P
+                <span className={`ml-1 ${mutedClass}`}>(default: model default)</span>
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="number"
+                  min="0"
+                  max="1"
+                  step="0.05"
+                  value={topP ?? ''}
+                  onChange={(e) => setTopP(e.target.value ? parseFloat(e.target.value) : undefined)}
+                  placeholder="Model default"
+                  className={`w-32 px-2 py-1 rounded border text-sm ${inputClass}`}
+                />
+                <span className={`text-xs ${mutedClass}`}>0.0 - 1.0</span>
+                {topP !== undefined && (
+                  <button
+                    onClick={() => setTopP(undefined)}
+                    className={`text-xs ${mutedClass} hover:opacity-80`}
+                  >
+                    Reset
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* API Key */}

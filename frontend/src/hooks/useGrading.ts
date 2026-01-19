@@ -137,6 +137,11 @@ export function useGrading() {
     provider: LLMProvider,
     model: string,
     parallelSize: number = 100,
+    advancedSettings?: {
+      temperature?: number;
+      maxTokens?: number;
+      topP?: number;
+    },
   ): Promise<GradeResponse | null> => {
     const apiKey = getApiKey(provider);
     const hasServerKey = serverApiKeys[provider];
@@ -173,6 +178,10 @@ export function useGrading() {
         // Only include api_key if we have one locally, otherwise server uses .env
         ...(apiKey ? { api_key: apiKey } : {}),
         parallel_size: parallelSize,
+        // Advanced settings
+        ...(advancedSettings?.temperature !== undefined ? { temperature: advancedSettings.temperature } : {}),
+        ...(advancedSettings?.maxTokens !== undefined ? { max_tokens: advancedSettings.maxTokens } : {}),
+        ...(advancedSettings?.topP !== undefined ? { top_p: advancedSettings.topP } : {}),
       };
 
       setProgress(prev => ({
@@ -267,6 +276,11 @@ export function useGrading() {
     provider: LLMProvider,
     model: string,
     parallelSize: number = 100,
+    advancedSettings?: {
+      temperature?: number;
+      maxTokens?: number;
+      topP?: number;
+    },
   ): Promise<GradeResponse | null> => {
     const gradeResult = await gradeSamples(
       filePath,
@@ -277,6 +291,7 @@ export function useGrading() {
       provider,
       model,
       parallelSize,
+      advancedSettings,
     );
 
     if (!gradeResult || gradeResult.graded_count === 0) {

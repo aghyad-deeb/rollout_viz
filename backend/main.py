@@ -134,6 +134,10 @@ class GradeRequest(BaseModel):
     model: str  # e.g., "gpt-4o", "claude-3-opus"
     api_key: Optional[str] = None  # Optional - will use .env if not provided
     parallel_size: int = 100  # Number of concurrent requests
+    # Advanced settings
+    temperature: Optional[float] = None  # 0.0 - 2.0, None = model default
+    max_tokens: Optional[int] = None  # Max output tokens
+    top_p: Optional[float] = None  # 0.0 - 1.0
 
 
 class GradeResponse(BaseModel):
@@ -604,8 +608,15 @@ async def grade_samples(request: GradeRequest):
         else:
             raw_samples = load_jsonl_from_file(request.file_path)
         
-        # Get the LLM provider
-        provider = get_provider(request.provider, api_key, request.model)
+        # Get the LLM provider with advanced settings
+        provider = get_provider(
+            request.provider, 
+            api_key, 
+            request.model,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+            top_p=request.top_p,
+        )
         
         # Grade each requested sample
         grades: Dict[int, GradeEntry] = {}

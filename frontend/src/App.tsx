@@ -288,6 +288,7 @@ function App() {
                 : 'bg-blue-600 hover:bg-blue-700 text-white p-4'
               }`}
             title={grading.progress.isRunning ? grading.progress.statusMessage : "Grade samples with LLM"}
+            aria-label="Grade samples with LLM"
           >
             {grading.progress.isRunning ? (
               <>
