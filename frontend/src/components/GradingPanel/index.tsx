@@ -43,7 +43,7 @@ export function GradingPanel({
   const [model, setModel] = useState<string>(lastModel);
   const [apiKeyInput, setApiKeyInput] = useState('');
   const [showApiKey, setShowApiKey] = useState(false);
-  const [useBatch, setUseBatch] = useState(false);
+  const [parallelSize, setParallelSize] = useState(100);
 
   // Check if we have a valid API key (local or server-side)
   const hasApiKey = useMemo(() => {
@@ -102,7 +102,7 @@ export function GradingPanel({
       currentMetric.grade_type as 'float' | 'int' | 'bool',
       provider,
       model,
-      useBatch && provider === 'openai',  // Batch API only for OpenAI
+      parallelSize,
     );
 
     if (result && result.graded_count > 0) {
@@ -220,29 +220,21 @@ export function GradingPanel({
         </div>
       </div>
 
-      {/* Batch API Toggle (OpenAI only) */}
-      {provider === 'openai' && (
-        <div className="space-y-2">
-          <label className={`flex items-center gap-2 cursor-pointer ${textClass}`}>
-            <input
-              type="checkbox"
-              checked={useBatch}
-              onChange={(e) => setUseBatch(e.target.checked)}
-              className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-            />
-            <span className="text-sm font-medium">Use Batch API</span>
-            <span className={`text-xs px-1.5 py-0.5 rounded ${isDarkMode ? 'bg-green-900/50 text-green-300' : 'bg-green-100 text-green-700'}`}>
-              50% cheaper
-            </span>
-          </label>
-          {useBatch && (
-            <p className={`text-xs ${mutedClass} pl-6`}>
-              Batch API processes requests within 24 hours at half the cost. 
-              Results will be saved when complete.
-            </p>
-          )}
+      {/* Parallel Size */}
+      <div className="space-y-2">
+        <label className={`text-sm font-medium ${textClass}`}>Parallel Requests</label>
+        <div className="flex items-center gap-2">
+          <input
+            type="number"
+            min="1"
+            max="500"
+            value={parallelSize}
+            onChange={(e) => setParallelSize(Math.max(1, Math.min(500, parseInt(e.target.value) || 100)))}
+            className={`w-24 px-3 py-2 rounded border text-sm ${inputClass}`}
+          />
+          <span className={`text-xs ${mutedClass}`}>concurrent requests (1-500)</span>
         </div>
-      )}
+      </div>
 
       {/* API Key */}
       <div className="space-y-2">

@@ -55,7 +55,7 @@ export interface GradeRequest {
   provider: LLMProvider;
   model: string;
   api_key?: string;  // Optional - server will use .env if not provided
-  use_batch?: boolean;  // Use OpenAI Batch API (50% cheaper, 24h turnaround)
+  parallel_size?: number;  // Number of concurrent requests (default: 100)
 }
 
 export interface GradeResponse {
