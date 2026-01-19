@@ -1,13 +1,14 @@
 import { useState, useMemo } from 'react';
 import type { LLMProvider } from '../../types';
 import { LLM_PROVIDERS } from '../../types';
-import { useGrading } from '../../hooks/useGrading';
+import type { useGrading } from '../../hooks/useGrading';
 
 interface GradingPanelProps {
   filteredSampleIds: number[];
   filePath: string;
   isDarkMode: boolean;
   onGradingComplete: () => void; // Callback to refresh samples after grading
+  grading: ReturnType<typeof useGrading>; // Grading state from parent
 }
 
 export function GradingPanel({
@@ -15,6 +16,7 @@ export function GradingPanel({
   filePath,
   isDarkMode,
   onGradingComplete,
+  grading,
 }: GradingPanelProps) {
   const {
     progress,
@@ -28,7 +30,7 @@ export function GradingPanel({
     saveLastProvider,
     saveLastModel,
     clearError,
-  } = useGrading();
+  } = grading;
 
   // Form state
   const [selectedMetric, setSelectedMetric] = useState<string>('helpfulness');
