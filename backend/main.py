@@ -95,11 +95,6 @@ class GradeEntry(BaseModel):
     timestamp: str
 
 
-class SampleGrades(BaseModel):
-    """All grades for a sample, keyed by metric name."""
-    __root__: Dict[str, List[GradeEntry]] = {}
-
-
 class GradeRequest(BaseModel):
     """Request to grade samples."""
     file_path: str
