@@ -268,8 +268,8 @@ function App() {
           onClick={() => setIsGradingPanelOpen(true)}
           className={`fixed bottom-6 right-6 rounded-full shadow-lg transition-all z-40 flex items-center gap-2
             ${grading.progress.isRunning 
-              ? (isDarkMode ? 'bg-purple-700 text-white px-4 py-3' : 'bg-purple-600 text-white px-4 py-3')
-              : (isDarkMode ? 'bg-purple-600 hover:bg-purple-500 text-white p-4' : 'bg-purple-500 hover:bg-purple-600 text-white p-4')
+              ? 'bg-blue-600 text-white px-4 py-3'
+              : 'bg-blue-600 hover:bg-blue-700 text-white p-4'
             }`}
           title={grading.progress.isRunning ? grading.progress.statusMessage : "Grade samples with LLM"}
         >
