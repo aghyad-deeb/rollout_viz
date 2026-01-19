@@ -27,7 +27,8 @@ export function GradingPanel({
     gradeAndSave,
     cancelGrading,
     saveApiKey,
-    getApiKey,
+    hasApiKeyAvailable,
+    isUsingServerKey,
     saveLastProvider,
     saveLastModel,
     clearError,
@@ -43,10 +44,15 @@ export function GradingPanel({
   const [apiKeyInput, setApiKeyInput] = useState('');
   const [showApiKey, setShowApiKey] = useState(false);
 
-  // Check if we have a valid API key
+  // Check if we have a valid API key (local or server-side)
   const hasApiKey = useMemo(() => {
-    return !!getApiKey(provider);
-  }, [getApiKey, provider]);
+    return hasApiKeyAvailable(provider);
+  }, [hasApiKeyAvailable, provider]);
+
+  // Check if using server-side key
+  const usingServerKey = useMemo(() => {
+    return isUsingServerKey(provider);
+  }, [isUsingServerKey, provider]);
 
   // Get the current metric info
   const currentMetric = useMemo(() => {
@@ -216,13 +222,24 @@ export function GradingPanel({
       <div className="space-y-2">
         <label className={`text-sm font-medium ${textClass}`}>
           API Key
-          {hasApiKey && (
+          {usingServerKey ? (
+            <span className="ml-2 text-blue-500 text-xs">
+              <span className="material-symbols-outlined" style={{ fontSize: 14 }}>cloud_done</span>
+              Using server .env
+            </span>
+          ) : hasApiKey ? (
             <span className="ml-2 text-green-500 text-xs">
               <span className="material-symbols-outlined" style={{ fontSize: 14 }}>check_circle</span>
-              Saved
+              Saved locally
             </span>
-          )}
+          ) : null}
         </label>
+        {usingServerKey ? (
+          <p className={`text-xs ${mutedClass} p-2 rounded border ${isDarkMode ? 'border-blue-800 bg-blue-900/20' : 'border-blue-200 bg-blue-50'}`}>
+            Using API key from server's <code className="px-1 rounded bg-gray-200 dark:bg-gray-700">.env</code> file. 
+            You can override by entering a key below.
+          </p>
+        ) : null}
         <div className="flex gap-2">
           <div className="relative flex-1">
             <input
@@ -253,9 +270,11 @@ export function GradingPanel({
             Save
           </button>
         </div>
-        <p className={`text-xs ${mutedClass}`}>
-          API keys are stored locally in your browser.
-        </p>
+        {!usingServerKey && (
+          <p className={`text-xs ${mutedClass}`}>
+            API keys are stored locally in your browser.
+          </p>
+        )}
       </div>
 
       {/* Grade button and status */}

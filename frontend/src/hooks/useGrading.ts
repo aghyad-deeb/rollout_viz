@@ -39,6 +39,9 @@ export function useGrading() {
   const [error, setError] = useState<string | null>(null);
   const [presetMetrics, setPresetMetrics] = useState<Record<string, PresetMetric>>({});
   
+  // Server-side API keys availability (from .env)
+  const [serverApiKeys, setServerApiKeys] = useState<Record<string, boolean>>({});
+  
   // Load API keys from localStorage
   const [apiKeys, setApiKeys] = useState<StoredAPIKeys>(() => {
     try {
@@ -84,10 +87,20 @@ export function useGrading() {
     });
   }, []);
 
-  // Get API key for a provider
+  // Get API key for a provider (returns empty string if using server-side key)
   const getApiKey = useCallback((provider: LLMProvider): string => {
     return apiKeys[provider] || '';
   }, [apiKeys]);
+
+  // Check if we have an API key available (either local or server-side)
+  const hasApiKeyAvailable = useCallback((provider: LLMProvider): boolean => {
+    return !!(apiKeys[provider] || serverApiKeys[provider]);
+  }, [apiKeys, serverApiKeys]);
+
+  // Check if using server-side key for a provider
+  const isUsingServerKey = useCallback((provider: LLMProvider): boolean => {
+    return !apiKeys[provider] && !!serverApiKeys[provider];
+  }, [apiKeys, serverApiKeys]);
 
   // Save last used provider
   const saveLastProvider = useCallback((provider: LLMProvider) => {
@@ -101,12 +114,17 @@ export function useGrading() {
     localStorage.setItem(MODEL_STORAGE_KEY, model);
   }, []);
 
-  // Fetch preset metrics on mount
+  // Fetch preset metrics and server API key availability on mount
   useEffect(() => {
     fetch('/api/preset-metrics')
       .then(res => res.json())
       .then(data => setPresetMetrics(data))
       .catch(err => console.error('Failed to load preset metrics:', err));
+    
+    fetch('/api/available-api-keys')
+      .then(res => res.json())
+      .then(data => setServerApiKeys(data))
+      .catch(err => console.error('Failed to check server API keys:', err));
   }, []);
 
   // Grade samples
@@ -120,7 +138,9 @@ export function useGrading() {
     model: string,
   ): Promise<GradeResponse | null> => {
     const apiKey = getApiKey(provider);
-    if (!apiKey) {
+    const hasServerKey = serverApiKeys[provider];
+    
+    if (!apiKey && !hasServerKey) {
       setError(`No API key configured for ${provider}`);
       return null;
     }
@@ -149,7 +169,8 @@ export function useGrading() {
         grade_type: gradeType,
         provider,
         model,
-        api_key: apiKey,
+        // Only include api_key if we have one locally, otherwise server uses .env
+        ...(apiKey ? { api_key: apiKey } : {}),
       };
 
       setProgress(prev => ({
@@ -204,7 +225,7 @@ export function useGrading() {
     } finally {
       abortControllerRef.current = null;
     }
-  }, [getApiKey, saveLastProvider, saveLastModel]);
+  }, [getApiKey, serverApiKeys, saveLastProvider, saveLastModel]);
 
   // Save graded samples to viz/ directory
   const saveGradedSamples = useCallback(async (
@@ -317,6 +338,7 @@ export function useGrading() {
     error,
     presetMetrics,
     apiKeys,
+    serverApiKeys,
     lastProvider,
     lastModel,
     
@@ -327,6 +349,8 @@ export function useGrading() {
     cancelGrading,
     saveApiKey,
     getApiKey,
+    hasApiKeyAvailable,
+    isUsingServerKey,
     saveLastProvider,
     saveLastModel,
     

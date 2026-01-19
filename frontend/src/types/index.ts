@@ -54,7 +54,7 @@ export interface GradeRequest {
   grade_type: 'float' | 'int' | 'bool';
   provider: LLMProvider;
   model: string;
-  api_key: string;
+  api_key?: string;  // Optional - server will use .env if not provided
 }
 
 export interface GradeResponse {

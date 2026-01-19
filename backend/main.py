@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -25,6 +26,33 @@ from backend.llm_providers import (
 
 # Project root directory (parent of backend/)
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
+
+# Load environment variables from .env file
+# Check multiple locations: project root, home directory
+env_locations = [
+    PROJECT_ROOT / ".env",
+    Path.home() / ".env",
+]
+for env_path in env_locations:
+    if env_path.exists():
+        load_dotenv(env_path)
+        break
+
+# API key environment variable names for each provider
+API_KEY_ENV_VARS = {
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "google": "GOOGLE_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+}
+
+
+def get_env_api_key(provider: str) -> Optional[str]:
+    """Get API key from environment for a provider."""
+    env_var = API_KEY_ENV_VARS.get(provider)
+    if env_var:
+        return os.getenv(env_var)
+    return None
 
 app = FastAPI(title="Rollout Visualizer API")
 
@@ -104,7 +132,7 @@ class GradeRequest(BaseModel):
     grade_type: str  # "float", "int", "bool"
     provider: str  # "openai", "anthropic", "google", "openrouter"
     model: str  # e.g., "gpt-4o", "claude-3-opus"
-    api_key: str  # User provides their key
+    api_key: Optional[str] = None  # Optional - will use .env if not provided
 
 
 class GradeResponse(BaseModel):
@@ -542,10 +570,31 @@ async def get_preset_metrics():
     }
 
 
+@app.get("/api/available-api-keys")
+async def get_available_api_keys():
+    """Check which API keys are available from server environment (.env file)."""
+    available = {}
+    for provider, env_var in API_KEY_ENV_VARS.items():
+        key = os.getenv(env_var)
+        available[provider] = bool(key and len(key) > 0)
+    return available
+
+
 @app.post("/api/grade", response_model=GradeResponse)
 async def grade_samples(request: GradeRequest):
     """Grade samples using an LLM provider."""
     try:
+        # Get API key - use provided key or fall back to environment
+        api_key = request.api_key
+        if not api_key:
+            api_key = get_env_api_key(request.provider)
+        
+        if not api_key:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No API key provided for {request.provider} and none found in .env file"
+            )
+        
         # Load the samples
         if request.file_path.startswith("s3://"):
             s3_path = request.file_path[5:]
@@ -555,7 +604,7 @@ async def grade_samples(request: GradeRequest):
             raw_samples = load_jsonl_from_file(request.file_path)
         
         # Get the LLM provider
-        provider = get_provider(request.provider, request.api_key, request.model)
+        provider = get_provider(request.provider, api_key, request.model)
         
         # Grade each requested sample
         grades: Dict[int, GradeEntry] = {}
