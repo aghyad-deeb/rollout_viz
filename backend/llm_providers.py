@@ -91,16 +91,24 @@ You MUST provide your response as a valid JSON object with the following structu
     "grade": <your grade value>,
     "quotes": [
         {{
-            "message_index": <index of the message (0-based)>,
-            "start": <start character position in the message content>,
-            "end": <end character position in the message content>,
-            "text": "<the exact quoted text>"
+            "message_index": <index of the message (0-based, as shown in [Message N] above)>,
+            "start": <start character position in the message content (0-based)>,
+            "end": <end character position in the message content (exclusive)>,
+            "text": "<the exact quoted text - must be a verbatim substring>"
         }}
     ],
     "explanation": "<your explanation for the grade, referencing the quotes>"
 }}
 
-Include 1-5 quotes that best support your grade. The quotes should be exact substrings from the message content.
+## Quoting Instructions
+
+Include 1-5 quotes that best support your grade. For each quote:
+1. **message_index**: The message number shown in brackets [Message N] - use N as the index
+2. **text**: Copy the EXACT substring from the message content - character for character, including any whitespace or punctuation
+3. **start**: The character position where your quoted text begins in that message's content (0 = first character)
+4. **end**: The character position where your quoted text ends (exclusive, so end - start = length of text)
+
+Example: If message content is "Hello world!" and you want to quote "world", then start=6, end=11, text="world"
 
 Respond ONLY with the JSON object, no additional text."""
 
