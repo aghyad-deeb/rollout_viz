@@ -1,5 +1,5 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
-import type { Sample, SearchCondition } from '../../types';
+import type { Sample, SearchCondition, Quote } from '../../types';
 import { MessageCard } from './MessageCard';
 
 interface ChatViewProps {
@@ -12,6 +12,7 @@ interface ChatViewProps {
   highlightedMessageIndex: number | null;
   highlightedText: string | null;
   onClearHighlight: () => void;
+  selectedGradeMetric?: string; // Which metric's quotes to highlight
 }
 
 interface LocalMatch {
@@ -29,7 +30,20 @@ export function ChatView({
   highlightedMessageIndex,
   highlightedText,
   onClearHighlight,
+  selectedGradeMetric,
 }: ChatViewProps) {
+  // Extract quotes from the selected grade metric
+  const gradeQuotes = useMemo((): Quote[] => {
+    if (!selectedGradeMetric || !sample.grades || !sample.grades[selectedGradeMetric]) {
+      return [];
+    }
+    const grades = sample.grades[selectedGradeMetric];
+    if (grades.length === 0) return [];
+    
+    // Get quotes from the latest grade
+    const latestGrade = grades[grades.length - 1];
+    return latestGrade.quotes || [];
+  }, [sample.grades, selectedGradeMetric]);
   // Get active search terms for highlighting (only 'contains' conditions with non-empty terms)
   const activeSearchTerms = useMemo(() => 
     searchConditions
@@ -310,6 +324,7 @@ export function ChatView({
               onClearHighlight={onClearHighlight}
               messageOccurrenceStart={messageOccurrenceStarts[index] ?? 0}
               currentOccurrenceIndex={currentOccurrenceIndex}
+              gradeQuotes={gradeQuotes}
             />
           </div>
         ))}

@@ -4,15 +4,23 @@ FastAPI backend for Rollout Trace Visualizer.
 Provides REST API endpoints for loading JSONL data from local files or S3.
 """
 
+import asyncio
 import json
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+from llm_providers import (
+    get_provider,
+    GradeResult,
+    Quote as LLMQuote,
+    PRESET_METRICS,
+)
 
 
 # Project root directory (parent of backend/)
@@ -50,6 +58,7 @@ class Sample(BaseModel):
     messages: List[Message]
     attributes: SampleAttributes
     timestamp: str
+    grades: Optional[Dict[str, List[Dict[str, Any]]]] = None  # metric_name -> list of grade entries
 
 
 class FileInfo(BaseModel):
@@ -63,6 +72,65 @@ class SamplesResponse(BaseModel):
     total: int
     experiment_name: str
     file_path: str
+    has_grades: bool = False
+
+
+# Grading models
+class Quote(BaseModel):
+    """A quoted section from a message that supports the grade."""
+    message_index: int
+    start: int
+    end: int
+    text: str
+
+
+class GradeEntry(BaseModel):
+    """A single grade entry for a metric."""
+    grade: Union[float, int, bool]
+    grade_type: str  # "float", "int", "bool"
+    quotes: List[Quote]
+    explanation: str
+    model: str
+    prompt_version: str
+    timestamp: str
+
+
+class SampleGrades(BaseModel):
+    """All grades for a sample, keyed by metric name."""
+    __root__: Dict[str, List[GradeEntry]] = {}
+
+
+class GradeRequest(BaseModel):
+    """Request to grade samples."""
+    file_path: str
+    sample_ids: List[int]  # Which samples to grade
+    metric_name: str
+    metric_prompt: str  # The grading prompt
+    grade_type: str  # "float", "int", "bool"
+    provider: str  # "openai", "anthropic", "google", "openrouter"
+    model: str  # e.g., "gpt-4o", "claude-3-opus"
+    api_key: str  # User provides their key
+
+
+class GradeResponse(BaseModel):
+    """Response from grading operation."""
+    graded_count: int
+    errors: List[Dict[str, Any]]
+    grades: Dict[int, GradeEntry]  # sample_id -> grade
+
+
+class SaveGradedRequest(BaseModel):
+    """Request to save graded samples to viz/ directory."""
+    file_path: str
+    grades: Dict[int, Dict[str, GradeEntry]]  # sample_id -> {metric_name: grade}
+
+
+class PresetMetricInfo(BaseModel):
+    """Information about a preset metric."""
+    name: str
+    description: str
+    grade_type: str
+    prompt: str
 
 
 def load_env_credentials():
@@ -299,15 +367,28 @@ async def get_s3_contents(
 async def get_samples(
     file: str = Query(..., description="Path to JSONL file (local path or s3://bucket/key)")
 ):
-    """Load samples from a JSONL file."""
+    """Load samples from a JSONL file.
+    
+    Automatically checks for a viz/ version first (which includes grades).
+    Falls back to the original file if viz/ doesn't exist.
+    """
     try:
-        if file.startswith("s3://"):
+        # Check if viz/ version exists and use it if so
+        viz_path = get_viz_path(file)
+        has_grades = False
+        actual_path = file
+        
+        if viz_file_exists(viz_path):
+            actual_path = viz_path
+            has_grades = True
+        
+        if actual_path.startswith("s3://"):
             # Parse S3 path
-            s3_path = file[5:]  # Remove 's3://'
+            s3_path = actual_path[5:]  # Remove 's3://'
             bucket, key = s3_path.split("/", 1)
             raw_samples = load_jsonl_from_s3(bucket, key)
         else:
-            raw_samples = load_jsonl_from_file(file)
+            raw_samples = load_jsonl_from_file(actual_path)
         
         # Convert to Sample objects with IDs
         samples = []
@@ -322,11 +403,17 @@ async def get_samples(
             if 'validate' in attrs:
                 attrs['is_validate'] = attrs.pop('validate')
             
+            # Include grades if present
+            grades = raw.get('grades', None)
+            if grades:
+                has_grades = True
+            
             sample = Sample(
                 id=i,
                 messages=[Message(**msg) for msg in raw.get('messages', [])],
                 attributes=SampleAttributes(**attrs),
                 timestamp=raw.get('timestamp', ''),
+                grades=grades,
             )
             samples.append(sample)
         
@@ -334,7 +421,8 @@ async def get_samples(
             samples=samples,
             total=len(samples),
             experiment_name=experiment_name,
-            file_path=file,
+            file_path=file,  # Return original path for consistency
+            has_grades=has_grades,
         )
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"File not found: {file}")
@@ -373,6 +461,222 @@ async def get_sample(
         )
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Helper functions for viz/ path handling
+
+def get_viz_path(original_path: str) -> str:
+    """Get the viz/ subdirectory path for a file.
+    
+    For /path/to/file.jsonl -> /path/to/viz/file.jsonl
+    For s3://bucket/path/file.jsonl -> s3://bucket/path/viz/file.jsonl
+    """
+    if original_path.startswith("s3://"):
+        # S3 path
+        s3_path = original_path[5:]  # Remove 's3://'
+        parts = s3_path.rsplit("/", 1)
+        if len(parts) == 2:
+            prefix, filename = parts
+            return f"s3://{prefix}/viz/{filename}"
+        else:
+            return f"s3://viz/{s3_path}"
+    else:
+        # Local path
+        path = Path(original_path)
+        return str(path.parent / "viz" / path.name)
+
+
+def viz_file_exists(viz_path: str) -> bool:
+    """Check if the viz/ version of a file exists."""
+    if viz_path.startswith("s3://"):
+        import boto3
+        try:
+            load_env_credentials()
+            s3_client = boto3.client('s3')
+            s3_path = viz_path[5:]
+            bucket, key = s3_path.split("/", 1)
+            s3_client.head_object(Bucket=bucket, Key=key)
+            return True
+        except Exception:
+            return False
+    else:
+        path = Path(viz_path)
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+        return path.exists()
+
+
+def save_jsonl_to_file(file_path: str, samples: List[Dict[str, Any]]) -> None:
+    """Save samples to a local JSONL file."""
+    path = Path(file_path)
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    
+    # Create parent directories including viz/
+    path.parent.mkdir(parents=True, exist_ok=True)
+    
+    with open(path, 'w') as f:
+        for sample in samples:
+            f.write(json.dumps(sample) + '\n')
+
+
+def save_jsonl_to_s3(bucket: str, key: str, samples: List[Dict[str, Any]]) -> None:
+    """Save samples to S3 as JSONL."""
+    import boto3
+    
+    load_env_credentials()
+    s3_client = boto3.client('s3')
+    
+    content = '\n'.join(json.dumps(sample) for sample in samples)
+    s3_client.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=content.encode('utf-8'),
+        ContentType='application/jsonl'
+    )
+
+
+@app.get("/api/preset-metrics", response_model=Dict[str, PresetMetricInfo])
+async def get_preset_metrics():
+    """Get available preset metrics for grading."""
+    return {
+        key: PresetMetricInfo(**value)
+        for key, value in PRESET_METRICS.items()
+    }
+
+
+@app.post("/api/grade", response_model=GradeResponse)
+async def grade_samples(request: GradeRequest):
+    """Grade samples using an LLM provider."""
+    try:
+        # Load the samples
+        if request.file_path.startswith("s3://"):
+            s3_path = request.file_path[5:]
+            bucket, key = s3_path.split("/", 1)
+            raw_samples = load_jsonl_from_s3(bucket, key)
+        else:
+            raw_samples = load_jsonl_from_file(request.file_path)
+        
+        # Get the LLM provider
+        provider = get_provider(request.provider, request.api_key, request.model)
+        
+        # Grade each requested sample
+        grades: Dict[int, GradeEntry] = {}
+        errors: List[Dict[str, Any]] = []
+        
+        async def grade_one(sample_id: int) -> tuple:
+            if sample_id < 0 or sample_id >= len(raw_samples):
+                return sample_id, None, f"Sample {sample_id} not found"
+            
+            raw = raw_samples[sample_id]
+            messages = raw.get('messages', [])
+            
+            try:
+                result = await provider.grade_sample(
+                    messages=messages,
+                    metric_prompt=request.metric_prompt,
+                    grade_type=request.grade_type,
+                )
+                
+                grade_entry = GradeEntry(
+                    grade=result.grade,
+                    grade_type=result.grade_type,
+                    quotes=[Quote(**q.dict()) for q in result.quotes],
+                    explanation=result.explanation,
+                    model=result.model,
+                    prompt_version=result.prompt_version,
+                    timestamp=result.timestamp,
+                )
+                return sample_id, grade_entry, None
+            except Exception as e:
+                return sample_id, None, str(e)
+        
+        # Grade samples concurrently (but with some rate limiting)
+        # Process in batches of 5 to avoid overwhelming the API
+        batch_size = 5
+        for i in range(0, len(request.sample_ids), batch_size):
+            batch = request.sample_ids[i:i + batch_size]
+            results = await asyncio.gather(*[grade_one(sid) for sid in batch])
+            
+            for sample_id, grade_entry, error in results:
+                if error:
+                    errors.append({"sample_id": sample_id, "error": error})
+                elif grade_entry:
+                    grades[sample_id] = grade_entry
+        
+        return GradeResponse(
+            graded_count=len(grades),
+            errors=errors,
+            grades=grades,
+        )
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/save-graded")
+async def save_graded_samples(request: SaveGradedRequest):
+    """Save graded samples to the viz/ subdirectory.
+    
+    This merges new grades with any existing grades in the viz/ file.
+    """
+    try:
+        # Determine paths
+        original_path = request.file_path
+        viz_path = get_viz_path(original_path)
+        
+        # Load existing samples (prefer viz/ if exists, else original)
+        if viz_file_exists(viz_path):
+            source_path = viz_path
+        else:
+            source_path = original_path
+        
+        if source_path.startswith("s3://"):
+            s3_path = source_path[5:]
+            bucket, key = s3_path.split("/", 1)
+            raw_samples = load_jsonl_from_s3(bucket, key)
+        else:
+            raw_samples = load_jsonl_from_file(source_path)
+        
+        # Merge new grades into samples
+        for sample_id_str, metric_grades in request.grades.items():
+            sample_id = int(sample_id_str)
+            if sample_id < 0 or sample_id >= len(raw_samples):
+                continue
+            
+            sample = raw_samples[sample_id]
+            
+            # Initialize grades dict if not present
+            if 'grades' not in sample:
+                sample['grades'] = {}
+            
+            # Merge each metric's grades
+            for metric_name, grade_entry in metric_grades.items():
+                if metric_name not in sample['grades']:
+                    sample['grades'][metric_name] = []
+                
+                # Add the new grade entry
+                if isinstance(grade_entry, dict):
+                    sample['grades'][metric_name].append(grade_entry)
+                else:
+                    sample['grades'][metric_name].append(grade_entry.dict())
+        
+        # Save to viz/ path
+        if viz_path.startswith("s3://"):
+            s3_path = viz_path[5:]
+            bucket, key = s3_path.split("/", 1)
+            save_jsonl_to_s3(bucket, key, raw_samples)
+        else:
+            save_jsonl_to_file(viz_path, raw_samples)
+        
+        return {
+            "success": True,
+            "viz_path": viz_path,
+            "samples_updated": len(request.grades),
+        }
+    
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

@@ -1,8 +1,9 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { Panel, Group as PanelGroup, Separator as PanelResizeHandle } from 'react-resizable-panels';
 import { LeftPanel } from './components/LeftPanel';
 import { RightPanel } from './components/RightPanel';
 import { FileBrowser } from './components/FileBrowser';
+import { GradingPanel } from './components/GradingPanel';
 import { useApi } from './hooks/useApi';
 import { useMarkedFiles } from './hooks/useMarkedFiles';
 import { useDarkMode } from './hooks/useDarkMode';
@@ -26,6 +27,9 @@ function App() {
   const [currentOccurrenceIndex, setCurrentOccurrenceIndex] = useState(0);
   const [highlightedMessageIndex, setHighlightedMessageIndex] = useState<number | null>(null);
   const [highlightedText, setHighlightedText] = useState<string | null>(null);
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const [selectedGradeMetric, _setSelectedGradeMetric] = useState<string | undefined>(undefined);
+  const [isGradingPanelOpen, setIsGradingPanelOpen] = useState(false);
   const { loading, error, loadSamples, loadMultipleSamples } = useApi();
   const { markedFiles, toggleMark } = useMarkedFiles();
   const { isDarkMode, toggleDarkMode } = useDarkMode();
@@ -151,6 +155,25 @@ function App() {
     setSelectedSampleId(samples[newIndex].id);
   };
 
+  // Reload samples after grading to pick up the viz/ version with grades
+  const handleGradingComplete = useCallback(() => {
+    if (filePaths.length === 0) return;
+    
+    if (filePaths.length === 1) {
+      loadSamples(filePaths[0]).then((data) => {
+        if (data) {
+          setSamples(data.samples);
+        }
+      });
+    } else {
+      loadMultipleSamples(filePaths).then((data) => {
+        if (data) {
+          setSamples(data.samples);
+        }
+      });
+    }
+  }, [filePaths, loadSamples, loadMultipleSamples]);
+
   return (
     <div className={`h-screen ${isDarkMode ? 'bg-[#1a1a2e]' : 'bg-white'}`}>
       <PanelGroup orientation="horizontal" className="h-full">
@@ -196,6 +219,7 @@ function App() {
               setHighlightedMessageIndex(null);
               setHighlightedText(null);
             }}
+            selectedGradeMetric={selectedGradeMetric}
           />
         </Panel>
       </PanelGroup>
@@ -212,6 +236,46 @@ function App() {
         onToggleMark={toggleMark}
         isDarkMode={isDarkMode}
       />
+
+      {/* Grading Panel Modal */}
+      {isGradingPanelOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+          <div className={`relative w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto rounded-xl shadow-2xl ${isDarkMode ? 'bg-gray-900' : 'bg-white'}`}>
+            <button
+              onClick={() => setIsGradingPanelOpen(false)}
+              className={`absolute top-3 right-3 p-1 rounded-lg ${isDarkMode ? 'hover:bg-gray-700 text-gray-400' : 'hover:bg-gray-100 text-gray-500'}`}
+            >
+              <span className="material-symbols-outlined">close</span>
+            </button>
+            <div className="p-4">
+              <GradingPanel
+                filteredSampleIds={filteredSamples.map(s => s.id)}
+                filePath={primaryFilePath}
+                isDarkMode={isDarkMode}
+                onGradingComplete={() => {
+                  handleGradingComplete();
+                  setIsGradingPanelOpen(false);
+                }}
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Floating Grade Button */}
+      {samples.length > 0 && (
+        <button
+          onClick={() => setIsGradingPanelOpen(true)}
+          className={`fixed bottom-6 right-6 p-4 rounded-full shadow-lg transition-all z-40
+            ${isDarkMode 
+              ? 'bg-purple-600 hover:bg-purple-500 text-white' 
+              : 'bg-purple-500 hover:bg-purple-600 text-white'
+            }`}
+          title="Grade samples with LLM"
+        >
+          <span className="material-symbols-outlined" style={{ fontSize: 24 }}>psychology</span>
+        </button>
+      )}
     </div>
   );
 }

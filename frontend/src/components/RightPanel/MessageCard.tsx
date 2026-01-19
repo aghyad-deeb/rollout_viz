@@ -1,5 +1,5 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
-import type { Message, SearchCondition, SearchField } from '../../types';
+import type { Message, SearchCondition, SearchField, Quote } from '../../types';
 
 interface MessageCardProps {
   message: Message;
@@ -17,6 +17,8 @@ interface MessageCardProps {
   // For tracking which occurrence is "current" in global search
   messageOccurrenceStart: number; // Starting index of occurrences in this message (0-based global)
   currentOccurrenceIndex: number; // Which occurrence is currently focused
+  // Grade quotes to highlight
+  gradeQuotes?: Quote[];
 }
 
 const ROLE_CONFIG = {
@@ -68,6 +70,7 @@ export function MessageCard({
   onClearHighlight,
   messageOccurrenceStart,
   currentOccurrenceIndex,
+  gradeQuotes = [],
 }: MessageCardProps) {
   const [isExpanded, setIsExpanded] = useState(true);
   const [selectionPopup, setSelectionPopup] = useState<SelectionPopup>({ show: false, x: 0, y: 0, text: '' });
@@ -213,7 +216,47 @@ export function MessageCard({
         return parts.length > 0 ? parts : text;
       }
 
-      // Priority 2: Local search (within this chat) - green highlight
+      // Priority 2: Grade quotes (from LLM grading) - purple highlight
+      if (gradeQuotes.length > 0) {
+        const quotesForThisMessage = gradeQuotes.filter(q => q.message_index === index);
+        if (quotesForThisMessage.length > 0) {
+          const parts: React.ReactNode[] = [];
+          let lastIndex = 0;
+          
+          // Sort quotes by start position
+          const sortedQuotes = [...quotesForThisMessage].sort((a, b) => a.start - b.start);
+          
+          for (const quote of sortedQuotes) {
+            if (quote.start < lastIndex) continue; // Skip overlapping
+            if (quote.start > text.length || quote.end > text.length) continue; // Skip invalid ranges
+            
+            if (quote.start > lastIndex) {
+              parts.push(text.slice(lastIndex, quote.start));
+            }
+            
+            parts.push(
+              <mark
+                key={`quote-${quote.start}`}
+                className="bg-purple-200 dark:bg-purple-900/50 text-purple-900 dark:text-purple-200 px-0.5 rounded border-b-2 border-purple-400"
+                title="Quoted by LLM grader"
+              >
+                {text.slice(quote.start, quote.end)}
+              </mark>
+            );
+            lastIndex = quote.end;
+          }
+          
+          if (lastIndex < text.length) {
+            parts.push(text.slice(lastIndex));
+          }
+          
+          if (parts.length > 0) {
+            return parts;
+          }
+        }
+      }
+
+      // Priority 3: Local search (within this chat) - green highlight
       if (localSearchTerm && localSearchTerm.trim() !== '') {
         const term = localSearchTerm.toLowerCase();
         const parts: React.ReactNode[] = [];
@@ -244,7 +287,7 @@ export function MessageCard({
         return parts.length > 0 ? parts : text;
       }
 
-      // Priority 3: Global search terms (from left panel) - yellow highlight, current = orange
+      // Priority 4: Global search terms (from left panel) - yellow highlight, current = orange
       const applicableTerms = getApplicableSearchTerms(isReasoning);
       if (applicableTerms.length === 0) {
         return text;
@@ -314,7 +357,7 @@ export function MessageCard({
 
       return parts.length > 0 ? parts : text;
     };
-  }, [searchConditions, getApplicableSearchTerms, localSearchTerm, isCurrentLocalMatch, highlightedText, onClearHighlight, messageOccurrenceStart, currentOccurrenceIndex]);
+  }, [searchConditions, getApplicableSearchTerms, localSearchTerm, isCurrentLocalMatch, highlightedText, onClearHighlight, messageOccurrenceStart, currentOccurrenceIndex, gradeQuotes, index]);
 
   // Parse reasoning from assistant messages
   const parseContent = (content: string) => {

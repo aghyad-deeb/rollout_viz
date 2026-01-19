@@ -18,6 +18,7 @@ interface RightPanelProps {
   highlightedMessageIndex: number | null;
   highlightedText: string | null;
   onClearHighlight: () => void;
+  selectedGradeMetric?: string;
 }
 
 export function RightPanel({
@@ -34,6 +35,7 @@ export function RightPanel({
   highlightedMessageIndex,
   highlightedText,
   onClearHighlight,
+  selectedGradeMetric,
 }: RightPanelProps) {
   const [viewMode, setViewMode] = useState<ViewMode>('chat');
 
@@ -69,6 +71,7 @@ export function RightPanel({
           highlightedMessageIndex={highlightedMessageIndex}
           highlightedText={highlightedText}
           onClearHighlight={onClearHighlight}
+          selectedGradeMetric={selectedGradeMetric}
         />
       );
     }

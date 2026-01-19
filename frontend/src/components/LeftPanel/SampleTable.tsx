@@ -12,7 +12,7 @@ interface SampleTableProps {
 }
 
 interface Column {
-  key: SortColumn | 'favourite';
+  key: SortColumn | 'favourite' | 'grades';
   label: string;
   sortable: boolean;
 }
@@ -22,8 +22,30 @@ const COLUMNS: Column[] = [
   { key: 'sample_index', label: 'ID', sortable: true },
   { key: 'step', label: 'Step', sortable: true },
   { key: 'reward', label: 'Reward', sortable: true },
+  { key: 'grades', label: 'Grades', sortable: false },
   { key: 'data_source', label: 'Source', sortable: true },
 ];
+
+// Helper to format a grade value
+function formatGrade(grade: number | boolean, gradeType: string): string {
+  if (gradeType === 'bool') return grade ? '✓' : '✗';
+  if (gradeType === 'float') return (grade as number).toFixed(2);
+  return String(grade);
+}
+
+// Helper to get grade color
+function getGradeColor(grade: number | boolean, gradeType: string, isDarkMode: boolean): string {
+  if (gradeType === 'bool') {
+    return grade 
+      ? (isDarkMode ? 'text-green-400' : 'text-green-600')
+      : (isDarkMode ? 'text-red-400' : 'text-red-600');
+  }
+  // For numeric grades, use a gradient
+  const value = grade as number;
+  if (value >= 0.7) return isDarkMode ? 'text-green-400' : 'text-green-600';
+  if (value >= 0.4) return isDarkMode ? 'text-yellow-400' : 'text-yellow-600';
+  return isDarkMode ? 'text-red-400' : 'text-red-600';
+}
 
 const ROW_HEIGHT = 36;
 
@@ -75,6 +97,7 @@ export function SampleTable({
                 col.key === 'sample_index' ? 'w-12 text-center' :
                 col.key === 'step' ? 'w-12 text-center' :
                 col.key === 'reward' ? 'w-16 text-right' :
+                col.key === 'grades' ? 'w-20 text-center' :
                 'flex-1 min-w-0'
               }`}
               onClick={() => col.sortable && onSort(col.key as SortColumn)}
@@ -147,6 +170,27 @@ export function SampleTable({
                     : (isDarkMode ? 'text-red-400' : 'text-red-600')
                 }`}>
                   {reward}
+                </div>
+
+                {/* Grades */}
+                <div className="w-20 flex items-center justify-center gap-1">
+                  {sample.grades && Object.entries(sample.grades).length > 0 ? (
+                    Object.entries(sample.grades).slice(0, 3).map(([metric, grades]) => {
+                      const latest = grades[grades.length - 1];
+                      if (!latest) return null;
+                      return (
+                        <span
+                          key={metric}
+                          className={`text-xs font-medium ${getGradeColor(latest.grade, latest.grade_type, isDarkMode)}`}
+                          title={`${metric}: ${formatGrade(latest.grade, latest.grade_type)}`}
+                        >
+                          {formatGrade(latest.grade, latest.grade_type)}
+                        </span>
+                      );
+                    })
+                  ) : (
+                    <span className={`text-xs ${isDarkMode ? 'text-gray-600' : 'text-gray-300'}`}>—</span>
+                  )}
                 </div>
 
                 {/* Data Source */}
