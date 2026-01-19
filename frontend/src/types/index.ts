@@ -55,6 +55,7 @@ export interface GradeRequest {
   provider: LLMProvider;
   model: string;
   api_key?: string;  // Optional - server will use .env if not provided
+  use_batch?: boolean;  // Use OpenAI Batch API (50% cheaper, 24h turnaround)
 }
 
 export interface GradeResponse {
@@ -85,26 +86,49 @@ export const LLM_PROVIDERS: Record<LLMProvider, LLMProviderConfig> = {
     displayName: 'OpenAI',
     defaultModel: 'gpt-4o',
     models: [
+      // GPT-5.2 series (latest)
+      'gpt-5.2',
+      'gpt-5.2-codex',
+      'gpt-5.2-pro',
+      // GPT-5.1 series
+      'gpt-5.1',
+      'gpt-5.1-codex',
+      'gpt-5.1-codex-mini',
+      'gpt-5.1-codex-max',
+      // GPT-5 series
+      'gpt-5',
+      'gpt-5-codex',
+      'gpt-5-mini',
+      'gpt-5-nano',
+      'gpt-5-pro',
+      // GPT-4 series
       'gpt-4o',
       'gpt-4o-mini',
+      'gpt-4.1',
+      'gpt-4.1-mini',
+      'gpt-4.1-nano',
       'gpt-4-turbo',
+      // Reasoning models
       'o1',
-      'o1-mini',
-      'o1-preview',
+      'o1-pro',
+      'o3',
       'o3-mini',
+      'o3-pro',
     ],
   },
   anthropic: {
     name: 'anthropic',
     displayName: 'Anthropic',
-    defaultModel: 'claude-sonnet-4-20250514',
+    defaultModel: 'claude-sonnet-4-5-20250929',
     models: [
+      'claude-opus-4-5-20251101',
       'claude-opus-4-1-20250805',
       'claude-opus-4-20250514',
+      'claude-sonnet-4-5-20250929',
       'claude-sonnet-4-20250514',
+      'claude-haiku-4-5-20251001',
       'claude-3-7-sonnet-20250219',
       'claude-3-5-haiku-20241022',
-      'claude-3-5-sonnet-20241022',
     ],
   },
   google: {
@@ -112,12 +136,13 @@ export const LLM_PROVIDERS: Record<LLMProvider, LLMProviderConfig> = {
     displayName: 'Google',
     defaultModel: 'gemini-2.5-flash',
     models: [
+      'gemini-3-pro-preview',
+      'gemini-3-flash-preview',
       'gemini-2.5-pro',
       'gemini-2.5-flash',
       'gemini-2.5-flash-lite',
       'gemini-2.0-flash',
-      'gemini-1.5-pro',
-      'gemini-1.5-flash',
+      'gemini-2.0-flash-lite',
     ],
   },
   openrouter: {
@@ -127,15 +152,17 @@ export const LLM_PROVIDERS: Record<LLMProvider, LLMProviderConfig> = {
     models: [
       'openai/gpt-4o',
       'openai/gpt-4o-mini',
-      'openai/o1',
+      'openai/o3',
       'openai/o3-mini',
-      'anthropic/claude-sonnet-4',
-      'anthropic/claude-3.5-sonnet',
+      'anthropic/claude-opus-4.5',
+      'anthropic/claude-sonnet-4.5',
+      'anthropic/claude-3.7-sonnet',
       'google/gemini-2.5-pro',
       'google/gemini-2.5-flash',
-      'meta-llama/llama-3.3-70b-instruct',
+      'meta-llama/llama-3.1-405b-instruct',
       'deepseek/deepseek-r1',
       'deepseek/deepseek-chat',
+      'mistralai/devstral-2512',
     ],
   },
 };

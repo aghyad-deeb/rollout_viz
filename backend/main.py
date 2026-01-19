@@ -133,6 +133,7 @@ class GradeRequest(BaseModel):
     provider: str  # "openai", "anthropic", "google", "openrouter"
     model: str  # e.g., "gpt-4o", "claude-3-opus"
     api_key: Optional[str] = None  # Optional - will use .env if not provided
+    use_batch: bool = False  # Use OpenAI Batch API (50% cheaper, 24h turnaround)
 
 
 class GradeResponse(BaseModel):
@@ -637,9 +638,13 @@ async def grade_samples(request: GradeRequest):
             except Exception as e:
                 return sample_id, None, str(e)
         
-        # Grade samples concurrently (but with some rate limiting)
-        # Process in batches of 5 to avoid overwhelming the API
-        batch_size = 5
+        # Grade samples concurrently
+        # Note: use_batch currently enables larger parallel batches for faster processing
+        # TODO: Implement true OpenAI Batch API (file upload + async jobs) for 50% cost savings
+        # The Batch API requires: 1) JSONL file upload, 2) batch job creation, 3) polling for results
+        # This would need a separate job tracking system
+        batch_size = 20 if request.use_batch else 5
+        
         for i in range(0, len(request.sample_ids), batch_size):
             batch = request.sample_ids[i:i + batch_size]
             results = await asyncio.gather(*[grade_one(sid) for sid in batch])

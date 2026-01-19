@@ -136,6 +136,7 @@ export function useGrading() {
     gradeType: 'float' | 'int' | 'bool',
     provider: LLMProvider,
     model: string,
+    useBatch: boolean = false,
   ): Promise<GradeResponse | null> => {
     const apiKey = getApiKey(provider);
     const hasServerKey = serverApiKeys[provider];
@@ -171,6 +172,7 @@ export function useGrading() {
         model,
         // Only include api_key if we have one locally, otherwise server uses .env
         ...(apiKey ? { api_key: apiKey } : {}),
+        ...(useBatch ? { use_batch: true } : {}),
       };
 
       setProgress(prev => ({
@@ -264,6 +266,7 @@ export function useGrading() {
     gradeType: 'float' | 'int' | 'bool',
     provider: LLMProvider,
     model: string,
+    useBatch: boolean = false,
   ): Promise<GradeResponse | null> => {
     const gradeResult = await gradeSamples(
       filePath,
@@ -273,6 +276,7 @@ export function useGrading() {
       gradeType,
       provider,
       model,
+      useBatch,
     );
 
     if (!gradeResult || gradeResult.graded_count === 0) {
