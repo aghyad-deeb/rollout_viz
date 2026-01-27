@@ -34,6 +34,20 @@ echo "============================================================"
 echo ""
 
 # =============================================================================
+# STEP 0: Load environment variables from ~/.env
+# =============================================================================
+
+if [ -f "$HOME/.env" ]; then
+    echo "Loading environment variables from ~/.env"
+    set -a
+    source "$HOME/.env"
+    set +a
+else
+    echo "Warning: ~/.env not found (API keys may be missing)"
+fi
+echo ""
+
+# =============================================================================
 # STEP 1: Setup nvm if needed
 # =============================================================================
 
@@ -117,17 +131,21 @@ fi
 
 echo "Starting tmux session '$SESSION_NAME'..."
 
+# Helper to load env in tmux windows
+ENV_LOAD='[ -f ~/.env ] && set -a && source ~/.env && set +a;'
+NVM_LOAD='export NVM_DIR="$HOME/.nvm" && [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" && nvm use 20'
+
 # Create new tmux session with shell window (index 0)
 tmux new-session -d -s "$SESSION_NAME" -n "shell"
-tmux send-keys -t "$SESSION_NAME:shell" "cd $SCRIPT_DIR && source venv/bin/activate && export NVM_DIR=\"\$HOME/.nvm\" && [ -s \"\$NVM_DIR/nvm.sh\" ] && . \"\$NVM_DIR/nvm.sh\" && nvm use 20" Enter
+tmux send-keys -t "$SESSION_NAME:shell" "cd $SCRIPT_DIR && $ENV_LOAD source venv/bin/activate && $NVM_LOAD" Enter
 
 # Create backend window (index 1)
 tmux new-window -t "$SESSION_NAME" -n "backend"
-tmux send-keys -t "$SESSION_NAME:backend" "cd $SCRIPT_DIR && source venv/bin/activate && python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload" Enter
+tmux send-keys -t "$SESSION_NAME:backend" "cd $SCRIPT_DIR && $ENV_LOAD source venv/bin/activate && python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload" Enter
 
 # Create frontend window (index 2)
 tmux new-window -t "$SESSION_NAME" -n "frontend"
-tmux send-keys -t "$SESSION_NAME:frontend" "cd $SCRIPT_DIR/frontend && export NVM_DIR=\"\$HOME/.nvm\" && [ -s \"\$NVM_DIR/nvm.sh\" ] && . \"\$NVM_DIR/nvm.sh\" && nvm use 20 && npm run dev" Enter
+tmux send-keys -t "$SESSION_NAME:frontend" "cd $SCRIPT_DIR/frontend && $ENV_LOAD $NVM_LOAD && npm run dev -- --host 127.0.0.1" Enter
 
 # Go back to shell window
 tmux select-window -t "$SESSION_NAME:shell"
