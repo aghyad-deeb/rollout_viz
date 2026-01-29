@@ -647,7 +647,21 @@ async def grade_samples(request: GradeRequest):
                 )
                 return sample_id, grade_entry, None
             except Exception as e:
-                return sample_id, None, str(e)
+                error_msg = str(e)
+                # Provide more helpful error messages for common issues
+                if "401" in error_msg or "invalid_api_key" in error_msg or "Incorrect API key" in error_msg:
+                    error_msg = (
+                        f"API key authentication failed. Common causes: "
+                        f"(1) The API key in ~/.env may have quotes around it - remove them. "
+                        f"(2) The API key may be expired or invalid. "
+                        f"(3) The API key may not have access to the selected model. "
+                        f"Original error: {error_msg}"
+                    )
+                elif "403" in error_msg or "forbidden" in error_msg.lower():
+                    error_msg = f"Access forbidden. Your API key may not have permission for this model. Original error: {error_msg}"
+                elif "429" in error_msg or "rate_limit" in error_msg.lower():
+                    error_msg = f"Rate limit exceeded. Try reducing parallel_size or wait before retrying. Original error: {error_msg}"
+                return sample_id, None, error_msg
         
         # Grade samples concurrently with configurable parallelism
         batch_size = min(request.parallel_size, 500)  # Cap at 500 to avoid overwhelming APIs
