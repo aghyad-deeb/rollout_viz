@@ -190,16 +190,23 @@ Respond ONLY with the JSON object, no additional text."""
 
 class OpenAIProvider(LLMProvider):
     """OpenAI API provider."""
-    
+
+    _client: Any = None  # Cached client instance
+
+    def _get_client(self):
+        """Get or create cached OpenAI client."""
+        if self._client is None:
+            from openai import AsyncOpenAI
+            self._client = AsyncOpenAI(api_key=self.api_key)
+        return self._client
+
     async def grade_sample(
         self,
         messages: List[Dict[str, str]],
         metric_prompt: str,
         grade_type: str,
     ) -> GradeResult:
-        from openai import AsyncOpenAI
-        
-        client = AsyncOpenAI(api_key=self.api_key)
+        client = self._get_client()
         prompt = self._build_grading_prompt(messages, metric_prompt, grade_type)
         
         # Build kwargs with optional parameters
@@ -233,16 +240,23 @@ class OpenAIProvider(LLMProvider):
 
 class AnthropicProvider(LLMProvider):
     """Anthropic API provider."""
-    
+
+    _client: Any = None  # Cached client instance
+
+    def _get_client(self):
+        """Get or create cached Anthropic client."""
+        if self._client is None:
+            from anthropic import AsyncAnthropic
+            self._client = AsyncAnthropic(api_key=self.api_key)
+        return self._client
+
     async def grade_sample(
         self,
         messages: List[Dict[str, str]],
         metric_prompt: str,
         grade_type: str,
     ) -> GradeResult:
-        from anthropic import AsyncAnthropic
-        
-        client = AsyncAnthropic(api_key=self.api_key)
+        client = self._get_client()
         prompt = self._build_grading_prompt(messages, metric_prompt, grade_type)
         
         # Build kwargs with optional parameters
@@ -321,17 +335,27 @@ class GoogleProvider(LLMProvider):
 
 class OpenRouterProvider(LLMProvider):
     """OpenRouter API provider (OpenAI-compatible)."""
-    
+
+    _client: Any = None  # Cached httpx client instance
+
+    def _get_client(self):
+        """Get or create cached httpx client with connection pooling."""
+        if self._client is None:
+            import httpx
+            self._client = httpx.AsyncClient(
+                timeout=120.0,
+                limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+            )
+        return self._client
+
     async def grade_sample(
         self,
         messages: List[Dict[str, str]],
         metric_prompt: str,
         grade_type: str,
     ) -> GradeResult:
-        import httpx
-        
         prompt = self._build_grading_prompt(messages, metric_prompt, grade_type)
-        
+
         # Build request body with optional parameters
         body: Dict[str, Any] = {
             "model": self.model,
@@ -343,19 +367,18 @@ class OpenRouterProvider(LLMProvider):
             body["max_tokens"] = self.max_tokens
         if self.top_p is not None:
             body["top_p"] = self.top_p
-        
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=body,
-                timeout=120.0,
-            )
-            response.raise_for_status()
-            data = response.json()
+
+        client = self._get_client()
+        response = await client.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+        )
+        response.raise_for_status()
+        data = response.json()
         
         response_text = data["choices"][0]["message"]["content"]
         parsed = self._parse_grade_response(response_text, grade_type)

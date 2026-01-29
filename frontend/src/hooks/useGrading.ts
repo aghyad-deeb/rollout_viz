@@ -127,7 +127,7 @@ export function useGrading() {
       .catch(err => console.error('Failed to check server API keys:', err));
   }, []);
 
-  // Grade samples
+  // Grade samples with streaming (SSE) for real-time progress updates
   const gradeSamples = useCallback(async (
     filePath: string,
     sampleIds: number[],
@@ -145,14 +145,14 @@ export function useGrading() {
   ): Promise<GradeResponse | null> => {
     const apiKey = getApiKey(provider);
     const hasServerKey = serverApiKeys[provider];
-    
+
     if (!apiKey && !hasServerKey) {
       setError(`No API key configured for ${provider}`);
       return null;
     }
 
     setError(null);
-    
+
     // Create new abort controller for this request
     abortControllerRef.current = new AbortController();
     const signal = abortControllerRef.current.signal;
@@ -190,7 +190,8 @@ export function useGrading() {
         statusMessage: `Grading ${sampleIds.length} sample${sampleIds.length !== 1 ? 's' : ''} with ${model}...`,
       }));
 
-      const response = await fetch('/api/grade', {
+      // Use streaming endpoint for real-time updates
+      const response = await fetch('/api/grade-stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(request),
@@ -202,22 +203,82 @@ export function useGrading() {
         throw new Error(errorData.detail || 'Failed to grade samples');
       }
 
-      const data: GradeResponse = await response.json();
-      
+      // Process SSE stream
+      const grades: Record<number, GradeEntry> = {};
+      const errors: Array<{ sample_id: number; error: string }> = [];
+      let completedCount = 0;
+      let errorCount = 0;
+
+      const reader = response.body?.getReader();
+      const decoder = new TextDecoder();
+
+      if (!reader) {
+        throw new Error('No response body');
+      }
+
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        // Process complete SSE messages
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || ''; // Keep incomplete line in buffer
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.slice(6));
+
+              if (data.type === 'grade') {
+                grades[data.sample_id] = data.grade;
+                completedCount++;
+                setProgress(prev => ({
+                  ...prev,
+                  completed: completedCount,
+                  statusMessage: `Grading... ${completedCount}/${sampleIds.length} complete`,
+                }));
+              } else if (data.type === 'error') {
+                errors.push({ sample_id: data.sample_id, error: data.error });
+                errorCount++;
+                setProgress(prev => ({
+                  ...prev,
+                  errors: errorCount,
+                }));
+              } else if (data.type === 'complete') {
+                // Final message - grading complete
+              }
+            } catch {
+              // Ignore malformed JSON
+            }
+          }
+        }
+      }
+
+      const result: GradeResponse = {
+        graded_count: completedCount,
+        errors,
+        grades,
+      };
+
       setProgress({
         total: sampleIds.length,
-        completed: data.graded_count,
-        errors: data.errors.length,
+        completed: result.graded_count,
+        errors: result.errors.length,
         isRunning: false,
         status: 'complete',
-        statusMessage: `Graded ${data.graded_count} sample${data.graded_count !== 1 ? 's' : ''}${data.errors.length > 0 ? ` (${data.errors.length} error${data.errors.length !== 1 ? 's' : ''})` : ''}`,
+        statusMessage: `Graded ${result.graded_count} sample${result.graded_count !== 1 ? 's' : ''}${result.errors.length > 0 ? ` (${result.errors.length} error${result.errors.length !== 1 ? 's' : ''})` : ''}`,
       });
 
       // Save preferences
       saveLastProvider(provider);
       saveLastModel(model);
 
-      return data;
+      return result;
     } catch (err) {
       // Check if this was an abort
       if (err instanceof Error && err.name === 'AbortError') {
@@ -226,8 +287,8 @@ export function useGrading() {
       }
       const message = err instanceof Error ? err.message : 'Unknown error';
       setError(message);
-      setProgress(prev => ({ 
-        ...prev, 
+      setProgress(prev => ({
+        ...prev,
         isRunning: false,
         status: 'error',
         statusMessage: 'Grading failed',

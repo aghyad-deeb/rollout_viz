@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Union
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from backend.llm_providers import (
@@ -684,6 +685,133 @@ async def grade_samples(request: GradeRequest):
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/grade-stream")
+async def grade_samples_stream(request: GradeRequest):
+    """Grade samples with Server-Sent Events (SSE) streaming.
+
+    Returns grades one-by-one as they complete for real-time UI updates.
+    """
+    # Get API key - use provided key or fall back to environment
+    api_key = request.api_key
+    if not api_key:
+        api_key = get_env_api_key(request.provider)
+
+    if not api_key:
+        async def error_generator():
+            yield f'data: {json.dumps({"type": "error", "error": f"No API key provided for {request.provider}"})}\n\n'
+        return StreamingResponse(error_generator(), media_type="text/event-stream")
+
+    # Load the samples
+    try:
+        if request.file_path.startswith("s3://"):
+            s3_path = request.file_path[5:]
+            bucket, key = s3_path.split("/", 1)
+            raw_samples = load_jsonl_from_s3(bucket, key)
+        else:
+            raw_samples = load_jsonl_from_file(request.file_path)
+    except Exception as e:
+        async def error_generator():
+            yield f'data: {json.dumps({"type": "error", "error": str(e)})}\n\n'
+        return StreamingResponse(error_generator(), media_type="text/event-stream")
+
+    # Get the LLM provider with advanced settings
+    provider = get_provider(
+        request.provider,
+        api_key,
+        request.model,
+        temperature=request.temperature,
+        max_tokens=request.max_tokens,
+        top_p=request.top_p,
+    )
+
+    async def event_generator():
+        """Generate SSE events as grades complete."""
+        graded_count = 0
+        error_count = 0
+        grades: Dict[int, GradeEntry] = {}
+
+        # Process samples with controlled concurrency
+        semaphore = asyncio.Semaphore(min(request.parallel_size, 100))
+
+        async def grade_one_with_semaphore(sample_id: int):
+            async with semaphore:
+                if sample_id < 0 or sample_id >= len(raw_samples):
+                    return sample_id, None, f"Sample {sample_id} not found"
+
+                raw = raw_samples[sample_id]
+                messages = raw.get('messages', [])
+
+                try:
+                    result = await provider.grade_sample(
+                        messages=messages,
+                        metric_prompt=request.metric_prompt,
+                        grade_type=request.grade_type,
+                    )
+
+                    grade_entry = GradeEntry(
+                        grade=result.grade,
+                        grade_type=result.grade_type,
+                        quotes=[Quote(**q.dict()) for q in result.quotes],
+                        explanation=result.explanation,
+                        model=result.model,
+                        prompt_version=result.prompt_version,
+                        timestamp=result.timestamp,
+                    )
+                    return sample_id, grade_entry, None
+                except Exception as e:
+                    error_msg = str(e)
+                    # Provide helpful error messages for common issues
+                    if "401" in error_msg or "invalid_api_key" in error_msg or "Incorrect API key" in error_msg:
+                        error_msg = (
+                            f"API key authentication failed. Common causes: "
+                            f"(1) The API key in ~/.env may have quotes around it - remove them. "
+                            f"(2) The API key may be expired or invalid. "
+                            f"Original error: {error_msg}"
+                        )
+                    return sample_id, None, error_msg
+
+        # Create all tasks
+        tasks = [
+            asyncio.create_task(grade_one_with_semaphore(sid))
+            for sid in request.sample_ids
+        ]
+
+        # Yield results as they complete
+        for coro in asyncio.as_completed(tasks):
+            sample_id, grade_entry, error = await coro
+
+            if error:
+                error_count += 1
+                yield f'data: {json.dumps({"type": "error", "sample_id": sample_id, "error": error})}\n\n'
+            else:
+                graded_count += 1
+                grades[sample_id] = grade_entry
+                # Convert grade_entry to dict for JSON serialization
+                grade_dict = {
+                    "grade": grade_entry.grade,
+                    "grade_type": grade_entry.grade_type,
+                    "quotes": [q.dict() for q in grade_entry.quotes],
+                    "explanation": grade_entry.explanation,
+                    "model": grade_entry.model,
+                    "prompt_version": grade_entry.prompt_version,
+                    "timestamp": grade_entry.timestamp,
+                }
+                yield f'data: {json.dumps({"type": "grade", "sample_id": sample_id, "grade": grade_dict})}\n\n'
+
+        # Final summary
+        yield f'data: {json.dumps({"type": "complete", "graded_count": graded_count, "error_count": error_count})}\n\n'
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        }
+    )
 
 
 @app.post("/api/save-graded")
