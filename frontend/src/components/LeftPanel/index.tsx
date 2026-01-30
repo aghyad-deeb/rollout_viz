@@ -227,7 +227,25 @@ export function LeftPanel({
         const orGroups = filterExpression.split(/\s+OR\s+/i);
         
         result = result.filter(sample => {
-          const attrs = sample.attributes as unknown as Record<string, unknown>;
+          // Create combined attrs including metric grades
+          const attrs: Record<string, unknown> = {
+            ...(sample.attributes as unknown as Record<string, unknown>),
+          };
+          
+          // Add metric values to attrs
+          if (sample.grades) {
+            for (const [metricName, grades] of Object.entries(sample.grades)) {
+              if (grades.length > 0) {
+                const grade = grades[grades.length - 1].grade;
+                // Convert bool to number for comparison
+                if (typeof grade === 'boolean') {
+                  attrs[metricName] = grade ? 1 : 0;
+                } else {
+                  attrs[metricName] = grade;
+                }
+              }
+            }
+          }
           
           // OR: any group must match
           return orGroups.some(orGroup => {
@@ -248,30 +266,50 @@ export function LeftPanel({
       let aVal: number | string;
       let bVal: number | string;
 
-      switch (sortColumn) {
-        case 'sample_index':
-          aVal = a.attributes.sample_index;
-          bVal = b.attributes.sample_index;
-          break;
-        case 'step':
-          aVal = a.attributes.step;
-          bVal = b.attributes.step;
-          break;
-        case 'data_source':
-          aVal = a.attributes.data_source;
-          bVal = b.attributes.data_source;
-          break;
-        case 'reward':
-          aVal = a.attributes.reward;
-          bVal = b.attributes.reward;
-          break;
-        case 'num_messages':
-          aVal = a.messages.length;
-          bVal = b.messages.length;
-          break;
-        default:
-          aVal = a.id;
-          bVal = b.id;
+      // Handle grade:metricName columns
+      if (sortColumn.startsWith('grade:')) {
+        const metricName = sortColumn.slice(6); // Remove 'grade:' prefix
+        const getGradeValue = (sample: Sample): number | null => {
+          if (!sample.grades || !sample.grades[metricName]) return null;
+          const grades = sample.grades[metricName];
+          if (grades.length === 0) return null;
+          const grade = grades[grades.length - 1].grade;
+          // Convert bool to number for sorting
+          if (typeof grade === 'boolean') return grade ? 1 : 0;
+          return grade as number;
+        };
+        aVal = getGradeValue(a);
+        bVal = getGradeValue(b);
+        // Handle null values - put them at the end
+        if (aVal === null && bVal === null) return 0;
+        if (aVal === null) return sortOrder === 'asc' ? 1 : -1;
+        if (bVal === null) return sortOrder === 'asc' ? -1 : 1;
+      } else {
+        switch (sortColumn) {
+          case 'sample_index':
+            aVal = a.attributes.sample_index;
+            bVal = b.attributes.sample_index;
+            break;
+          case 'step':
+            aVal = a.attributes.step;
+            bVal = b.attributes.step;
+            break;
+          case 'data_source':
+            aVal = a.attributes.data_source;
+            bVal = b.attributes.data_source;
+            break;
+          case 'reward':
+            aVal = a.attributes.reward;
+            bVal = b.attributes.reward;
+            break;
+          case 'num_messages':
+            aVal = a.messages.length;
+            bVal = b.messages.length;
+            break;
+          default:
+            aVal = a.id;
+            bVal = b.id;
+        }
       }
 
       if (typeof aVal === 'string' && typeof bVal === 'string') {

@@ -55,6 +55,8 @@ class LLMProvider(ABC):
         messages: List[Dict[str, str]],
         metric_prompt: str,
         grade_type: str,
+        require_quotes: bool = True,
+        is_quote_retry: bool = False,
     ) -> GradeResult:
         """Grade a single sample and return structured result."""
         pass
@@ -64,6 +66,8 @@ class LLMProvider(ABC):
         messages: List[Dict[str, str]],
         metric_prompt: str,
         grade_type: str,
+        require_quotes: bool = True,
+        is_quote_retry: bool = False,
     ) -> str:
         """Build the full grading prompt with the conversation and instructions."""
         
@@ -82,6 +86,53 @@ class LLMProvider(ABC):
         else:  # float
             grade_instruction = "Respond with a float grade between 0.0 and 1.0."
         
+        # Build quote instructions based on whether quotes are required
+        if require_quotes:
+            if is_quote_retry:
+                # Stronger language on retry
+                quote_section = """## Quoting Instructions (REQUIRED - RETRY ATTEMPT)
+
+**YOUR PREVIOUS RESPONSE WAS REJECTED BECAUSE IT DID NOT INCLUDE QUOTES.**
+
+You MUST include at least 1 quote. This is ABSOLUTELY MANDATORY - your response will be rejected again if you don't include quotes.
+
+The "quotes" array in your JSON response MUST contain at least one quote object.
+
+For each quote:
+1. **message_index**: The message number shown in brackets [Message N] - use N as the index
+2. **text**: Copy the EXACT substring from the message content
+3. **start**: Character position where the quote begins (0 = first character)
+4. **end**: Character position where the quote ends (exclusive)
+
+Example: {"message_index": 0, "start": 0, "end": 5, "text": "Hello"}
+
+DO NOT return an empty quotes array. Include at least one relevant quote from the conversation."""
+            else:
+                quote_section = """## Quoting Instructions (REQUIRED)
+
+You MUST include 1-5 quotes that support your grade. This is MANDATORY.
+If you do not include quotes, your response will be rejected and you will be asked again.
+
+For each quote:
+1. **message_index**: The message number shown in brackets [Message N] - use N as the index
+2. **text**: Copy the EXACT substring from the message content - character for character, including any whitespace or punctuation
+3. **start**: The character position where your quoted text begins in that message's content (0 = first character)
+4. **end**: The character position where your quoted text ends (exclusive, so end - start = length of text)
+
+Example: If message content is "Hello world!" and you want to quote "world", then start=6, end=11, text="world"
+
+IMPORTANT: The "quotes" array MUST NOT be empty. Include at least one quote."""
+        else:
+            quote_section = """## Quoting Instructions (Optional)
+
+You may optionally include quotes that support your grade. If included:
+1. **message_index**: The message number shown in brackets [Message N] - use N as the index
+2. **text**: Copy the EXACT substring from the message content
+3. **start**: The character position where your quoted text begins (0-based)
+4. **end**: The character position where your quoted text ends (exclusive)
+
+If you don't want to include quotes, leave the "quotes" array empty: "quotes": []"""
+
         prompt = f"""You are an expert evaluator. Your task is to grade the following conversation based on the specified metric.
 
 ## Conversation to Evaluate
@@ -110,15 +161,7 @@ You MUST provide your response as a valid JSON object with the following structu
     "explanation": "<your explanation for the grade, referencing the quotes>"
 }}
 
-## Quoting Instructions
-
-Include 1-5 quotes that best support your grade. For each quote:
-1. **message_index**: The message number shown in brackets [Message N] - use N as the index
-2. **text**: Copy the EXACT substring from the message content - character for character, including any whitespace or punctuation
-3. **start**: The character position where your quoted text begins in that message's content (0 = first character)
-4. **end**: The character position where your quoted text ends (exclusive, so end - start = length of text)
-
-Example: If message content is "Hello world!" and you want to quote "world", then start=6, end=11, text="world"
+{quote_section}
 
 Respond ONLY with the JSON object, no additional text."""
 
@@ -191,16 +234,27 @@ Respond ONLY with the JSON object, no additional text."""
 class OpenAIProvider(LLMProvider):
     """OpenAI API provider."""
     
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._client = None  # Instance variable, not class variable
+    
+    def _get_client(self):
+        """Get or create the async client (reused across requests)."""
+        if self._client is None:
+            from openai import AsyncOpenAI
+            self._client = AsyncOpenAI(api_key=self.api_key)
+        return self._client
+    
     async def grade_sample(
         self,
         messages: List[Dict[str, str]],
         metric_prompt: str,
         grade_type: str,
+        require_quotes: bool = True,
+        is_quote_retry: bool = False,
     ) -> GradeResult:
-        from openai import AsyncOpenAI
-        
-        client = AsyncOpenAI(api_key=self.api_key)
-        prompt = self._build_grading_prompt(messages, metric_prompt, grade_type)
+        client = self._get_client()
+        prompt = self._build_grading_prompt(messages, metric_prompt, grade_type, require_quotes, is_quote_retry)
         
         # Build kwargs with optional parameters
         kwargs: Dict[str, Any] = {
@@ -234,16 +288,27 @@ class OpenAIProvider(LLMProvider):
 class AnthropicProvider(LLMProvider):
     """Anthropic API provider."""
     
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._client = None
+    
+    def _get_client(self):
+        """Get or create the async client (reused across requests)."""
+        if self._client is None:
+            from anthropic import AsyncAnthropic
+            self._client = AsyncAnthropic(api_key=self.api_key)
+        return self._client
+    
     async def grade_sample(
         self,
         messages: List[Dict[str, str]],
         metric_prompt: str,
         grade_type: str,
+        require_quotes: bool = True,
+        is_quote_retry: bool = False,
     ) -> GradeResult:
-        from anthropic import AsyncAnthropic
-        
-        client = AsyncAnthropic(api_key=self.api_key)
-        prompt = self._build_grading_prompt(messages, metric_prompt, grade_type)
+        client = self._get_client()
+        prompt = self._build_grading_prompt(messages, metric_prompt, grade_type, require_quotes, is_quote_retry)
         
         # Build kwargs with optional parameters
         kwargs: Dict[str, Any] = {
@@ -280,13 +345,15 @@ class GoogleProvider(LLMProvider):
         messages: List[Dict[str, str]],
         metric_prompt: str,
         grade_type: str,
+        require_quotes: bool = True,
+        is_quote_retry: bool = False,
     ) -> GradeResult:
         import google.generativeai as genai
         
         genai.configure(api_key=self.api_key)
         model = genai.GenerativeModel(self.model)
         
-        prompt = self._build_grading_prompt(messages, metric_prompt, grade_type)
+        prompt = self._build_grading_prompt(messages, metric_prompt, grade_type, require_quotes, is_quote_retry)
         
         # Build generation config with optional parameters
         config_kwargs: Dict[str, Any] = {
@@ -322,15 +389,28 @@ class GoogleProvider(LLMProvider):
 class OpenRouterProvider(LLMProvider):
     """OpenRouter API provider (OpenAI-compatible)."""
     
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._client = None
+    
+    def _get_client(self):
+        """Get or create the async httpx client (reused across requests)."""
+        if self._client is None:
+            import httpx
+            self._client = httpx.AsyncClient(timeout=120.0)
+        return self._client
+    
     async def grade_sample(
         self,
         messages: List[Dict[str, str]],
         metric_prompt: str,
         grade_type: str,
+        require_quotes: bool = True,
+        is_quote_retry: bool = False,
     ) -> GradeResult:
-        import httpx
+        client = self._get_client()
         
-        prompt = self._build_grading_prompt(messages, metric_prompt, grade_type)
+        prompt = self._build_grading_prompt(messages, metric_prompt, grade_type, require_quotes, is_quote_retry)
         
         # Build request body with optional parameters
         body: Dict[str, Any] = {
@@ -344,18 +424,16 @@ class OpenRouterProvider(LLMProvider):
         if self.top_p is not None:
             body["top_p"] = self.top_p
         
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=body,
-                timeout=120.0,
-            )
-            response.raise_for_status()
-            data = response.json()
+        response = await client.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+        )
+        response.raise_for_status()
+        data = response.json()
         
         response_text = data["choices"][0]["message"]["content"]
         parsed = self._parse_grade_response(response_text, grade_type)

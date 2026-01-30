@@ -1,6 +1,7 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import type { Sample, SearchCondition, Quote } from '../../types';
 import { MessageCard } from './MessageCard';
+import { GradesDisplay } from './GradesDisplay';
 
 interface ChatViewProps {
   sample: Sample;
@@ -13,6 +14,7 @@ interface ChatViewProps {
   highlightedText: string | null;
   onClearHighlight: () => void;
   selectedGradeMetric?: string; // Which metric's quotes to highlight
+  onSelectGradeMetric?: (metric: string | undefined) => void;
 }
 
 interface LocalMatch {
@@ -31,6 +33,7 @@ export function ChatView({
   highlightedText,
   onClearHighlight,
   selectedGradeMetric,
+  onSelectGradeMetric,
 }: ChatViewProps) {
   // Extract quotes from the selected grade metric
   const gradeQuotes = useMemo((): Quote[] => {
@@ -84,10 +87,16 @@ export function ChatView({
   const [localSearchTerm, setLocalSearchTerm] = useState('');
   const [currentMatchIndex, setCurrentMatchIndex] = useState(0);
   const [isSearchOpen, setIsSearchOpen] = useState(false);
+  const [currentQuoteIndex, setCurrentQuoteIndex] = useState(0);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const messageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const lastScrolledSampleId = useRef<number | null>(null);
   const lastScrolledSearchTerm = useRef<string>('');
+  
+  // Reset quote index when metric changes
+  useEffect(() => {
+    setCurrentQuoteIndex(0);
+  }, [selectedGradeMetric]);
 
   // Find all matches in the current chat
   const localMatches = useMemo((): LocalMatch[] => {
@@ -304,6 +313,26 @@ export function ChatView({
           </button>
         </div>
       )}
+
+      {/* Grades display */}
+      <GradesDisplay
+        grades={sample.grades}
+        selectedMetric={selectedGradeMetric}
+        onSelectMetric={onSelectGradeMetric || (() => {})}
+        onScrollToQuote={(messageIndex) => {
+          // Scroll to the message containing the quote
+          const messageElement = messageRefs.current.get(messageIndex);
+          if (messageElement) {
+            // Small delay to allow the highlight to render first
+            setTimeout(() => {
+              messageElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }, 100);
+          }
+        }}
+        isDarkMode={isDarkMode}
+        currentQuoteIndex={currentQuoteIndex}
+        onQuoteIndexChange={setCurrentQuoteIndex}
+      />
 
       {/* Messages area */}
       <div ref={messagesContainerRef} className="flex-1 overflow-y-auto custom-scrollbar p-4 space-y-4">

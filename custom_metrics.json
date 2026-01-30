@@ -1,0 +1,9 @@
+{
+  "messed_up": {
+    "name": "messed_up",
+    "description": "Custom metric: messed_up",
+    "grade_type": "bool",
+    "prompt": "Is the model output messed up, as in it's incoherent and not usual LLM output?",
+    "is_custom": true
+  }
+}

@@ -70,6 +70,7 @@ export function useGrading() {
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
     }
+    setError(null); // Clear any errors from cancelled request
     setProgress(prev => ({
       ...prev,
       isRunning: false,
@@ -127,7 +128,7 @@ export function useGrading() {
       .catch(err => console.error('Failed to check server API keys:', err));
   }, []);
 
-  // Grade samples
+  // Grade samples using SSE for real-time progress
   const gradeSamples = useCallback(async (
     filePath: string,
     sampleIds: number[],
@@ -141,6 +142,10 @@ export function useGrading() {
       temperature?: number;
       maxTokens?: number;
       topP?: number;
+    },
+    quoteSettings?: {
+      requireQuotes?: boolean;
+      maxQuoteRetries?: number;
     },
   ): Promise<GradeResponse | null> => {
     const apiKey = getApiKey(provider);
@@ -178,6 +183,9 @@ export function useGrading() {
         // Only include api_key if we have one locally, otherwise server uses .env
         ...(apiKey ? { api_key: apiKey } : {}),
         parallel_size: parallelSize,
+        // Quote settings
+        require_quotes: quoteSettings?.requireQuotes ?? false,
+        max_quote_retries: quoteSettings?.maxQuoteRetries ?? 2,
         // Advanced settings
         ...(advancedSettings?.temperature !== undefined ? { temperature: advancedSettings.temperature } : {}),
         ...(advancedSettings?.maxTokens !== undefined ? { max_tokens: advancedSettings.maxTokens } : {}),
@@ -190,7 +198,8 @@ export function useGrading() {
         statusMessage: `Grading ${sampleIds.length} sample${sampleIds.length !== 1 ? 's' : ''} with ${model}...`,
       }));
 
-      const response = await fetch('/api/grade', {
+      // Use SSE streaming endpoint for real-time progress
+      const response = await fetch('/api/grade-stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(request),
@@ -202,22 +211,106 @@ export function useGrading() {
         throw new Error(errorData.detail || 'Failed to grade samples');
       }
 
-      const data: GradeResponse = await response.json();
+      // Read SSE stream
+      const reader = response.body?.getReader();
+      if (!reader) {
+        throw new Error('Failed to get response stream');
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let finalResult: GradeResponse | null = null;
+      let errorCount = 0;
+      let wasAborted = false;
+
+      try {
+        while (true) {
+          // Check if aborted before reading
+          if (signal.aborted) {
+            wasAborted = true;
+            break;
+          }
+          
+          const { done, value } = await reader.read();
+          
+          if (done) break;
+          
+          buffer += decoder.decode(value, { stream: true });
+          
+          // Process complete SSE events (lines starting with "data: ")
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || ''; // Keep incomplete line in buffer
+          
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const eventData = JSON.parse(line.slice(6));
+                
+                if (eventData.type === 'progress') {
+                  setProgress(prev => ({
+                    ...prev,
+                    completed: eventData.completed,
+                    total: eventData.total,
+                    errors: errorCount,
+                    statusMessage: `Grading... ${eventData.completed}/${eventData.total} samples`,
+                  }));
+                } else if (eventData.type === 'complete') {
+                  errorCount = eventData.errors?.length || 0;
+                  finalResult = {
+                    graded_count: eventData.graded_count,
+                    errors: eventData.errors || [],
+                    grades: eventData.grades || {},
+                  };
+                } else if (eventData.type === 'error') {
+                  throw new Error(eventData.message);
+                }
+              } catch (parseErr) {
+                // Ignore JSON parse errors for partial data
+                if (parseErr instanceof SyntaxError) continue;
+                throw parseErr;
+              }
+            }
+          }
+        }
+      } catch (streamErr) {
+        // Handle stream read errors (often happens on abort)
+        if (signal.aborted || (streamErr instanceof Error && streamErr.name === 'AbortError')) {
+          wasAborted = true;
+        } else {
+          throw streamErr;
+        }
+      } finally {
+        // Always try to cancel the reader
+        try {
+          reader.cancel();
+        } catch {
+          // Ignore cancel errors
+        }
+      }
+
+      // If aborted, return null without error
+      if (wasAborted) {
+        return null;
+      }
+
+      if (!finalResult) {
+        throw new Error('Grading did not complete');
+      }
       
       setProgress({
         total: sampleIds.length,
-        completed: data.graded_count,
-        errors: data.errors.length,
+        completed: finalResult.graded_count,
+        errors: finalResult.errors.length,
         isRunning: false,
         status: 'complete',
-        statusMessage: `Graded ${data.graded_count} sample${data.graded_count !== 1 ? 's' : ''}${data.errors.length > 0 ? ` (${data.errors.length} error${data.errors.length !== 1 ? 's' : ''})` : ''}`,
+        statusMessage: `Graded ${finalResult.graded_count} sample${finalResult.graded_count !== 1 ? 's' : ''}${finalResult.errors.length > 0 ? ` (${finalResult.errors.length} error${finalResult.errors.length !== 1 ? 's' : ''})` : ''}`,
       });
 
       // Save preferences
       saveLastProvider(provider);
       saveLastModel(model);
 
-      return data;
+      return finalResult;
     } catch (err) {
       // Check if this was an abort
       if (err instanceof Error && err.name === 'AbortError') {
@@ -281,6 +374,10 @@ export function useGrading() {
       maxTokens?: number;
       topP?: number;
     },
+    quoteSettings?: {
+      requireQuotes?: boolean;
+      maxQuoteRetries?: number;
+    },
   ): Promise<GradeResponse | null> => {
     const gradeResult = await gradeSamples(
       filePath,
@@ -292,6 +389,7 @@ export function useGrading() {
       model,
       parallelSize,
       advancedSettings,
+      quoteSettings,
     );
 
     if (!gradeResult || gradeResult.graded_count === 0) {
@@ -351,6 +449,70 @@ export function useGrading() {
     return !!sample.grades && Object.keys(sample.grades).length > 0;
   }, []);
 
+  // Save a custom metric as a preset
+  const saveCustomMetric = useCallback(async (
+    name: string,
+    description: string,
+    gradeType: 'float' | 'int' | 'bool',
+    prompt: string,
+  ): Promise<boolean> => {
+    try {
+      const key = name.toLowerCase().replace(/\s+/g, '_');
+      const response = await fetch('/api/save-custom-metric', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          key,
+          name,
+          description,
+          grade_type: gradeType,
+          prompt,
+        }),
+      });
+      
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.detail || 'Failed to save metric');
+      }
+      
+      // Refresh preset metrics
+      const metricsResponse = await fetch('/api/preset-metrics');
+      const metrics = await metricsResponse.json();
+      setPresetMetrics(metrics);
+      
+      return true;
+    } catch (err) {
+      console.error('Failed to save custom metric:', err);
+      setError(err instanceof Error ? err.message : 'Failed to save custom metric');
+      return false;
+    }
+  }, []);
+
+  // Delete a custom metric
+  const deleteCustomMetric = useCallback(async (key: string): Promise<boolean> => {
+    try {
+      const response = await fetch(`/api/custom-metric/${key}`, {
+        method: 'DELETE',
+      });
+      
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.detail || 'Failed to delete metric');
+      }
+      
+      // Refresh preset metrics
+      const metricsResponse = await fetch('/api/preset-metrics');
+      const metrics = await metricsResponse.json();
+      setPresetMetrics(metrics);
+      
+      return true;
+    } catch (err) {
+      console.error('Failed to delete custom metric:', err);
+      setError(err instanceof Error ? err.message : 'Failed to delete custom metric');
+      return false;
+    }
+  }, []);
+
   return {
     // State
     progress,
@@ -376,6 +538,10 @@ export function useGrading() {
     // Utilities
     getLatestGrade,
     hasGrades,
+    
+    // Custom metrics
+    saveCustomMetric,
+    deleteCustomMetric,
     
     // Clear error
     clearError: () => setError(null),

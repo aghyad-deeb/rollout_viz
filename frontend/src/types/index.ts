@@ -56,6 +56,8 @@ export interface GradeRequest {
   model: string;
   api_key?: string;  // Optional - server will use .env if not provided
   parallel_size?: number;  // Number of concurrent requests (default: 100)
+  require_quotes?: boolean;  // Whether to require quotes from the model (default: true)
+  max_quote_retries?: number;  // Max retries if quotes missing (default: 2)
   // Advanced settings
   temperature?: number;  // 0.0 - 2.0, undefined = model default
   max_tokens?: number;  // Max output tokens
@@ -72,6 +74,7 @@ export interface PresetMetric {
   name: string;
   description: string;
   grade_type: 'float' | 'int' | 'bool';
+  is_custom?: boolean;  // True if user-created
   prompt: string;
 }
 
@@ -177,7 +180,8 @@ export interface FileInfo {
   last_modified: string;
 }
 
-export type SortColumn = 'sample_index' | 'step' | 'data_source' | 'reward' | 'num_messages';
+// SortColumn can be a standard column or a metric column (prefixed with 'grade:')
+export type SortColumn = 'sample_index' | 'step' | 'data_source' | 'reward' | 'num_messages' | string;
 export type SortOrder = 'asc' | 'desc';
 export type SearchField = 
   | 'chat' 

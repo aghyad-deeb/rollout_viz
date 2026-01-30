@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Union
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from backend.llm_providers import (
@@ -51,7 +52,10 @@ def get_env_api_key(provider: str) -> Optional[str]:
     """Get API key from environment for a provider."""
     env_var = API_KEY_ENV_VARS.get(provider)
     if env_var:
-        return os.getenv(env_var)
+        key = os.getenv(env_var)
+        if key:
+            print(f"[DEBUG] {provider} key loaded: {key[:15]}...{key[-5:]} (len={len(key)})")
+        return key
     return None
 
 app = FastAPI(title="Rollout Visualizer API")
@@ -134,6 +138,8 @@ class GradeRequest(BaseModel):
     model: str  # e.g., "gpt-4o", "claude-3-opus"
     api_key: Optional[str] = None  # Optional - will use .env if not provided
     parallel_size: int = 100  # Number of concurrent requests
+    require_quotes: bool = True  # Whether to require quotes from the model
+    max_quote_retries: int = 2  # Max retries if quotes are required but missing
     # Advanced settings
     temperature: Optional[float] = None  # 0.0 - 2.0, None = model default
     max_tokens: Optional[int] = None  # Max output tokens
@@ -159,6 +165,7 @@ class PresetMetricInfo(BaseModel):
     description: str
     grade_type: str
     prompt: str
+    is_custom: bool = False  # True if user-created
 
 
 def load_env_credentials():
@@ -566,13 +573,98 @@ def save_jsonl_to_s3(bucket: str, key: str, samples: List[Dict[str, Any]]) -> No
     )
 
 
+# Path to store custom metrics
+CUSTOM_METRICS_FILE = PROJECT_ROOT / "custom_metrics.json"
+
+
+def load_custom_metrics() -> Dict[str, dict]:
+    """Load custom metrics from file."""
+    if CUSTOM_METRICS_FILE.exists():
+        try:
+            with open(CUSTOM_METRICS_FILE, 'r') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return {}
+    return {}
+
+
+def save_custom_metrics(metrics: Dict[str, dict]) -> None:
+    """Save custom metrics to file."""
+    with open(CUSTOM_METRICS_FILE, 'w') as f:
+        json.dump(metrics, f, indent=2)
+
+
 @app.get("/api/preset-metrics", response_model=Dict[str, PresetMetricInfo])
 async def get_preset_metrics():
-    """Get available preset metrics for grading."""
-    return {
+    """Get available preset metrics for grading (includes saved custom metrics)."""
+    # Start with built-in presets
+    all_metrics = {
         key: PresetMetricInfo(**value)
         for key, value in PRESET_METRICS.items()
     }
+    
+    # Add custom metrics (marked as custom)
+    custom_metrics = load_custom_metrics()
+    for key, value in custom_metrics.items():
+        # Don't override built-in presets
+        if key not in all_metrics:
+            all_metrics[key] = PresetMetricInfo(**value)
+    
+    return all_metrics
+
+
+class SaveCustomMetricRequest(BaseModel):
+    """Request to save a custom metric."""
+    key: str  # Unique identifier (lowercase, no spaces)
+    name: str  # Display name
+    description: str
+    grade_type: str  # 'float', 'int', or 'bool'
+    prompt: str
+
+
+@app.post("/api/save-custom-metric")
+async def save_custom_metric(request: SaveCustomMetricRequest):
+    """Save a custom metric for future use."""
+    # Validate key format
+    key = request.key.lower().replace(" ", "_")
+    
+    # Don't allow overriding built-in presets
+    if key in PRESET_METRICS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot override built-in preset '{key}'"
+        )
+    
+    # Load existing custom metrics
+    custom_metrics = load_custom_metrics()
+    
+    # Add/update the metric
+    custom_metrics[key] = {
+        "name": request.name,
+        "description": request.description,
+        "grade_type": request.grade_type,
+        "prompt": request.prompt,
+        "is_custom": True,
+    }
+    
+    # Save
+    save_custom_metrics(custom_metrics)
+    
+    return {"status": "saved", "key": key}
+
+
+@app.delete("/api/custom-metric/{key}")
+async def delete_custom_metric(key: str):
+    """Delete a custom metric."""
+    custom_metrics = load_custom_metrics()
+    
+    if key not in custom_metrics:
+        raise HTTPException(status_code=404, detail=f"Custom metric '{key}' not found")
+    
+    del custom_metrics[key]
+    save_custom_metrics(custom_metrics)
+    
+    return {"status": "deleted", "key": key}
 
 
 @app.get("/api/available-api-keys")
@@ -630,11 +722,27 @@ async def grade_samples(request: GradeRequest):
             messages = raw.get('messages', [])
             
             try:
-                result = await provider.grade_sample(
-                    messages=messages,
-                    metric_prompt=request.metric_prompt,
-                    grade_type=request.grade_type,
-                )
+                result = None
+                max_attempts = (request.max_quote_retries + 1) if request.require_quotes else 1
+                
+                for attempt in range(max_attempts):
+                    # On retry, use stronger language about quotes
+                    is_retry = attempt > 0
+                    
+                    result = await provider.grade_sample(
+                        messages=messages,
+                        metric_prompt=request.metric_prompt,
+                        grade_type=request.grade_type,
+                        require_quotes=request.require_quotes,
+                        is_quote_retry=is_retry,
+                    )
+                    
+                    # Check if we got quotes when required
+                    if not request.require_quotes or (result.quotes and len(result.quotes) > 0):
+                        break
+                    
+                    # Log retry attempt
+                    print(f"Sample {sample_id}: No quotes received, retrying ({attempt + 1}/{max_attempts})")
                 
                 grade_entry = GradeEntry(
                     grade=result.grade,
@@ -652,15 +760,26 @@ async def grade_samples(request: GradeRequest):
         # Grade samples concurrently with configurable parallelism
         batch_size = min(request.parallel_size, 500)  # Cap at 500 to avoid overwhelming APIs
         
+        import time
+        total_start = time.time()
+        print(f"[Grading] Starting {len(request.sample_ids)} samples with batch_size={batch_size}")
+        
         for i in range(0, len(request.sample_ids), batch_size):
             batch = request.sample_ids[i:i + batch_size]
+            batch_start = time.time()
             results = await asyncio.gather(*[grade_one(sid) for sid in batch])
+            batch_time = time.time() - batch_start
             
             for sample_id, grade_entry, error in results:
                 if error:
                     errors.append({"sample_id": sample_id, "error": error})
                 elif grade_entry:
                     grades[sample_id] = grade_entry
+            
+            print(f"[Grading] Batch {i//batch_size + 1}: {len(batch)} samples in {batch_time:.2f}s ({batch_time/len(batch):.2f}s per sample)")
+        
+        total_time = time.time() - total_start
+        print(f"[Grading] Complete: {len(grades)} graded, {len(errors)} errors in {total_time:.2f}s")
         
         return GradeResponse(
             graded_count=len(grades),
@@ -670,6 +789,138 @@ async def grade_samples(request: GradeRequest):
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/grade-stream")
+async def grade_samples_stream(request: GradeRequest):
+    """Grade samples using an LLM provider with SSE streaming progress."""
+    import time
+    
+    async def generate_events():
+        start_time = time.time()
+        try:
+            print(f"[SSE Grading] Starting {len(request.sample_ids)} samples, require_quotes={request.require_quotes}, parallel_size={request.parallel_size}")
+            
+            # Get API key - use provided key or fall back to environment
+            api_key = request.api_key
+            if not api_key:
+                api_key = get_env_api_key(request.provider)
+            
+            if not api_key:
+                yield f"data: {json.dumps({'type': 'error', 'message': f'No API key for {request.provider}'})}\n\n"
+                return
+            
+            # Load the samples
+            if request.file_path.startswith("s3://"):
+                s3_path = request.file_path[5:]
+                bucket, key = s3_path.split("/", 1)
+                raw_samples = load_jsonl_from_s3(bucket, key)
+            else:
+                raw_samples = load_jsonl_from_file(request.file_path)
+            
+            # Get the LLM provider with advanced settings
+            provider = get_provider(
+                request.provider, 
+                api_key, 
+                request.model,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+                top_p=request.top_p,
+            )
+            
+            total_samples = len(request.sample_ids)
+            completed = 0
+            grades: Dict[int, dict] = {}
+            errors: List[Dict[str, Any]] = []
+            
+            # Send initial progress
+            yield f"data: {json.dumps({'type': 'progress', 'completed': 0, 'total': total_samples})}\n\n"
+            
+            async def grade_one(sample_id: int) -> tuple:
+                if sample_id < 0 or sample_id >= len(raw_samples):
+                    return sample_id, None, f"Sample {sample_id} not found"
+                
+                raw = raw_samples[sample_id]
+                messages = raw.get('messages', [])
+                
+                try:
+                    result = None
+                    max_attempts = (request.max_quote_retries + 1) if request.require_quotes else 1
+                    
+                    for attempt in range(max_attempts):
+                        is_retry = attempt > 0
+                        
+                        result = await provider.grade_sample(
+                            messages=messages,
+                            metric_prompt=request.metric_prompt,
+                            grade_type=request.grade_type,
+                            require_quotes=request.require_quotes,
+                            is_quote_retry=is_retry,
+                        )
+                        
+                        if not request.require_quotes or (result.quotes and len(result.quotes) > 0):
+                            break
+                    
+                    grade_entry = {
+                        "grade": result.grade,
+                        "grade_type": result.grade_type,
+                        "quotes": [q.dict() for q in result.quotes],
+                        "explanation": result.explanation,
+                        "model": result.model,
+                        "prompt_version": result.prompt_version,
+                        "timestamp": result.timestamp,
+                    }
+                    return sample_id, grade_entry, None
+                except Exception as e:
+                    return sample_id, None, str(e)
+            
+            # Run ALL requests in parallel, report progress as each completes
+            # Use asyncio.as_completed to get results as they finish
+            batch_size = min(request.parallel_size, 500)  # Cap at 500
+            tasks = [asyncio.create_task(grade_one(sid)) for sid in request.sample_ids[:batch_size]]
+            remaining_ids = request.sample_ids[batch_size:]
+            
+            last_progress_update = 0
+            progress_interval = max(1, total_samples // 20)  # Update ~20 times during grading
+            
+            for coro in asyncio.as_completed(tasks):
+                sample_id, grade_entry, error = await coro
+                completed += 1
+                
+                if error:
+                    errors.append({"sample_id": sample_id, "error": error})
+                elif grade_entry:
+                    grades[sample_id] = grade_entry
+                
+                # Start a new task if there are remaining samples
+                if remaining_ids:
+                    next_id = remaining_ids.pop(0)
+                    tasks.append(asyncio.create_task(grade_one(next_id)))
+                
+                # Send progress update periodically (not on every single completion)
+                if completed - last_progress_update >= progress_interval or completed == total_samples:
+                    yield f"data: {json.dumps({'type': 'progress', 'completed': completed, 'total': total_samples})}\n\n"
+                    last_progress_update = completed
+            
+            # Send final result
+            total_time = time.time() - start_time
+            print(f"[SSE Grading] Complete: {len(grades)} graded, {len(errors)} errors in {total_time:.2f}s ({total_time/max(1,len(request.sample_ids)):.2f}s per sample)")
+            yield f"data: {json.dumps({'type': 'complete', 'graded_count': len(grades), 'errors': errors, 'grades': grades})}\n\n"
+            
+        except Exception as e:
+            total_time = time.time() - start_time
+            print(f"[SSE Grading] Error after {total_time:.2f}s: {str(e)}")
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+    
+    return StreamingResponse(
+        generate_events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+    )
 
 
 @app.post("/api/save-graded")

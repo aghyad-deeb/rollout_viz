@@ -217,41 +217,65 @@ export function MessageCard({
       }
 
       // Priority 2: Grade quotes (from LLM grading) - purple highlight
+      // Use text matching instead of position matching since the message content
+      // may be parsed (reasoning extracted) differently than the raw content
       if (gradeQuotes.length > 0) {
         const quotesForThisMessage = gradeQuotes.filter(q => q.message_index === index);
         if (quotesForThisMessage.length > 0) {
-          const parts: React.ReactNode[] = [];
-          let lastIndex = 0;
+          // Find all quote text matches in the current text
+          const matches: { start: number; end: number; text: string }[] = [];
           
-          // Sort quotes by start position
-          const sortedQuotes = [...quotesForThisMessage].sort((a, b) => a.start - b.start);
-          
-          for (const quote of sortedQuotes) {
-            if (quote.start < lastIndex) continue; // Skip overlapping
-            if (quote.start > text.length || quote.end > text.length) continue; // Skip invalid ranges
+          for (const quote of quotesForThisMessage) {
+            if (!quote.text) continue;
             
-            if (quote.start > lastIndex) {
-              parts.push(text.slice(lastIndex, quote.start));
+            // Search for the quote text in the current text
+            let searchIndex = 0;
+            let matchIndex = text.indexOf(quote.text, searchIndex);
+            
+            while (matchIndex !== -1) {
+              matches.push({
+                start: matchIndex,
+                end: matchIndex + quote.text.length,
+                text: quote.text,
+              });
+              searchIndex = matchIndex + quote.text.length;
+              matchIndex = text.indexOf(quote.text, searchIndex);
+            }
+          }
+          
+          if (matches.length > 0) {
+            // Sort by position and remove overlaps
+            matches.sort((a, b) => a.start - b.start);
+            
+            const parts: React.ReactNode[] = [];
+            let lastIndex = 0;
+            
+            for (const match of matches) {
+              if (match.start < lastIndex) continue; // Skip overlapping
+              
+              if (match.start > lastIndex) {
+                parts.push(text.slice(lastIndex, match.start));
+              }
+              
+              parts.push(
+                <mark
+                  key={`quote-${match.start}`}
+                  className="bg-purple-200 dark:bg-purple-900/50 text-purple-900 dark:text-purple-200 px-0.5 rounded border-b-2 border-purple-400"
+                  title="Quoted by LLM grader"
+                >
+                  {match.text}
+                </mark>
+              );
+              lastIndex = match.end;
             }
             
-            parts.push(
-              <mark
-                key={`quote-${quote.start}`}
-                className="bg-purple-200 dark:bg-purple-900/50 text-purple-900 dark:text-purple-200 px-0.5 rounded border-b-2 border-purple-400"
-                title="Quoted by LLM grader"
-              >
-                {text.slice(quote.start, quote.end)}
-              </mark>
-            );
-            lastIndex = quote.end;
-          }
-          
-          if (lastIndex < text.length) {
-            parts.push(text.slice(lastIndex));
-          }
-          
-          if (parts.length > 0) {
-            return parts;
+            if (lastIndex < text.length) {
+              parts.push(text.slice(lastIndex));
+            }
+            
+            if (parts.length > 0) {
+              return parts;
+            }
           }
         }
       }

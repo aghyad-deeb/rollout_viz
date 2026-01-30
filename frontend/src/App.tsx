@@ -28,8 +28,7 @@ function App() {
   const [currentOccurrenceIndex, setCurrentOccurrenceIndex] = useState(0);
   const [highlightedMessageIndex, setHighlightedMessageIndex] = useState<number | null>(null);
   const [highlightedText, setHighlightedText] = useState<string | null>(null);
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const [selectedGradeMetric, _setSelectedGradeMetric] = useState<string | undefined>(undefined);
+  const [selectedGradeMetric, setSelectedGradeMetric] = useState<string | undefined>(undefined);
   const [isGradingPanelOpen, setIsGradingPanelOpen] = useState(false);
   const { loading, error, loadSamples, loadMultipleSamples } = useApi();
   const { markedFiles, toggleMark } = useMarkedFiles();
@@ -107,9 +106,10 @@ function App() {
   const handleSelectSampleWithUrlUpdate = (id: number) => {
     isUserAction.current = true;
     setSelectedSampleId(id);
-    // Clear any highlights when user manually changes sample
+    // Clear any highlights and grade selection when user manually changes sample
     setHighlightedMessageIndex(null);
     setHighlightedText(null);
+    setSelectedGradeMetric(undefined);
   };
 
   // Update URL only when user changes sample
@@ -155,6 +155,8 @@ function App() {
     }
     
     setSelectedSampleId(samples[newIndex].id);
+    // Clear grade metric selection when navigating
+    setSelectedGradeMetric(undefined);
   };
 
   // Reload samples after grading to pick up the viz/ version with grades
@@ -222,6 +224,7 @@ function App() {
               setHighlightedText(null);
             }}
             selectedGradeMetric={selectedGradeMetric}
+            onSelectGradeMetric={setSelectedGradeMetric}
           />
         </Panel>
       </PanelGroup>

@@ -24,8 +24,8 @@ const SEARCH_OPERATORS: { value: SearchOperator; label: string }[] = [
 // Helper to generate unique IDs
 const generateId = () => Math.random().toString(36).substring(2, 9);
 
-// Field definitions with types
-const FILTER_FIELDS: { name: string; type: 'number' | 'string' | 'boolean' }[] = [
+// Base field definitions with types
+const BASE_FILTER_FIELDS: { name: string; type: 'number' | 'string' | 'boolean' }[] = [
   { name: 'reward', type: 'number' },
   { name: 'step', type: 'number' },
   { name: 'sample_index', type: 'number' },
@@ -34,6 +34,19 @@ const FILTER_FIELDS: { name: string; type: 'number' | 'string' | 'boolean' }[] =
   { name: 'is_validate', type: 'boolean' },
   { name: 'experiment_name', type: 'string' },
 ];
+
+// Helper to extract metric names from samples
+function getMetricFields(samples: Sample[]): { name: string; type: 'number' | 'string' | 'boolean' }[] {
+  const metrics = new Set<string>();
+  for (const sample of samples) {
+    if (sample.grades) {
+      for (const metricName of Object.keys(sample.grades)) {
+        metrics.add(metricName);
+      }
+    }
+  }
+  return Array.from(metrics).sort().map(name => ({ name, type: 'number' as const }));
+}
 
 // Operators by field type
 const OPERATORS_BY_TYPE: Record<string, string[]> = {
@@ -111,6 +124,12 @@ export function FilterBar({
   const filterInputRef = useRef<HTMLInputElement>(null);
   const suggestionsRef = useRef<HTMLDivElement>(null);
 
+  // Compute all filter fields including dynamic metric fields
+  const FILTER_FIELDS = useMemo(() => {
+    const metricFields = getMetricFields(samples);
+    return [...BASE_FILTER_FIELDS, ...metricFields];
+  }, [samples]);
+
   // Extract unique values from samples for each field
   const uniqueValues = useMemo(() => {
     const values: Record<string, Set<string | number>> = {};
@@ -128,10 +147,25 @@ export function FilterBar({
       if (attrs.data_source) values['data_source'].add(attrs.data_source);
       if (attrs.is_validate !== undefined) values['is_validate'].add(attrs.is_validate ? 'true' : 'false');
       if (attrs.experiment_name) values['experiment_name'].add(attrs.experiment_name);
+      
+      // Add metric values
+      if (sample.grades) {
+        for (const [metricName, grades] of Object.entries(sample.grades)) {
+          if (!values[metricName]) values[metricName] = new Set();
+          if (grades.length > 0) {
+            const grade = grades[grades.length - 1].grade;
+            if (typeof grade === 'boolean') {
+              values[metricName].add(grade ? 1 : 0);
+            } else {
+              values[metricName].add(grade as number);
+            }
+          }
+        }
+      }
     });
 
     return values;
-  }, [samples]);
+  }, [samples, FILTER_FIELDS]);
 
   // Parse the current filter expression to determine context
   const parseContext = useMemo(() => {

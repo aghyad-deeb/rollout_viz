@@ -35,6 +35,15 @@ trap cleanup SIGINT SIGTERM
 # Start backend (run from project root so relative paths work)
 echo -e "${GREEN}Starting backend on port 8000...${NC}"
 source venv/bin/activate
+
+# Load .env file into shell environment so uvicorn subprocess inherits it
+if [ -f ".env" ]; then
+    echo -e "${GREEN}Loading API keys from .env...${NC}"
+    set -a  # automatically export all variables
+    source .env
+    set +a
+fi
+
 python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload &
 BACKEND_PID=$!
 
