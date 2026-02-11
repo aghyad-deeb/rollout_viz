@@ -514,11 +514,32 @@ export function GradingPanel({
       <div className="pt-2 space-y-3">
         {/* Success message */}
         {progress.status === 'complete' && !progress.isRunning && (
-          <div className="p-3 rounded-lg bg-green-100 dark:bg-green-900/30 border border-green-300 dark:border-green-700">
-            <div className="flex items-center gap-2">
-              <span className="material-symbols-outlined text-green-600 dark:text-green-400" style={{ fontSize: 18 }}>check_circle</span>
-              <span className="text-green-700 dark:text-green-300 text-sm">{progress.statusMessage}</span>
+          <div className="space-y-2">
+            <div className="p-3 rounded-lg bg-green-100 dark:bg-green-900/30 border border-green-300 dark:border-green-700">
+              <div className="flex items-center gap-2">
+                <span className="material-symbols-outlined text-green-600 dark:text-green-400" style={{ fontSize: 18 }}>check_circle</span>
+                <span className="text-green-700 dark:text-green-300 text-sm">{progress.statusMessage}</span>
+              </div>
             </div>
+            {/* Show error details if some samples failed */}
+            {progress.errors > 0 && progress.errorDetails.length > 0 && (
+              <div className="p-3 rounded-lg bg-orange-100 dark:bg-orange-900/20 border border-orange-300 dark:border-orange-700">
+                <p className="text-orange-700 dark:text-orange-300 text-sm font-medium">{progress.errors} sample{progress.errors !== 1 ? 's' : ''} failed:</p>
+                {progress.errorDetails.map((detail, i) => (
+                  <p key={i} className="text-orange-600 dark:text-orange-400 text-xs mt-1 font-mono break-all">{detail}</p>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Error status (all samples failed) */}
+        {progress.status === 'error' && !progress.isRunning && progress.errorDetails.length > 0 && (
+          <div className="p-3 rounded-lg bg-red-100 dark:bg-red-900/30 border border-red-300 dark:border-red-700">
+            <p className="text-red-700 dark:text-red-300 text-sm font-medium">{progress.statusMessage}</p>
+            {progress.errorDetails.map((detail, i) => (
+              <p key={i} className="text-red-600 dark:text-red-400 text-xs mt-1 font-mono break-all">{detail}</p>
+            ))}
           </div>
         )}
 

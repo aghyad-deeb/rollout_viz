@@ -14,6 +14,7 @@ interface GradingProgress {
   total: number;
   completed: number;
   errors: number;
+  errorDetails: string[];  // Unique error messages from failed samples
   isRunning: boolean;
   status: GradingStatus;
   statusMessage: string;
@@ -32,6 +33,7 @@ export function useGrading() {
     total: 0,
     completed: 0,
     errors: 0,
+    errorDetails: [],
     isRunning: false,
     status: 'idle',
     statusMessage: '',
@@ -166,12 +168,29 @@ export function useGrading() {
       total: sampleIds.length,
       completed: 0,
       errors: 0,
+      errorDetails: [],
       isRunning: true,
       status: 'connecting',
-      statusMessage: `Connecting to ${provider}...`,
+      statusMessage: `Validating ${provider} connection...`,
     });
 
     try {
+      // Pre-flight: validate API key + model before starting the full job
+      const testResponse = await fetch('/api/test-provider', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider,
+          model,
+          ...(apiKey ? { api_key: apiKey } : {}),
+        }),
+        signal,
+      });
+      const testResult = await testResponse.json();
+      if (!testResult.ok) {
+        throw new Error(testResult.error || `Failed to connect to ${provider}`);
+      }
+
       const request: GradeRequest = {
         file_path: filePath,
         sample_ids: sampleIds,
@@ -296,11 +315,30 @@ export function useGrading() {
       if (!finalResult) {
         throw new Error('Grading did not complete');
       }
-      
+
+      // Extract unique error messages for display
+      const uniqueErrors = [...new Set(finalResult.errors.map(e => e.error))];
+
+      // If ALL samples failed, surface the error prominently
+      if (finalResult.graded_count === 0 && finalResult.errors.length > 0) {
+        setError(`All ${finalResult.errors.length} samples failed: ${uniqueErrors[0]}`);
+        setProgress({
+          total: sampleIds.length,
+          completed: 0,
+          errors: finalResult.errors.length,
+          errorDetails: uniqueErrors,
+          isRunning: false,
+          status: 'error',
+          statusMessage: `All ${finalResult.errors.length} samples failed`,
+        });
+        return finalResult;
+      }
+
       setProgress({
         total: sampleIds.length,
         completed: finalResult.graded_count,
         errors: finalResult.errors.length,
+        errorDetails: uniqueErrors,
         isRunning: false,
         status: 'complete',
         statusMessage: `Graded ${finalResult.graded_count} sample${finalResult.graded_count !== 1 ? 's' : ''}${finalResult.errors.length > 0 ? ` (${finalResult.errors.length} error${finalResult.errors.length !== 1 ? 's' : ''})` : ''}`,

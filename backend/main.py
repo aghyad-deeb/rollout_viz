@@ -7,14 +7,17 @@ Provides REST API endpoints for loading JSONL data from local files or S3.
 import asyncio
 import json
 import os
+import secrets
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from pydantic import BaseModel
 
 from backend.llm_providers import (
@@ -28,16 +31,22 @@ from backend.llm_providers import (
 # Project root directory (parent of backend/)
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
-# Load environment variables from .env file
-# Check multiple locations: project root, home directory
-env_locations = [
-    PROJECT_ROOT / ".env",
-    Path.home() / ".env",
-]
-for env_path in env_locations:
-    if env_path.exists():
-        load_dotenv(env_path)
-        break
+# Load environment variables exclusively from ~/.env
+# All config (API keys, VIZ_PASSWORD, etc.) lives in one place
+_env_file = Path.home() / ".env"
+_env_config: Dict[str, str] = {}
+if _env_file.exists():
+    with open(_env_file, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                key, value = line.split('=', 1)
+                # Strip surrounding quotes if present
+                value = value.strip().strip('"').strip("'")
+                _env_config[key.strip()] = value
+    print(f"[CONFIG] Loaded {len(_env_config)} vars from {_env_file}")
+else:
+    print(f"[CONFIG] WARNING: {_env_file} not found")
 
 # API key environment variable names for each provider
 API_KEY_ENV_VARS = {
@@ -49,10 +58,10 @@ API_KEY_ENV_VARS = {
 
 
 def get_env_api_key(provider: str) -> Optional[str]:
-    """Get API key from environment for a provider."""
+    """Get API key from ~/.env for a provider (ignores shell environment)."""
     env_var = API_KEY_ENV_VARS.get(provider)
     if env_var:
-        key = os.getenv(env_var)
+        key = _env_config.get(env_var)
         if key:
             print(f"[DEBUG] {provider} key loaded: {key[:15]}...{key[-5:]} (len={len(key)})")
         return key
@@ -68,6 +77,109 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# --- Password authentication ---
+VIZ_PASSWORD = _env_config.get("VIZ_PASSWORD")
+SECRET_KEY = _env_config.get("VIZ_SECRET_KEY", secrets.token_hex(32))
+cookie_serializer = URLSafeTimedSerializer(SECRET_KEY)
+COOKIE_MAX_AGE = 30 * 24 * 3600  # 30 days
+AUTH_EXEMPT_PATHS = {"/api/auth/login", "/api/auth/check", "/api/health"}
+
+# Simple in-memory rate limiter for login attempts
+_login_attempts: Dict[str, List[float]] = {}
+RATE_LIMIT_WINDOW = 300  # 5 minutes
+RATE_LIMIT_MAX = 5
+
+
+def _check_rate_limit(client_ip: str) -> bool:
+    """Return True if the request should be rate-limited."""
+    now = time.time()
+    attempts = _login_attempts.get(client_ip, [])
+    # Prune old attempts
+    attempts = [t for t in attempts if now - t < RATE_LIMIT_WINDOW]
+    _login_attempts[client_ip] = attempts
+    return len(attempts) >= RATE_LIMIT_MAX
+
+
+def _record_failed_attempt(client_ip: str):
+    _login_attempts.setdefault(client_ip, []).append(time.time())
+
+
+def _clear_attempts(client_ip: str):
+    _login_attempts.pop(client_ip, None)
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    if not VIZ_PASSWORD:
+        return await call_next(request)
+    if request.url.path in AUTH_EXEMPT_PATHS:
+        return await call_next(request)
+    # Only protect /api/* routes
+    if not request.url.path.startswith("/api"):
+        return await call_next(request)
+    # Check session cookie
+    session_cookie = request.cookies.get("viz_session")
+    if session_cookie:
+        try:
+            cookie_serializer.loads(session_cookie, max_age=COOKIE_MAX_AGE)
+            return await call_next(request)
+        except (BadSignature, SignatureExpired):
+            pass
+    return JSONResponse(status_code=401, content={"detail": "Authentication required"})
+
+
+class LoginRequest(BaseModel):
+    password: str
+
+
+@app.post("/api/auth/login")
+async def auth_login(body: LoginRequest, request: Request, response: Response):
+    client_ip = request.client.host if request.client else "unknown"
+    if _check_rate_limit(client_ip):
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Too many login attempts. Try again in a few minutes."},
+            headers={"Retry-After": str(RATE_LIMIT_WINDOW)},
+        )
+    if not VIZ_PASSWORD or not secrets.compare_digest(body.password, VIZ_PASSWORD):
+        _record_failed_attempt(client_ip)
+        return JSONResponse(status_code=401, content={"detail": "Invalid password"})
+    _clear_attempts(client_ip)
+    token = cookie_serializer.dumps("authenticated")
+    response = JSONResponse(content={"ok": True})
+    # Only set Secure flag when not on localhost (HTTP)
+    is_localhost = request.url.hostname in ("localhost", "127.0.0.1")
+    response.set_cookie(
+        key="viz_session",
+        value=token,
+        max_age=COOKIE_MAX_AGE,
+        httponly=True,
+        secure=not is_localhost,
+        samesite="lax",
+    )
+    return response
+
+
+@app.get("/api/auth/check")
+async def auth_check(request: Request):
+    auth_required = bool(VIZ_PASSWORD)
+    if not auth_required:
+        return {"auth_required": False, "authenticated": True}
+    session_cookie = request.cookies.get("viz_session")
+    if session_cookie:
+        try:
+            cookie_serializer.loads(session_cookie, max_age=COOKIE_MAX_AGE)
+            return {"auth_required": True, "authenticated": True}
+        except (BadSignature, SignatureExpired):
+            pass
+    return {"auth_required": True, "authenticated": False}
+
+
+if VIZ_PASSWORD:
+    print(f"[AUTH] Password protection enabled")
+else:
+    print(f"[AUTH] No VIZ_PASSWORD set — authentication disabled")
 
 
 class Message(BaseModel):
@@ -169,23 +281,28 @@ class PresetMetricInfo(BaseModel):
 
 
 def load_env_credentials():
-    """Load AWS credentials from ~/.env file."""
-    env_path = os.path.expanduser("~/.env")
-    if os.path.exists(env_path):
-        with open(env_path, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#') and '=' in line:
-                    key, value = line.split('=', 1)
-                    os.environ[key] = value
+    """Set AWS credentials from ~/.env config into os.environ for boto3."""
+    for key in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_DEFAULT_REGION"):
+        if key in _env_config:
+            os.environ[key] = _env_config[key]
+
+
+def _safe_resolve_path(file_path: str) -> Path:
+    """Resolve a file path and ensure it stays within PROJECT_ROOT."""
+    path = Path(file_path)
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    resolved = path.resolve()
+    try:
+        resolved.relative_to(PROJECT_ROOT.resolve())
+    except ValueError:
+        raise ValueError(f"Access denied: path is outside the project directory")
+    return resolved
 
 
 def load_jsonl_from_file(file_path: str) -> List[Dict[str, Any]]:
     """Load JSONL data from a local file."""
-    # Resolve relative paths from project root
-    path = Path(file_path)
-    if not path.is_absolute():
-        path = PROJECT_ROOT / path
+    path = _safe_resolve_path(file_path)
     
     samples = []
     with open(path, 'r') as f:
@@ -288,12 +405,8 @@ def list_s3_contents(bucket: str, prefix: str = "") -> Dict[str, List[Dict[str, 
 def list_local_files(directory: str) -> List[Dict[str, Any]]:
     """List JSONL files in a local directory."""
     files = []
-    dir_path = Path(directory)
-    
-    # Resolve relative paths from project root
-    if not dir_path.is_absolute():
-        dir_path = PROJECT_ROOT / dir_path
-    
+    dir_path = _safe_resolve_path(directory)
+
     if not dir_path.exists():
         return files
     
@@ -310,15 +423,11 @@ def list_local_files(directory: str) -> List[Dict[str, Any]]:
 
 def list_local_contents(directory: str) -> Dict[str, List[Dict[str, Any]]]:
     """List both folders and JSONL files in a local directory (non-recursive)."""
-    dir_path = Path(directory)
-    
-    # Resolve relative paths from project root
-    if not dir_path.is_absolute():
-        dir_path = PROJECT_ROOT / dir_path
-    
+    dir_path = _safe_resolve_path(directory)
+
     folders = []
     files = []
-    
+
     if not dir_path.exists():
         return {'folders': folders, 'files': files}
     
@@ -537,18 +646,14 @@ def viz_file_exists(viz_path: str) -> bool:
         except Exception:
             return False
     else:
-        path = Path(viz_path)
-        if not path.is_absolute():
-            path = PROJECT_ROOT / path
+        path = _safe_resolve_path(viz_path)
         return path.exists()
 
 
 def save_jsonl_to_file(file_path: str, samples: List[Dict[str, Any]]) -> None:
     """Save samples to a local JSONL file."""
-    path = Path(file_path)
-    if not path.is_absolute():
-        path = PROJECT_ROOT / path
-    
+    path = _safe_resolve_path(file_path)
+
     # Create parent directories including viz/
     path.parent.mkdir(parents=True, exist_ok=True)
     
@@ -672,9 +777,58 @@ async def get_available_api_keys():
     """Check which API keys are available from server environment (.env file)."""
     available = {}
     for provider, env_var in API_KEY_ENV_VARS.items():
-        key = os.getenv(env_var)
+        key = _env_config.get(env_var)
         available[provider] = bool(key and len(key) > 0)
     return available
+
+
+class TestProviderRequest(BaseModel):
+    """Request to test an LLM provider connection."""
+    provider: str
+    model: str
+    api_key: Optional[str] = None
+
+
+@app.post("/api/test-provider")
+async def test_provider(request: TestProviderRequest):
+    """Test that an LLM provider + model + API key combination works.
+
+    Makes a minimal API call to validate the configuration before
+    starting a full grading job.
+    """
+    try:
+        api_key = request.api_key
+        if not api_key:
+            api_key = get_env_api_key(request.provider)
+
+        if not api_key:
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "error": f"No API key for {request.provider}"}
+            )
+
+        provider = get_provider(request.provider, api_key, request.model, max_tokens=200)
+
+        # Make a minimal call to validate the key + model.
+        # We only care that the API accepts the request (valid key + model).
+        # JSON parsing errors are OK here — they mean the connection works.
+        try:
+            await provider.grade_sample(
+                messages=[{"role": "user", "content": "Say OK."}],
+                metric_prompt="Is this message polite? Grade as true or false.",
+                grade_type="bool",
+                require_quotes=False,
+            )
+        except ValueError:
+            # ValueError = JSON parse error = API responded but format was off.
+            # That's fine — the connection works.
+            pass
+        return {"ok": True}
+    except Exception as e:
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": str(e)}
+        )
 
 
 @app.post("/api/grade", response_model=GradeResponse)
@@ -874,29 +1028,29 @@ async def grade_samples_stream(request: GradeRequest):
                 except Exception as e:
                     return sample_id, None, str(e)
             
-            # Run ALL requests in parallel, report progress as each completes
-            # Use asyncio.as_completed to get results as they finish
+            # Run requests with bounded concurrency using a semaphore
             batch_size = min(request.parallel_size, 500)  # Cap at 500
-            tasks = [asyncio.create_task(grade_one(sid)) for sid in request.sample_ids[:batch_size]]
-            remaining_ids = request.sample_ids[batch_size:]
-            
+            sem = asyncio.Semaphore(batch_size)
+
+            async def grade_with_limit(sample_id: int) -> tuple:
+                async with sem:
+                    return await grade_one(sample_id)
+
+            tasks = [asyncio.create_task(grade_with_limit(sid)) for sid in request.sample_ids]
+
             last_progress_update = 0
             progress_interval = max(1, total_samples // 20)  # Update ~20 times during grading
-            
+
             for coro in asyncio.as_completed(tasks):
                 sample_id, grade_entry, error = await coro
                 completed += 1
-                
+
                 if error:
                     errors.append({"sample_id": sample_id, "error": error})
+                    print(f"[SSE Grading] Sample {sample_id} error: {error}")
                 elif grade_entry:
                     grades[sample_id] = grade_entry
-                
-                # Start a new task if there are remaining samples
-                if remaining_ids:
-                    next_id = remaining_ids.pop(0)
-                    tasks.append(asyncio.create_task(grade_one(next_id)))
-                
+
                 # Send progress update periodically (not on every single completion)
                 if completed - last_progress_update >= progress_interval or completed == total_samples:
                     yield f"data: {json.dumps({'type': 'progress', 'completed': completed, 'total': total_samples})}\n\n"

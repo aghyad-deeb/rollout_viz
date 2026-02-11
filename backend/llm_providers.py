@@ -233,18 +233,25 @@ Respond ONLY with the JSON object, no additional text."""
 
 class OpenAIProvider(LLMProvider):
     """OpenAI API provider."""
-    
+
+    # Reasoning models that don't support response_format
+    REASONING_MODEL_PREFIXES = ("o1", "o3", "o4-mini")
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._client = None  # Instance variable, not class variable
-    
+
     def _get_client(self):
         """Get or create the async client (reused across requests)."""
         if self._client is None:
             from openai import AsyncOpenAI
             self._client = AsyncOpenAI(api_key=self.api_key)
         return self._client
-    
+
+    def _is_reasoning_model(self) -> bool:
+        """Check if the model is a reasoning model that doesn't support response_format."""
+        return any(self.model.startswith(prefix) for prefix in self.REASONING_MODEL_PREFIXES)
+
     async def grade_sample(
         self,
         messages: List[Dict[str, str]],
@@ -255,19 +262,24 @@ class OpenAIProvider(LLMProvider):
     ) -> GradeResult:
         client = self._get_client()
         prompt = self._build_grading_prompt(messages, metric_prompt, grade_type, require_quotes, is_quote_retry)
-        
+
         # Build kwargs with optional parameters
         kwargs: Dict[str, Any] = {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
-            "response_format": {"type": "json_object"},
         }
-        if self.temperature is not None:
+        is_reasoning = self._is_reasoning_model()
+        # Reasoning models (o1, o3, o4-mini) don't support response_format
+        if not is_reasoning:
+            kwargs["response_format"] = {"type": "json_object"}
+        # Reasoning models don't support temperature or top_p
+        if not is_reasoning and self.temperature is not None:
             kwargs["temperature"] = self.temperature
-        if self.max_tokens is not None:
-            kwargs["max_tokens"] = self.max_tokens
-        if self.top_p is not None:
+        if not is_reasoning and self.top_p is not None:
             kwargs["top_p"] = self.top_p
+        # Newer OpenAI models use max_completion_tokens instead of max_tokens
+        if self.max_tokens is not None:
+            kwargs["max_completion_tokens"] = self.max_tokens
         
         response = await client.chat.completions.create(**kwargs)
         

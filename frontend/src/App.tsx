@@ -14,7 +14,61 @@ import type { Sample, SearchCondition, SearchLogic } from './types';
 // Helper to generate unique IDs
 const generateId = () => Math.random().toString(36).substring(2, 9);
 
+function LoginOverlay({ isDarkMode, onLogin }: { isDarkMode: boolean; onLogin: () => void }) {
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoading(true);
+    setError('');
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password }),
+      });
+      if (res.ok) {
+        onLogin();
+      } else {
+        const data = await res.json();
+        setError(data.detail || 'Invalid password');
+      }
+    } catch {
+      setError('Connection failed');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className={`h-screen flex items-center justify-center ${isDarkMode ? 'bg-[#1a1a2e]' : 'bg-gray-50'}`}>
+      <form onSubmit={handleSubmit} className={`p-8 rounded-xl shadow-lg w-80 ${isDarkMode ? 'bg-gray-900 text-gray-100' : 'bg-white text-gray-900'}`}>
+        <h2 className="text-lg font-semibold mb-4">Rollout Visualizer</h2>
+        <input
+          type="password"
+          value={password}
+          onChange={e => setPassword(e.target.value)}
+          placeholder="Enter password"
+          autoFocus
+          className={`w-full px-3 py-2 rounded-lg border mb-3 outline-none focus:ring-2 focus:ring-blue-500 ${isDarkMode ? 'bg-gray-800 border-gray-700 text-gray-100' : 'bg-white border-gray-300 text-gray-900'}`}
+        />
+        {error && <p className="text-red-500 text-sm mb-3">{error}</p>}
+        <button
+          type="submit"
+          disabled={loading || !password}
+          className="w-full py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-medium disabled:opacity-50 transition-colors"
+        >
+          {loading ? 'Checking...' : 'Log in'}
+        </button>
+      </form>
+    </div>
+  );
+}
+
 function App() {
+  const [authState, setAuthState] = useState<'loading' | 'login' | 'ready'>('loading');
   const [samples, setSamples] = useState<Sample[]>([]);
   const [filteredSamples, setFilteredSamples] = useState<Sample[]>([]);
   const [selectedSampleId, setSelectedSampleId] = useState<number | null>(null);
@@ -37,6 +91,16 @@ function App() {
   const grading = useGrading();
   const initialLoadDone = useRef(false);
   const isUserAction = useRef(false);
+
+  // Check authentication on mount
+  useEffect(() => {
+    fetch('/api/auth/check')
+      .then(res => res.json())
+      .then(data => {
+        setAuthState(data.authenticated ? 'ready' : data.auth_required ? 'login' : 'ready');
+      })
+      .catch(() => setAuthState('ready')); // If backend is down, don't block
+  }, []);
 
   // Get the primary file path for display and URL (first file or the sample's source file)
   const primaryFilePath = filePaths.length > 0 ? filePaths[0] : '';
@@ -177,6 +241,13 @@ function App() {
       });
     }
   }, [filePaths, loadSamples, loadMultipleSamples]);
+
+  if (authState === 'loading') {
+    return <div className={`h-screen ${isDarkMode ? 'bg-[#1a1a2e]' : 'bg-white'}`} />;
+  }
+  if (authState === 'login') {
+    return <LoginOverlay isDarkMode={isDarkMode} onLogin={() => setAuthState('ready')} />;
+  }
 
   return (
     <div className={`h-screen ${isDarkMode ? 'bg-[#1a1a2e]' : 'bg-white'}`}>
