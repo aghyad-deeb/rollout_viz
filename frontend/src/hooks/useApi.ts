@@ -26,8 +26,12 @@ export function useApi() {
     try {
       const response = await fetch(`/api/samples?file=${encodeURIComponent(filePath)}`);
       if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.detail || 'Failed to load samples');
+        let detail = `Failed to load samples: ${response.status} ${response.statusText}`;
+        try {
+          const errorData = await response.json();
+          detail = errorData.detail || detail;
+        } catch { /* response body not JSON */ }
+        throw new Error(detail);
       }
       const data = await response.json();
       return data;
@@ -52,8 +56,12 @@ export function useApi() {
         filePaths.map(async (filePath) => {
           const response = await fetch(`/api/samples?file=${encodeURIComponent(filePath)}`);
           if (!response.ok) {
-            const errorData = await response.json();
-            throw new Error(`Failed to load ${filePath}: ${errorData.detail || 'Unknown error'}`);
+            let detail = `${response.status} ${response.statusText}`;
+            try {
+              const errorData = await response.json();
+              detail = errorData.detail || detail;
+            } catch { /* response body not JSON */ }
+            throw new Error(`Failed to load ${filePath}: ${detail}`);
           }
           return response.json() as Promise<SamplesResponse>;
         })

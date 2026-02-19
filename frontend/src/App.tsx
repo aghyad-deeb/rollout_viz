@@ -126,9 +126,9 @@ function App() {
     }
   }, [getUrlState]);
 
-  // Load samples when file paths change
+  // Load samples when file paths change (only after authenticated)
   useEffect(() => {
-    if (filePaths.length === 0) return;
+    if (filePaths.length === 0 || authState !== 'ready') return;
     
     if (filePaths.length === 1) {
       // Single file - use simple loading
@@ -164,7 +164,7 @@ function App() {
         }
       });
     }
-  }, [filePaths, loadSamples, loadMultipleSamples, getUrlState]);
+  }, [filePaths, authState, loadSamples, loadMultipleSamples, getUrlState]);
 
   // Only update URL on user-initiated sample selection (not on initial load)
   const handleSelectSampleWithUrlUpdate = (id: number) => {

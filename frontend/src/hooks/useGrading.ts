@@ -186,7 +186,12 @@ export function useGrading() {
         }),
         signal,
       });
-      const testResult = await testResponse.json();
+      let testResult;
+      try {
+        testResult = await testResponse.json();
+      } catch {
+        throw new Error(`Pre-flight check failed: ${testResponse.status} ${testResponse.statusText}`);
+      }
       if (!testResult.ok) {
         throw new Error(testResult.error || `Failed to connect to ${provider}`);
       }
@@ -226,8 +231,12 @@ export function useGrading() {
       });
 
       if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.detail || 'Failed to grade samples');
+        let detail = `Grading request failed: ${response.status} ${response.statusText}`;
+        try {
+          const errorData = await response.json();
+          detail = errorData.detail || detail;
+        } catch { /* response body not JSON */ }
+        throw new Error(detail);
       }
 
       // Read SSE stream
@@ -252,19 +261,23 @@ export function useGrading() {
           
           const { done, value } = await reader.read();
           
-          if (done) break;
-          
+          if (done) {
+            // Flush remaining decoder bytes
+            buffer += decoder.decode();
+            break;
+          }
+
           buffer += decoder.decode(value, { stream: true });
-          
+
           // Process complete SSE events (lines starting with "data: ")
           const lines = buffer.split('\n');
           buffer = lines.pop() || ''; // Keep incomplete line in buffer
-          
+
           for (const line of lines) {
             if (line.startsWith('data: ')) {
               try {
                 const eventData = JSON.parse(line.slice(6));
-                
+
                 if (eventData.type === 'progress') {
                   setProgress(prev => ({
                     ...prev,
@@ -289,6 +302,25 @@ export function useGrading() {
                 throw parseErr;
               }
             }
+          }
+        }
+
+        // Process any remaining data in buffer after stream ends
+        if (buffer.trim().startsWith('data: ')) {
+          try {
+            const eventData = JSON.parse(buffer.trim().slice(6));
+            if (eventData.type === 'complete') {
+              errorCount = eventData.errors?.length || 0;
+              finalResult = {
+                graded_count: eventData.graded_count,
+                errors: eventData.errors || [],
+                grades: eventData.grades || {},
+              };
+            } else if (eventData.type === 'error') {
+              throw new Error(eventData.message);
+            }
+          } catch (parseErr) {
+            if (!(parseErr instanceof SyntaxError)) throw parseErr;
           }
         }
       } catch (streamErr) {
@@ -385,8 +417,12 @@ export function useGrading() {
       });
 
       if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.detail || 'Failed to save grades');
+        let detail = `Failed to save grades: ${response.status} ${response.statusText}`;
+        try {
+          const errorData = await response.json();
+          detail = errorData.detail || detail;
+        } catch { /* response body not JSON */ }
+        throw new Error(detail);
       }
 
       return true;

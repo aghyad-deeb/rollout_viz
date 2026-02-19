@@ -110,6 +110,24 @@ def _clear_attempts(client_ip: str):
 
 
 @app.middleware("http")
+async def timing_middleware(request: Request, call_next):
+    if not request.url.path.startswith("/api"):
+        return await call_next(request)
+    start = time.time()
+    response = await call_next(request)
+    elapsed = time.time() - start
+    # Log slow requests or all sample loads
+    path = request.url.path
+    if elapsed > 0.5 or "samples" in path:
+        short_path = request.url.query if request.url.query else path
+        # Truncate long query strings for readability
+        if len(short_path) > 80:
+            short_path = "..." + short_path[-77:]
+        print(f"[PERF] {request.method} {path} — {elapsed:.2f}s ({response.status_code}) {short_path}")
+    return response
+
+
+@app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     if not VIZ_PASSWORD:
         return await call_next(request)
@@ -507,71 +525,99 @@ async def get_s3_contents(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _load_samples_sync(file: str) -> SamplesResponse:
+    """Synchronous helper for loading samples — runs in a thread to avoid blocking the event loop."""
+    # Check if viz/ version exists and use it if so
+    viz_path = get_viz_path(file)
+    has_grades = False
+    actual_path = file
+
+    if viz_file_exists(viz_path):
+        actual_path = viz_path
+        has_grades = True
+
+    if actual_path.startswith("s3://"):
+        s3_path = actual_path[5:]
+        bucket, key = s3_path.split("/", 1)
+        raw_samples = load_jsonl_from_s3(bucket, key)
+    else:
+        raw_samples = load_jsonl_from_file(actual_path)
+
+    # Convert to Sample objects with IDs
+    samples = []
+    experiment_name = "unknown"
+
+    for i, raw in enumerate(raw_samples):
+        attrs = raw.get('attributes', {})
+        if experiment_name == "unknown":
+            experiment_name = attrs.get('experiment_name', 'unknown')
+
+        if 'validate' in attrs:
+            attrs['is_validate'] = attrs.pop('validate')
+
+        grades = raw.get('grades', None)
+        if grades:
+            has_grades = True
+
+        sample = Sample(
+            id=i,
+            messages=[Message(**msg) for msg in raw.get('messages', [])],
+            attributes=SampleAttributes(**attrs),
+            timestamp=raw.get('timestamp', ''),
+            grades=grades,
+        )
+        samples.append(sample)
+
+    return SamplesResponse(
+        samples=samples,
+        total=len(samples),
+        experiment_name=experiment_name,
+        file_path=file,
+        has_grades=has_grades,
+    )
+
+
 @app.get("/api/samples", response_model=SamplesResponse)
 async def get_samples(
     file: str = Query(..., description="Path to JSONL file (local path or s3://bucket/key)")
 ):
     """Load samples from a JSONL file.
-    
+
     Automatically checks for a viz/ version first (which includes grades).
     Falls back to the original file if viz/ doesn't exist.
+    Runs in a thread so multiple requests can load concurrently.
     """
     try:
-        # Check if viz/ version exists and use it if so
-        viz_path = get_viz_path(file)
-        has_grades = False
-        actual_path = file
-        
-        if viz_file_exists(viz_path):
-            actual_path = viz_path
-            has_grades = True
-        
-        if actual_path.startswith("s3://"):
-            # Parse S3 path
-            s3_path = actual_path[5:]  # Remove 's3://'
-            bucket, key = s3_path.split("/", 1)
-            raw_samples = load_jsonl_from_s3(bucket, key)
-        else:
-            raw_samples = load_jsonl_from_file(actual_path)
-        
-        # Convert to Sample objects with IDs
-        samples = []
-        experiment_name = "unknown"
-        
-        for i, raw in enumerate(raw_samples):
-            attrs = raw.get('attributes', {})
-            if experiment_name == "unknown":
-                experiment_name = attrs.get('experiment_name', 'unknown')
-            
-            # Rename 'validate' to 'is_validate' to avoid shadowing BaseModel.validate
-            if 'validate' in attrs:
-                attrs['is_validate'] = attrs.pop('validate')
-            
-            # Include grades if present
-            grades = raw.get('grades', None)
-            if grades:
-                has_grades = True
-            
-            sample = Sample(
-                id=i,
-                messages=[Message(**msg) for msg in raw.get('messages', [])],
-                attributes=SampleAttributes(**attrs),
-                timestamp=raw.get('timestamp', ''),
-                grades=grades,
-            )
-            samples.append(sample)
-        
-        return SamplesResponse(
-            samples=samples,
-            total=len(samples),
-            experiment_name=experiment_name,
-            file_path=file,  # Return original path for consistency
-            has_grades=has_grades,
-        )
+        return await asyncio.to_thread(_load_samples_sync, file)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"File not found: {file}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _load_single_sample_sync(file: str, sample_id: int) -> Sample:
+    """Synchronous helper for loading a single sample — runs in a thread."""
+    if file.startswith("s3://"):
+        s3_path = file[5:]
+        bucket, key = s3_path.split("/", 1)
+        raw_samples = load_jsonl_from_s3(bucket, key)
+    else:
+        raw_samples = load_jsonl_from_file(file)
+
+    if sample_id < 0 or sample_id >= len(raw_samples):
+        raise HTTPException(status_code=404, detail=f"Sample {sample_id} not found")
+
+    raw = raw_samples[sample_id]
+    attrs = raw.get('attributes', {})
+    if 'validate' in attrs:
+        attrs['is_validate'] = attrs.pop('validate')
+
+    return Sample(
+        id=sample_id,
+        messages=[Message(**msg) for msg in raw.get('messages', [])],
+        attributes=SampleAttributes(**attrs),
+        timestamp=raw.get('timestamp', ''),
+    )
 
 
 @app.get("/api/sample/{sample_id}", response_model=Sample)
@@ -581,28 +627,7 @@ async def get_sample(
 ):
     """Get a single sample by ID."""
     try:
-        if file.startswith("s3://"):
-            s3_path = file[5:]
-            bucket, key = s3_path.split("/", 1)
-            raw_samples = load_jsonl_from_s3(bucket, key)
-        else:
-            raw_samples = load_jsonl_from_file(file)
-        
-        if sample_id < 0 or sample_id >= len(raw_samples):
-            raise HTTPException(status_code=404, detail=f"Sample {sample_id} not found")
-        
-        raw = raw_samples[sample_id]
-        attrs = raw.get('attributes', {})
-        # Rename 'validate' to 'is_validate' to avoid shadowing BaseModel.validate
-        if 'validate' in attrs:
-            attrs['is_validate'] = attrs.pop('validate')
-        
-        return Sample(
-            id=sample_id,
-            messages=[Message(**msg) for msg in raw.get('messages', [])],
-            attributes=SampleAttributes(**attrs),
-            timestamp=raw.get('timestamp', ''),
-        )
+        return await asyncio.to_thread(_load_single_sample_sync, file, sample_id)
     except HTTPException:
         raise
     except Exception as e:
@@ -846,31 +871,36 @@ async def grade_samples(request: GradeRequest):
                 detail=f"No API key provided for {request.provider} and none found in .env file"
             )
         
-        # Load the samples
-        if request.file_path.startswith("s3://"):
-            s3_path = request.file_path[5:]
+        # Load the samples (check viz/ version first, same as GET /api/samples)
+        actual_path = request.file_path
+        viz_path = get_viz_path(request.file_path)
+        if viz_file_exists(viz_path):
+            actual_path = viz_path
+
+        if actual_path.startswith("s3://"):
+            s3_path = actual_path[5:]
             bucket, key = s3_path.split("/", 1)
             raw_samples = load_jsonl_from_s3(bucket, key)
         else:
-            raw_samples = load_jsonl_from_file(request.file_path)
-        
+            raw_samples = load_jsonl_from_file(actual_path)
+
         # Get the LLM provider with advanced settings
         provider = get_provider(
-            request.provider, 
-            api_key, 
+            request.provider,
+            api_key,
             request.model,
             temperature=request.temperature,
             max_tokens=request.max_tokens,
             top_p=request.top_p,
         )
-        
+
         # Grade each requested sample
         grades: Dict[int, GradeEntry] = {}
         errors: List[Dict[str, Any]] = []
-        
+
         async def grade_one(sample_id: int) -> tuple:
             if sample_id < 0 or sample_id >= len(raw_samples):
-                return sample_id, None, f"Sample {sample_id} not found"
+                return sample_id, None, f"Sample {sample_id} not found (file has {len(raw_samples)} samples)"
             
             raw = raw_samples[sample_id]
             messages = raw.get('messages', [])
@@ -964,35 +994,42 @@ async def grade_samples_stream(request: GradeRequest):
                 yield f"data: {json.dumps({'type': 'error', 'message': f'No API key for {request.provider}'})}\n\n"
                 return
             
-            # Load the samples
-            if request.file_path.startswith("s3://"):
-                s3_path = request.file_path[5:]
+            # Load the samples (check viz/ version first, same as GET /api/samples)
+            actual_path = request.file_path
+            viz_path = get_viz_path(request.file_path)
+            if viz_file_exists(viz_path):
+                actual_path = viz_path
+
+            if actual_path.startswith("s3://"):
+                s3_path = actual_path[5:]
                 bucket, key = s3_path.split("/", 1)
                 raw_samples = load_jsonl_from_s3(bucket, key)
             else:
-                raw_samples = load_jsonl_from_file(request.file_path)
-            
+                raw_samples = load_jsonl_from_file(actual_path)
+
+            print(f"[SSE Grading] Loaded {len(raw_samples)} samples from {actual_path}, grading IDs: {request.sample_ids[:5]}{'...' if len(request.sample_ids) > 5 else ''}")
+
             # Get the LLM provider with advanced settings
             provider = get_provider(
-                request.provider, 
-                api_key, 
+                request.provider,
+                api_key,
                 request.model,
                 temperature=request.temperature,
                 max_tokens=request.max_tokens,
                 top_p=request.top_p,
             )
-            
+
             total_samples = len(request.sample_ids)
             completed = 0
             grades: Dict[int, dict] = {}
             errors: List[Dict[str, Any]] = []
-            
+
             # Send initial progress
             yield f"data: {json.dumps({'type': 'progress', 'completed': 0, 'total': total_samples})}\n\n"
-            
+
             async def grade_one(sample_id: int) -> tuple:
                 if sample_id < 0 or sample_id >= len(raw_samples):
-                    return sample_id, None, f"Sample {sample_id} not found"
+                    return sample_id, None, f"Sample {sample_id} not found (file has {len(raw_samples)} samples)"
                 
                 raw = raw_samples[sample_id]
                 messages = raw.get('messages', [])
