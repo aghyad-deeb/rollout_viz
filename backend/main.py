@@ -525,8 +525,15 @@ async def get_s3_contents(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def _load_samples_sync(file: str) -> SamplesResponse:
-    """Synchronous helper for loading samples — runs in a thread to avoid blocking the event loop."""
+_ATTR_DEFAULTS = {
+    "step": 0, "sample_index": 0, "rollout_n": 0, "reward": 0.0,
+    "data_source": "unknown", "experiment_name": "unknown", "is_validate": False,
+}
+
+
+def _load_samples_sync(file: str) -> dict:
+    """Synchronous helper for loading samples — runs in a thread to avoid blocking the event loop.
+    Returns a plain dict (skips Pydantic) for performance."""
     # Check if viz/ version exists and use it if so
     viz_path = get_viz_path(file)
     has_grades = False
@@ -543,7 +550,7 @@ def _load_samples_sync(file: str) -> SamplesResponse:
     else:
         raw_samples = load_jsonl_from_file(actual_path)
 
-    # Convert to Sample objects with IDs
+    # Build response dicts directly — skip Pydantic model construction
     samples = []
     experiment_name = "unknown"
 
@@ -559,25 +566,31 @@ def _load_samples_sync(file: str) -> SamplesResponse:
         if grades:
             has_grades = True
 
-        sample = Sample(
-            id=i,
-            messages=[Message(**msg) for msg in raw.get('messages', [])],
-            attributes=SampleAttributes(**attrs),
-            timestamp=raw.get('timestamp', ''),
-            grades=grades,
-        )
-        samples.append(sample)
+        # Apply defaults for missing attributes
+        filled_attrs = {k: attrs.get(k, v) for k, v in _ATTR_DEFAULTS.items()}
+        # Preserve any extra attributes (e.g., source_file)
+        for k, v in attrs.items():
+            if k not in filled_attrs:
+                filled_attrs[k] = v
 
-    return SamplesResponse(
-        samples=samples,
-        total=len(samples),
-        experiment_name=experiment_name,
-        file_path=file,
-        has_grades=has_grades,
-    )
+        samples.append({
+            "id": i,
+            "messages": raw.get('messages', []),
+            "attributes": filled_attrs,
+            "timestamp": raw.get('timestamp', ''),
+            "grades": grades,
+        })
+
+    return {
+        "samples": samples,
+        "total": len(samples),
+        "experiment_name": experiment_name,
+        "file_path": file,
+        "has_grades": has_grades,
+    }
 
 
-@app.get("/api/samples", response_model=SamplesResponse)
+@app.get("/api/samples")
 async def get_samples(
     file: str = Query(..., description="Path to JSONL file (local path or s3://bucket/key)")
 ):
@@ -588,14 +601,15 @@ async def get_samples(
     Runs in a thread so multiple requests can load concurrently.
     """
     try:
-        return await asyncio.to_thread(_load_samples_sync, file)
+        data = await asyncio.to_thread(_load_samples_sync, file)
+        return JSONResponse(content=data)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"File not found: {file}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def _load_single_sample_sync(file: str, sample_id: int) -> Sample:
+def _load_single_sample_sync(file: str, sample_id: int) -> dict:
     """Synchronous helper for loading a single sample — runs in a thread."""
     if file.startswith("s3://"):
         s3_path = file[5:]
@@ -612,22 +626,28 @@ def _load_single_sample_sync(file: str, sample_id: int) -> Sample:
     if 'validate' in attrs:
         attrs['is_validate'] = attrs.pop('validate')
 
-    return Sample(
-        id=sample_id,
-        messages=[Message(**msg) for msg in raw.get('messages', [])],
-        attributes=SampleAttributes(**attrs),
-        timestamp=raw.get('timestamp', ''),
-    )
+    filled_attrs = {k: attrs.get(k, v) for k, v in _ATTR_DEFAULTS.items()}
+    for k, v in attrs.items():
+        if k not in filled_attrs:
+            filled_attrs[k] = v
+
+    return {
+        "id": sample_id,
+        "messages": raw.get('messages', []),
+        "attributes": filled_attrs,
+        "timestamp": raw.get('timestamp', ''),
+    }
 
 
-@app.get("/api/sample/{sample_id}", response_model=Sample)
+@app.get("/api/sample/{sample_id}")
 async def get_sample(
     sample_id: int,
     file: str = Query(..., description="Path to JSONL file")
 ):
     """Get a single sample by ID."""
     try:
-        return await asyncio.to_thread(_load_single_sample_sync, file, sample_id)
+        data = await asyncio.to_thread(_load_single_sample_sync, file, sample_id)
+        return JSONResponse(content=data)
     except HTTPException:
         raise
     except Exception as e:

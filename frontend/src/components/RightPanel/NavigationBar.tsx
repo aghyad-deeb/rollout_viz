@@ -33,6 +33,12 @@ export function NavigationBar({
     navigator.clipboard.writeText(link);
   };
 
+  const copyConversation = () => {
+    if (!sample) return;
+    const messages = sample.messages.map(({ role, content }) => ({ role, content }));
+    navigator.clipboard.writeText(JSON.stringify(messages, null, 2));
+  };
+
   const btnClass = isDarkMode 
     ? 'text-gray-300 bg-gray-700 hover:bg-gray-600' 
     : 'text-gray-600 bg-gray-200 hover:bg-gray-300';
@@ -161,6 +167,14 @@ export function NavigationBar({
 
         {/* Action buttons */}
         <div className="flex items-center gap-1">
+          <button
+            className={`flex items-center justify-center w-7 h-7 rounded-md disabled:opacity-50 ${btnClass}`}
+            title="Copy conversation as JSON"
+            onClick={copyConversation}
+            disabled={!sample}
+          >
+            <span className="material-symbols-outlined" style={{ fontSize: 17 }}>content_copy</span>
+          </button>
           <button
             className={`flex items-center justify-center w-7 h-7 rounded-md ${isDarkMode ? 'text-blue-400 bg-blue-900 hover:bg-blue-800' : 'text-blue-700 bg-blue-200 hover:bg-blue-300'}`}
             title="Download"
