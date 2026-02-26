@@ -1,8 +1,9 @@
-import { useState } from 'react';
+import { useState, lazy, Suspense } from 'react';
 import type { Sample, ViewMode, SearchCondition } from '../../types';
 import { NavigationBar } from './NavigationBar';
 import { ChatView } from './ChatView';
-import { AnalysisView } from './AnalysisView';
+
+const AnalysisView = lazy(() => import('./AnalysisView').then(m => ({ default: m.AnalysisView })));
 
 interface RightPanelProps {
   sample: Sample | null;
@@ -43,7 +44,15 @@ export function RightPanel({
 
   const renderContent = () => {
     if (viewMode === 'analysis') {
-      return <AnalysisView samples={filteredSamples} isDarkMode={isDarkMode} />;
+      return (
+        <Suspense fallback={
+          <div className={`h-full flex items-center justify-center ${isDarkMode ? 'text-gray-500' : 'text-gray-400'}`}>
+            <span className="material-symbols-outlined animate-spin" style={{ fontSize: 32 }}>progress_activity</span>
+          </div>
+        }>
+          <AnalysisView samples={filteredSamples} isDarkMode={isDarkMode} />
+        </Suspense>
+      );
     }
 
     // Chat view (default) and placeholders for eval/meta

@@ -30,7 +30,64 @@ cloudflared tunnel --url http://localhost:3000
 ngrok http 3000 --domain YOUR-DOMAIN.ngrok-free.app
 ```
 
-No test suite exists. Verify changes manually via the running app or curl against the API. FastAPI auto-docs available at `http://localhost:8000/docs`.
+## Testing
+
+This project follows **Red/Green TDD**: write a failing test with timing/behavior assertions first, then implement the minimum code to make it pass.
+
+### Running Tests
+
+```bash
+# Backend (pytest + pytest-benchmark + moto for S3 mocking)
+source venv/bin/activate
+pytest tests/ -v                                    # Full suite (~160 tests)
+pytest tests/test_performance.py -v                 # Performance benchmarks
+pytest tests/test_llm_providers.py -v               # LLM provider unit tests
+pytest tests/test_performance.py -k "s3_client" -v  # Run specific test class
+
+# Frontend (vitest + @testing-library/react)
+cd frontend
+npx vitest run                                      # Full suite (~120 tests)
+npx vitest run src/hooks/useDebouncedValue.test.ts   # Single file
+npx vitest run src/components/LeftPanel/             # Directory
+npx vitest                                          # Watch mode
+```
+
+### Test Organization
+
+**Backend** (`tests/`):
+- `conftest.py` — Shared fixtures: `sample_data`, `temp_jsonl`, `patch_project_root`, `app_no_auth`, `app_with_auth`, `authenticated_client`, `mock_s3`, `mock_env_config`. Autouse fixture resets rate limiter + caches between tests.
+- `test_performance.py` — Performance benchmarks with timing assertions (`@pytest.mark.performance`): S3 singleton, GZip, file cache, viz_exists cache, load benchmarks.
+- `test_llm_providers.py` — Provider factory, prompt building, response parsing, Google client reuse.
+- `test_sample_loading.py` — Sample loading, attribute defaults, `validate` → `is_validate` rename.
+- `test_file_browsing.py` — Local and S3 file listing, path traversal protection.
+- `test_grading.py` — Grade saving, merging, viz/ directory handling.
+- `test_auth.py` — Auth middleware, login, rate limiting, cookie handling.
+- `test_startup_stress.py` — Sustained load and memory pressure tests (slow, may flake under CI load).
+
+**Frontend** (`frontend/src/**/*.test.{ts,tsx}`):
+- `hooks/useDebouncedValue.test.ts` — Debounce hook: initial value, delay, timer reset.
+- `hooks/useDarkMode.test.ts`, `hooks/useMarkedFiles.test.ts`, `hooks/useUrlState.test.ts` — Hook unit tests.
+- `components/RightPanel/MessageCard.test.tsx` — Rendering, role colors, highlight priority, React.memo verification.
+- `components/RightPanel/ChatView.test.tsx`, `components/RightPanel/GradesDisplay.test.tsx` — Right panel unit tests.
+- `components/LeftPanel/SampleTable.test.tsx` — Table rendering, column sorting, selection.
+- `components/LeftPanel/SampleTable.stress.test.tsx` — 5,000-sample virtual scrolling, RAF scroll throttle, grade columns at scale.
+- `components/LeftPanel/LeftPanel.stress.test.tsx` — 5,000-sample filtering/sorting, debounced search batching, AND/OR logic.
+- `test/fixtures.ts` — `makeSample()`, `makeMessage()`, `makeAttributes()`, `makeGradeEntry()` factory helpers.
+- `test/setup.ts` — Global test setup (jsdom polyfills).
+
+### Writing New Tests (Red/Green TDD)
+
+1. **RED**: Write the failing test first. Use timing assertions for performance tests (e.g., `assert elapsed < 0.05`). Use identity checks for singletons (`assert client1 is client2`). Use `vi.useFakeTimers()` for debounce tests.
+2. **GREEN**: Write the minimum implementation to make the test pass.
+3. **REFACTOR**: Clean up without breaking green.
+
+Key patterns:
+- Backend perf tests use `time.perf_counter()` for timing, `@pytest.mark.performance` marker.
+- Frontend stress tests generate 5,000 samples via helper functions and assert render/filter times.
+- Use `_reset_*()` / `_clear_*()` functions for cache teardown in tests (called by autouse fixture in conftest).
+- Frontend tests requiring debounce use `vi.useFakeTimers()` + `act(() => vi.advanceTimersByTime(200))`.
+
+FastAPI auto-docs available at `http://localhost:8000/docs`.
 
 ## Architecture
 
@@ -99,6 +156,11 @@ AWS_DEFAULT_REGION=...
 ## Important Patterns
 
 ### Backend
+- **S3 client singleton**: `_get_s3_client()` lazily creates one `boto3.client('s3')` and reuses it across all S3 operations. Call `_reset_s3_client()` in tests to force re-creation (e.g., inside `mock_aws` context). All 5 S3 functions use this — never call `boto3.client('s3')` directly.
+- **GZip compression**: `GZipMiddleware(minimum_size=1000)` compresses API responses over 1KB. Added after CORS middleware.
+- **File loading cache**: `load_jsonl_from_file()` caches parsed results keyed by `(path, mtime)`. FIFO eviction at 20 entries. Call `_clear_file_cache()` in tests. Invalidates automatically when file mtime changes.
+- **viz_exists TTL cache**: `viz_file_exists()` caches results for 60 seconds to avoid repeated `head_object` / `stat()` calls. Call `_clear_viz_exists_cache()` in tests.
+- **LLM provider client reuse**: All providers (OpenAI, Anthropic, Google, OpenRouter) cache their API client in `self._client` via `_get_client()`. Google previously called `genai.configure()` + `GenerativeModel()` on every sample — now cached like the others.
 - **OpenAI reasoning models** (o1, o3, o4-mini): Do not support `response_format`, `temperature`, or `top_p`. Use `max_completion_tokens` instead of `max_tokens`. See `_is_reasoning_model()` in `llm_providers.py`.
 - **Grading concurrency**: Uses `asyncio.Semaphore` to bound parallel LLM calls. Do not use `asyncio.as_completed` with a sliding window — it silently drops tasks added during iteration.
 - **`validate` → `is_validate` rename**: The backend silently renames the `validate` attribute to `is_validate` on load to avoid shadowing Pydantic's `BaseModel.validate`. Raw JSONL uses `validate`; frontend uses `is_validate`.
@@ -111,6 +173,10 @@ AWS_DEFAULT_REGION=...
 ### Frontend
 - **Tailwind v4**: Uses `@tailwindcss/vite` plugin, not PostCSS. CSS import is `@import "tailwindcss"`, not a config file.
 - **TypeScript strict mode** with `erasableSyntaxOnly: true` — no `enum` or `namespace` allowed. ESLint 9 flat config.
+- **Debounced filtering**: `LeftPanel/index.tsx` uses `useDebouncedValue(value, 150)` on `searchConditions` and `filterExpression` before passing them to the `filteredSamples` useMemo. This prevents O(n*m) re-filtering on every keystroke. The hook lives at `hooks/useDebouncedValue.ts`.
+- **React.memo on MessageCard**: `MessageCard` is wrapped in `React.memo()` to skip re-renders when props haven't changed. The inner function is `MessageCardInner`, the export is `memo(MessageCardInner)`.
+- **RAF-throttled scroll**: `SampleTable.tsx` scroll handler uses `requestAnimationFrame` coalescing — stores a `rafIdRef`, skips if already scheduled, cleans up on unmount. Event listener uses `{ passive: true }`.
+- **Lazy-loaded chunks**: `AnalysisView` (imports recharts ~385KB) is `React.lazy()` loaded in `RightPanel/index.tsx`. `GradingPanel` is `React.lazy()` loaded in `App.tsx`. Both wrapped in `<Suspense>` with spinner fallbacks.
 - **Message role colors**: Defined as hand-rolled CSS classes in `index.css` (`.message-user`, `.message-assistant`, etc.), NOT Tailwind classes. Adding a new message role requires adding CSS classes there.
 - **Virtual scrolling**: `SampleTable.tsx` uses manual virtual scrolling with fixed `ROW_HEIGHT = 36px`. Changing row height requires reworking the scroll logic.
 - **Two search systems**: (1) Global search in FilterBar — multi-condition AND/OR, field-scoped, yellow/orange highlights. (2) Local search in ChatView (`Ctrl+F`) — in-message text search, green highlights. These are independent.

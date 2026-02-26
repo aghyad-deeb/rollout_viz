@@ -109,25 +109,39 @@ export function SampleTable({
     return [...baseColumns, ...metricColumns, sourceColumn];
   }, [metricNames]);
 
-  // Virtual scrolling
+  // Virtual scrolling with RAF-throttled scroll handler
+  const rafIdRef = useRef<number | null>(null);
+
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
 
-    const handleScroll = () => {
+    const updateVisibleRange = () => {
       const scrollTop = container.scrollTop;
       const viewportHeight = container.clientHeight;
-      
+
       const start = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - 5);
       const end = Math.min(samples.length, Math.ceil((scrollTop + viewportHeight) / ROW_HEIGHT) + 5);
-      
+
       setVisibleRange({ start, end });
+      rafIdRef.current = null;
     };
 
-    container.addEventListener('scroll', handleScroll);
-    handleScroll();
+    const handleScroll = () => {
+      if (rafIdRef.current !== null) return; // Already scheduled
+      rafIdRef.current = requestAnimationFrame(updateVisibleRange);
+    };
 
-    return () => container.removeEventListener('scroll', handleScroll);
+    container.addEventListener('scroll', handleScroll, { passive: true });
+    updateVisibleRange(); // Initial calculation
+
+    return () => {
+      container.removeEventListener('scroll', handleScroll);
+      if (rafIdRef.current !== null) {
+        cancelAnimationFrame(rafIdRef.current);
+        rafIdRef.current = null;
+      }
+    };
   }, [samples.length]);
 
   const totalHeight = samples.length * ROW_HEIGHT;

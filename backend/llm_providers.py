@@ -351,7 +351,19 @@ class AnthropicProvider(LLMProvider):
 
 class GoogleProvider(LLMProvider):
     """Google Gemini API provider."""
-    
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._client = None
+
+    def _get_client(self):
+        """Get or create the GenerativeModel (reused across requests)."""
+        if self._client is None:
+            import google.generativeai as genai
+            genai.configure(api_key=self.api_key)
+            self._client = genai.GenerativeModel(self.model)
+        return self._client
+
     async def grade_sample(
         self,
         messages: List[Dict[str, str]],
@@ -361,9 +373,8 @@ class GoogleProvider(LLMProvider):
         is_quote_retry: bool = False,
     ) -> GradeResult:
         import google.generativeai as genai
-        
-        genai.configure(api_key=self.api_key)
-        model = genai.GenerativeModel(self.model)
+
+        model = self._get_client()
         
         prompt = self._build_grading_prompt(messages, metric_prompt, grade_type, require_quotes, is_quote_retry)
         

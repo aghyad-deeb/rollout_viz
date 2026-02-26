@@ -3,6 +3,7 @@ import type { Sample, SortColumn, SortOrder, SearchCondition, SearchLogic } from
 import { SampleTable } from './SampleTable';
 import { FilterBar } from './FilterBar';
 import { MetadataHeader } from './MetadataHeader';
+import { useDebouncedValue } from '../../hooks/useDebouncedValue';
 
 interface LeftPanelProps {
   samples: Sample[];
@@ -22,6 +23,7 @@ interface LeftPanelProps {
   onToggleDarkMode: () => void;
   onFilteredSamplesChange?: (samples: Sample[]) => void;
   onCurrentOccurrenceIndexChange?: (index: number) => void;
+  messagesLoaded?: boolean;
 }
 
 export function LeftPanel({
@@ -42,11 +44,16 @@ export function LeftPanel({
   onToggleDarkMode,
   onFilteredSamplesChange,
   onCurrentOccurrenceIndexChange,
+  messagesLoaded = true,
 }: LeftPanelProps) {
   const [sortColumn, setSortColumn] = useState<SortColumn>('sample_index');
   const [sortOrder, setSortOrder] = useState<SortOrder>('asc');
   const [filterExpression, setFilterExpression] = useState('');
   const [currentOccurrenceIndex, setCurrentOccurrenceIndex] = useState(0); // Which occurrence within current sample
+
+  // Debounce search/filter inputs to avoid re-filtering on every keystroke
+  const debouncedSearchConditions = useDebouncedValue(searchConditions, 150);
+  const debouncedFilterExpression = useDebouncedValue(filterExpression, 150);
 
   // Filter and sort samples
   const filteredSamples = useMemo(() => {
@@ -153,7 +160,7 @@ export function LeftPanel({
     };
 
     // Apply search conditions
-    const activeConditions = searchConditions.filter(c => c.term.trim());
+    const activeConditions = debouncedSearchConditions.filter(c => c.term.trim());
     if (activeConditions.length > 0) {
       result = result.filter(sample => {
         if (searchLogic === 'AND') {
@@ -165,7 +172,7 @@ export function LeftPanel({
     }
 
     // Apply filter expression with AND/OR support
-    if (filterExpression.trim()) {
+    if (debouncedFilterExpression.trim()) {
       try {
         // Helper to evaluate a single condition
         const evaluateCondition = (
@@ -224,7 +231,7 @@ export function LeftPanel({
 
         // Parse expression with AND/OR support
         // Split by OR first (lower precedence), then AND (higher precedence)
-        const orGroups = filterExpression.split(/\s+OR\s+/i);
+        const orGroups = debouncedFilterExpression.split(/\s+OR\s+/i);
         
         result = result.filter(sample => {
           // Create combined attrs including metric grades
@@ -303,8 +310,8 @@ export function LeftPanel({
             bVal = b.attributes.reward;
             break;
           case 'num_messages':
-            aVal = a.messages.length;
-            bVal = b.messages.length;
+            aVal = a.messages.length || a.message_count || 0;
+            bVal = b.messages.length || b.message_count || 0;
             break;
           default:
             aVal = a.id;
@@ -324,7 +331,7 @@ export function LeftPanel({
     });
 
     return result;
-  }, [samples, searchConditions, searchLogic, filterExpression, sortColumn, sortOrder]);
+  }, [samples, debouncedSearchConditions, searchLogic, debouncedFilterExpression, sortColumn, sortOrder]);
 
   const handleSort = (column: SortColumn) => {
     if (sortColumn === column) {
@@ -501,6 +508,20 @@ export function LeftPanel({
           isDarkMode={isDarkMode}
           samples={samples}
         />
+
+        {/* Message search loading indicator */}
+        {!messagesLoaded && (() => {
+          const messageFields = ['chat', 'system', 'user', 'assistant', 'tool', 'reasoning', 'all'];
+          const hasActiveMessageSearch = searchConditions.some(
+            c => c.term.trim() && messageFields.includes(c.field)
+          );
+          return hasActiveMessageSearch ? (
+            <div className={`px-3 py-1 text-xs flex items-center gap-1 ${isDarkMode ? 'text-yellow-400 bg-yellow-900/20' : 'text-yellow-600 bg-yellow-50'}`}>
+              <span className="material-symbols-outlined animate-spin" style={{ fontSize: 12 }}>progress_activity</span>
+              Message search limited — loading full content...
+            </div>
+          ) : null;
+        })()}
 
         {/* Loading/Error states */}
         {loading && (

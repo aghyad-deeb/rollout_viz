@@ -40,6 +40,7 @@ export interface SampleGrades {
 export interface Sample {
   id: number;
   messages: Message[];
+  message_count?: number;
   attributes: SampleAttributes;
   timestamp: string;
   grades?: SampleGrades;

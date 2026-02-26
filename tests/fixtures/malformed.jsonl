@@ -1,0 +1,4 @@
+{"messages": [{"role": "user", "content": "Valid line one"}], "attributes": {"step": 1, "rollout_n": 300, "reward": 0.5}, "timestamp": "2026-01-25T09:00:00"}
+
+{"messages": [{"role": "user", "content": "This line is malformed"}, "attributes": {"step": 2, "rollout_n": 301, "reward": 0.3}
+{"messages": [{"role": "user", "content": "Valid line two"}], "attributes": {"step": 3, "rollout_n": 302, "reward": 0.7}, "timestamp": "2026-01-25T09:02:00"}

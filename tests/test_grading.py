@@ -1,0 +1,252 @@
+"""Tests for grading: test-provider, SSE streaming, concurrency, quote retry, save."""
+
+import json
+import pytest
+from unittest.mock import patch, AsyncMock, MagicMock
+from pathlib import Path
+
+from backend.llm_providers import GradeResult, Quote
+
+
+def _make_grade_result(grade=True, grade_type="bool", quotes=None, explanation="test"):
+    """Helper to create a GradeResult."""
+    return GradeResult(
+        grade=grade,
+        grade_type=grade_type,
+        quotes=quotes or [],
+        explanation=explanation,
+        model="test-model",
+        prompt_version="v1",
+        timestamp="2026-01-15T10:00:00",
+    )
+
+
+class TestTestProvider:
+    """Tests for POST /api/test-provider."""
+
+    async def test_no_key_returns_400(self, app_no_auth):
+        with patch("backend.main.get_env_api_key", return_value=None):
+            client = await app_no_auth()
+            resp = await client.post("/api/test-provider", json={
+                "provider": "openai", "model": "gpt-4o"
+            })
+            assert resp.status_code == 400
+            assert resp.json()["ok"] is False
+            await client.aclose()
+
+    async def test_valid_mocked_returns_ok(self, app_no_auth):
+        mock_provider = MagicMock()
+        mock_provider.grade_sample = AsyncMock(return_value=_make_grade_result())
+
+        with patch("backend.main.get_provider", return_value=mock_provider):
+            client = await app_no_auth()
+            resp = await client.post("/api/test-provider", json={
+                "provider": "openai", "model": "gpt-4o", "api_key": "test-key"
+            })
+            assert resp.status_code == 200
+            assert resp.json()["ok"] is True
+            await client.aclose()
+
+    async def test_value_error_still_ok(self, app_no_auth):
+        """ValueError from grade_sample means API connected but JSON was off — still ok."""
+        mock_provider = MagicMock()
+        mock_provider.grade_sample = AsyncMock(side_effect=ValueError("bad json"))
+
+        with patch("backend.main.get_provider", return_value=mock_provider):
+            client = await app_no_auth()
+            resp = await client.post("/api/test-provider", json={
+                "provider": "openai", "model": "gpt-4o", "api_key": "test-key"
+            })
+            assert resp.status_code == 200
+            assert resp.json()["ok"] is True
+            await client.aclose()
+
+    async def test_connection_error_returns_not_ok(self, app_no_auth):
+        """Connection error → ok=false."""
+        with patch("backend.main.get_provider", side_effect=Exception("Connection refused")):
+            client = await app_no_auth()
+            resp = await client.post("/api/test-provider", json={
+                "provider": "openai", "model": "gpt-4o", "api_key": "test-key"
+            })
+            assert resp.status_code == 400
+            assert resp.json()["ok"] is False
+            await client.aclose()
+
+
+class TestGradeStream:
+    """Tests for POST /api/grade-stream SSE endpoint."""
+
+    def _parse_sse_events(self, text):
+        """Parse SSE response text into list of event dicts."""
+        events = []
+        for line in text.split("\n"):
+            if line.startswith("data: "):
+                events.append(json.loads(line[6:]))
+        return events
+
+    async def test_progress_and_complete_events(self, app_no_auth, temp_jsonl, patch_project_root, sample_data):
+        file_path = temp_jsonl(sample_data, "test.jsonl")
+        mock_provider = MagicMock()
+        mock_provider.grade_sample = AsyncMock(return_value=_make_grade_result())
+
+        with patch("backend.main.get_provider", return_value=mock_provider):
+            client = await app_no_auth()
+            resp = await client.post("/api/grade-stream", json={
+                "file_path": str(file_path),
+                "sample_ids": [0, 1],
+                "metric_name": "test",
+                "metric_prompt": "Is this good?",
+                "grade_type": "bool",
+                "provider": "openai",
+                "model": "gpt-4o",
+                "api_key": "test-key",
+                "parallel_size": 10,
+            })
+            assert resp.status_code == 200
+            events = self._parse_sse_events(resp.text)
+
+            # Should have at least one progress and one complete event
+            types = [e["type"] for e in events]
+            assert "progress" in types
+            assert "complete" in types
+
+            # Complete event should have grades
+            complete = [e for e in events if e["type"] == "complete"][0]
+            assert complete["graded_count"] == 2
+            assert len(complete["errors"]) == 0
+            await client.aclose()
+
+    async def test_error_event_on_failure(self, app_no_auth, temp_jsonl, patch_project_root, sample_data):
+        file_path = temp_jsonl(sample_data, "test.jsonl")
+        mock_provider = MagicMock()
+        mock_provider.grade_sample = AsyncMock(side_effect=Exception("API error"))
+
+        with patch("backend.main.get_provider", return_value=mock_provider):
+            client = await app_no_auth()
+            resp = await client.post("/api/grade-stream", json={
+                "file_path": str(file_path),
+                "sample_ids": [0],
+                "metric_name": "test",
+                "metric_prompt": "Is this good?",
+                "grade_type": "bool",
+                "provider": "openai",
+                "model": "gpt-4o",
+                "api_key": "test-key",
+            })
+            events = self._parse_sse_events(resp.text)
+            complete = [e for e in events if e["type"] == "complete"][0]
+            assert len(complete["errors"]) == 1
+            await client.aclose()
+
+    async def test_no_api_key_sends_error_event(self, app_no_auth, temp_jsonl, patch_project_root, sample_data):
+        file_path = temp_jsonl(sample_data, "test.jsonl")
+        with patch("backend.main.get_env_api_key", return_value=None):
+            client = await app_no_auth()
+            resp = await client.post("/api/grade-stream", json={
+                "file_path": str(file_path),
+                "sample_ids": [0],
+                "metric_name": "test",
+                "metric_prompt": "Is this good?",
+                "grade_type": "bool",
+                "provider": "openai",
+                "model": "gpt-4o",
+            })
+            events = self._parse_sse_events(resp.text)
+            error_events = [e for e in events if e["type"] == "error"]
+            assert len(error_events) == 1
+            assert "API key" in error_events[0]["message"] or "key" in error_events[0]["message"].lower()
+            await client.aclose()
+
+
+class TestSaveGraded:
+    """Tests for POST /api/save-graded."""
+
+    async def test_creates_viz_dir_and_saves(self, app_no_auth, temp_jsonl, patch_project_root, sample_data):
+        file_path = temp_jsonl(sample_data, "test.jsonl")
+        grade_entry = {
+            "grade": True,
+            "grade_type": "bool",
+            "quotes": [],
+            "explanation": "good",
+            "model": "test",
+            "prompt_version": "v1",
+            "timestamp": "2026-01-15T10:00:00",
+        }
+        client = await app_no_auth()
+        resp = await client.post("/api/save-graded", json={
+            "file_path": str(file_path),
+            "grades": {"0": {"helpfulness": grade_entry}},
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["success"] is True
+
+        # Verify viz/ file was created
+        viz_path = file_path.parent / "viz" / file_path.name
+        assert viz_path.exists()
+        await client.aclose()
+
+    async def test_merges_grades_appends(self, app_no_auth, temp_jsonl, patch_project_root, sample_data):
+        file_path = temp_jsonl(sample_data, "test.jsonl")
+        grade1 = {
+            "grade": True, "grade_type": "bool", "quotes": [],
+            "explanation": "first", "model": "m1", "prompt_version": "v1",
+            "timestamp": "2026-01-15T10:00:00",
+        }
+        grade2 = {
+            "grade": False, "grade_type": "bool", "quotes": [],
+            "explanation": "second", "model": "m2", "prompt_version": "v1",
+            "timestamp": "2026-01-15T10:01:00",
+        }
+        client = await app_no_auth()
+        # First save
+        await client.post("/api/save-graded", json={
+            "file_path": str(file_path),
+            "grades": {"0": {"accuracy": grade1}},
+        })
+        # Second save with same metric — should append
+        await client.post("/api/save-graded", json={
+            "file_path": str(file_path),
+            "grades": {"0": {"accuracy": grade2}},
+        })
+
+        # Read viz file and check grades were appended
+        viz_path = file_path.parent / "viz" / file_path.name
+        with open(viz_path) as f:
+            lines = [json.loads(l) for l in f if l.strip()]
+        assert len(lines[0]["grades"]["accuracy"]) == 2
+        await client.aclose()
+
+    async def test_never_mutates_original(self, app_no_auth, temp_jsonl, patch_project_root, sample_data):
+        file_path = temp_jsonl(sample_data, "test.jsonl")
+        original_content = file_path.read_text()
+
+        grade_entry = {
+            "grade": 0.9, "grade_type": "float", "quotes": [],
+            "explanation": "good", "model": "test", "prompt_version": "v1",
+            "timestamp": "2026-01-15T10:00:00",
+        }
+        client = await app_no_auth()
+        await client.post("/api/save-graded", json={
+            "file_path": str(file_path),
+            "grades": {"0": {"helpfulness": grade_entry}},
+        })
+
+        # Original file should be unchanged
+        assert file_path.read_text() == original_content
+        await client.aclose()
+
+    async def test_out_of_bounds_ids_skipped(self, app_no_auth, temp_jsonl, patch_project_root, sample_data):
+        file_path = temp_jsonl(sample_data, "test.jsonl")
+        grade_entry = {
+            "grade": True, "grade_type": "bool", "quotes": [],
+            "explanation": "test", "model": "test", "prompt_version": "v1",
+            "timestamp": "2026-01-15T10:00:00",
+        }
+        client = await app_no_auth()
+        resp = await client.post("/api/save-graded", json={
+            "file_path": str(file_path),
+            "grades": {"999": {"test": grade_entry}},
+        })
+        assert resp.status_code == 200
+        await client.aclose()

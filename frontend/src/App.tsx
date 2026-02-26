@@ -1,9 +1,10 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, lazy, Suspense } from 'react';
 import { Panel, Group as PanelGroup, Separator as PanelResizeHandle } from 'react-resizable-panels';
 import { LeftPanel } from './components/LeftPanel';
 import { RightPanel } from './components/RightPanel';
 import { FileBrowser } from './components/FileBrowser';
-import { GradingPanel } from './components/GradingPanel';
+
+const GradingPanel = lazy(() => import('./components/GradingPanel').then(m => ({ default: m.GradingPanel })));
 import { useApi } from './hooks/useApi';
 import { useMarkedFiles } from './hooks/useMarkedFiles';
 import { useDarkMode } from './hooks/useDarkMode';
@@ -84,7 +85,7 @@ function App() {
   const [highlightedText, setHighlightedText] = useState<string | null>(null);
   const [selectedGradeMetric, setSelectedGradeMetric] = useState<string | undefined>(undefined);
   const [isGradingPanelOpen, setIsGradingPanelOpen] = useState(false);
-  const { loading, error, loadSamples, loadMultipleSamples } = useApi();
+  const { loading, error, loadSamples, loadMultipleSamples, loadFilesProgressively, loadMultipleSamplesFull, loadSingleSample, messagesLoaded, messagesLoading } = useApi();
   const { markedFiles, toggleMark } = useMarkedFiles();
   const { isDarkMode, toggleDarkMode } = useDarkMode();
   const { getUrlState, setUrlState, generateLink } = useUrlState();
@@ -92,14 +93,40 @@ function App() {
   const initialLoadDone = useRef(false);
   const isUserAction = useRef(false);
 
-  // Check authentication on mount
+  // Check authentication on mount, with retry for backend startup
   useEffect(() => {
-    fetch('/api/auth/check')
-      .then(res => res.json())
-      .then(data => {
-        setAuthState(data.authenticated ? 'ready' : data.auth_required ? 'login' : 'ready');
-      })
-      .catch(() => setAuthState('ready')); // If backend is down, don't block
+    let cancelled = false;
+    let attempt = 0;
+    const maxAttempts = 15; // ~15 seconds total
+    const retryDelay = 1000;
+    const fetchTimeout = 3000;
+
+    const tryAuthCheck = async () => {
+      while (attempt < maxAttempts && !cancelled) {
+        attempt++;
+        try {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), fetchTimeout);
+          const res = await fetch('/api/auth/check', { signal: controller.signal });
+          clearTimeout(timer);
+          const data = await res.json();
+          if (!cancelled) {
+            setAuthState(data.authenticated ? 'ready' : data.auth_required ? 'login' : 'ready');
+          }
+          return; // Success — stop retrying
+        } catch {
+          // Backend not ready yet — wait and retry
+          if (!cancelled && attempt < maxAttempts) {
+            await new Promise(r => setTimeout(r, retryDelay));
+          }
+        }
+      }
+      // All retries exhausted — proceed without auth (backend may be down)
+      if (!cancelled) setAuthState('ready');
+    };
+
+    tryAuthCheck();
+    return () => { cancelled = true; };
   }, []);
 
   // Get the primary file path for display and URL (first file or the sample's source file)
@@ -127,44 +154,99 @@ function App() {
   }, [getUrlState]);
 
   // Load samples when file paths change (only after authenticated)
+  // Progressive per-file loading: fire individual metadata-only requests per file,
+  // render each file's samples as they arrive (~2s for first file).
+  // Then hydrate messages in background.
   useEffect(() => {
     if (filePaths.length === 0 || authState !== 'ready') return;
-    
-    if (filePaths.length === 1) {
-      // Single file - use simple loading
-      loadSamples(filePaths[0]).then((data) => {
-        if (data) {
-          setSamples(data.samples);
-          setExperimentName(data.experiment_name);
-          
-          // Check URL for rollout_n to find the specific sample
-          const urlState = getUrlState();
-          if (urlState.rollout !== undefined) {
-            const targetSample = data.samples.find(s => s.attributes.rollout_n === urlState.rollout);
-            if (targetSample) {
-              setSelectedSampleId(targetSample.id);
-            } else if (data.samples.length > 0) {
-              setSelectedSampleId(data.samples[0].id);
-            }
-          } else if (data.samples.length > 0 && selectedSampleId === null) {
-            setSelectedSampleId(data.samples[0].id);
-          }
-        }
+
+    // Clear samples before starting new load
+    setSamples([]);
+    setSelectedSampleId(null);
+
+    const urlState = getUrlState();
+    let firstFileHandled = false;
+
+    // Phase 1: progressive per-file metadata loading
+    loadFilesProgressively(filePaths, (fileSamples, _filePath) => {
+      // Called as each file completes — append samples with sequential IDs
+      setSamples(prev => {
+        const nextId = prev.length;
+        const newSamples = fileSamples.map((s: Sample, i: number) => ({
+          ...s,
+          id: nextId + i,
+        }));
+        return [...prev, ...newSamples];
       });
-    } else {
-      // Multiple files - load and combine
-      loadMultipleSamples(filePaths).then((data) => {
-        if (data) {
-          setSamples(data.samples);
-          setExperimentName(data.experiment_name);
-          
-          if (data.samples.length > 0 && selectedSampleId === null) {
-            setSelectedSampleId(data.samples[0].id);
+
+      // Auto-select first sample or URL-targeted sample on first file
+      if (!firstFileHandled) {
+        firstFileHandled = true;
+        if (urlState.rollout !== undefined) {
+          const targetSample = fileSamples.find(s => s.attributes.rollout_n === urlState.rollout);
+          if (targetSample) {
+            // Will get ID 0+ based on current state, use functional lookup
+            setSamples(prev => {
+              const found = prev.find(s => s.attributes.rollout_n === urlState.rollout);
+              if (found) setSelectedSampleId(found.id);
+              else if (prev.length > 0) setSelectedSampleId(prev[0].id);
+              return prev;
+            });
+          } else {
+            setSelectedSampleId(0); // First sample of first file
           }
+        } else {
+          setSelectedSampleId(0);
         }
+      }
+    }).then((result) => {
+      if (!result) return;
+      setExperimentName(result.experimentName);
+
+      // If URL-targeted sample wasn't in first file, find it now
+      if (urlState.rollout !== undefined) {
+        setSamples(prev => {
+          const found = prev.find(s => s.attributes.rollout_n === urlState.rollout);
+          if (found) setSelectedSampleId(found.id);
+          return prev;
+        });
+      }
+
+      // Phase 2: full load in background → hydrate messages
+      loadMultipleSamplesFull(filePaths).then((fullData) => {
+        if (!fullData) return;
+        setSamples(fullData.samples);
       });
-    }
-  }, [filePaths, authState, loadSamples, loadMultipleSamples, getUrlState]);
+    });
+  }, [filePaths, authState, loadFilesProgressively, loadMultipleSamplesFull, getUrlState]);
+
+  // On-demand message loading: when user selects a sample that has empty messages
+  // and background full load hasn't completed yet, fetch that single sample's messages
+  useEffect(() => {
+    if (selectedSampleId === null || messagesLoaded) return;
+
+    const sample = samples.find(s => s.id === selectedSampleId);
+    if (!sample || sample.messages.length > 0) return;
+
+    // Determine which file this sample came from
+    const sourceFile = sample.attributes.source_file || filePaths[0];
+
+    // Find the sample's original index within its source file
+    // The batch endpoint assigns sequential IDs across all files, but the
+    // single-sample endpoint needs the index within that specific file
+    const samplesFromSameFile = samples.filter(s => (s.attributes.source_file || filePaths[0]) === sourceFile);
+    const indexInFile = samplesFromSameFile.indexOf(sample);
+    if (indexInFile < 0) return;
+
+    loadSingleSample(indexInFile, sourceFile).then((singleSample) => {
+      if (!singleSample) return;
+      setSamples(prev => prev.map(s =>
+        s.id === selectedSampleId
+          ? { ...s, messages: singleSample.messages, grades: singleSample.grades ?? s.grades }
+          : s
+      ));
+    });
+  }, [selectedSampleId, messagesLoaded, samples, filePaths, loadSingleSample]);
 
   // Only update URL on user-initiated sample selection (not on initial load)
   const handleSelectSampleWithUrlUpdate = (id: number) => {
@@ -226,24 +308,23 @@ function App() {
   // Reload samples after grading to pick up the viz/ version with grades
   const handleGradingComplete = useCallback(() => {
     if (filePaths.length === 0) return;
-    
-    if (filePaths.length === 1) {
-      loadSamples(filePaths[0]).then((data) => {
-        if (data) {
-          setSamples(data.samples);
-        }
-      });
-    } else {
-      loadMultipleSamples(filePaths).then((data) => {
-        if (data) {
-          setSamples(data.samples);
-        }
-      });
-    }
-  }, [filePaths, loadSamples, loadMultipleSamples]);
+    // Full reload (not metadata-only) since user expects grades to appear
+    loadMultipleSamplesFull(filePaths).then((data) => {
+      if (data) {
+        setSamples(data.samples);
+      }
+    });
+  }, [filePaths, loadMultipleSamplesFull]);
 
   if (authState === 'loading') {
-    return <div className={`h-screen ${isDarkMode ? 'bg-[#1a1a2e]' : 'bg-white'}`} />;
+    return (
+      <div className={`h-screen flex items-center justify-center ${isDarkMode ? 'bg-[#1a1a2e]' : 'bg-white'}`}>
+        <div className="text-center">
+          <span className={`material-symbols-outlined animate-spin ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`} style={{ fontSize: 32 }}>progress_activity</span>
+          <p className={`mt-3 text-sm ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>Connecting to server...</p>
+        </div>
+      </div>
+    );
   }
   if (authState === 'login') {
     return <LoginOverlay isDarkMode={isDarkMode} onLogin={() => setAuthState('ready')} />;
@@ -271,6 +352,7 @@ function App() {
             onToggleDarkMode={toggleDarkMode}
             onFilteredSamplesChange={setFilteredSamples}
             onCurrentOccurrenceIndexChange={setCurrentOccurrenceIndex}
+            messagesLoaded={messagesLoaded}
           />
         </Panel>
         
@@ -324,13 +406,19 @@ function App() {
               <span className="material-symbols-outlined">close</span>
             </button>
             <div className="p-4">
-              <GradingPanel
-                filteredSampleIds={filteredSamples.map(s => s.id)}
-                filePath={primaryFilePath}
-                isDarkMode={isDarkMode}
-                onGradingComplete={handleGradingComplete}
-                grading={grading}
-              />
+              <Suspense fallback={
+                <div className={`flex items-center justify-center p-8 ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>
+                  <span className="material-symbols-outlined animate-spin" style={{ fontSize: 32 }}>progress_activity</span>
+                </div>
+              }>
+                <GradingPanel
+                  filteredSampleIds={filteredSamples.map(s => s.id)}
+                  filePath={primaryFilePath}
+                  isDarkMode={isDarkMode}
+                  onGradingComplete={handleGradingComplete}
+                  grading={grading}
+                />
+              </Suspense>
             </div>
           </div>
         </div>

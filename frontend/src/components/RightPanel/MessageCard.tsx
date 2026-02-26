@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
+import { useState, useMemo, useRef, useEffect, useCallback, memo } from 'react';
 import type { Message, SearchCondition, SearchField, Quote } from '../../types';
 
 interface MessageCardProps {
@@ -55,9 +55,9 @@ interface SelectionPopup {
   text: string;
 }
 
-export function MessageCard({ 
-  message, 
-  index, 
+function MessageCardInner({
+  message,
+  index,
   searchConditions,
   localSearchTerm = '',
   isCurrentLocalMatch = false,
@@ -577,3 +577,5 @@ export function MessageCard({
     </div>
   );
 }
+
+export const MessageCard = memo(MessageCardInner);

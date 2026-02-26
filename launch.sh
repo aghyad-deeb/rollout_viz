@@ -40,8 +40,19 @@ source venv/bin/activate
 python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload &
 BACKEND_PID=$!
 
-# Wait for backend to be ready
-sleep 2
+# Wait for backend to be ready (poll health endpoint)
+echo -e "${YELLOW}Waiting for backend to be ready...${NC}"
+for i in $(seq 1 30); do
+    if curl -sf http://127.0.0.1:8000/api/health > /dev/null 2>&1; then
+        echo -e "${GREEN}Backend is ready!${NC}"
+        break
+    fi
+    if [ $i -eq 30 ]; then
+        echo -e "${RED}Backend failed to start within 30 seconds${NC}"
+        cleanup
+    fi
+    sleep 1
+done
 
 # Start frontend
 echo -e "${GREEN}Starting frontend on port 3000...${NC}"

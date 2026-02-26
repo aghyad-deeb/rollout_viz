@@ -9,16 +9,19 @@ import json
 import os
 import secrets
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+import orjson
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, ORJSONResponse, StreamingResponse
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from pydantic import BaseModel
+from starlette.middleware.gzip import GZipMiddleware
 
 from backend.llm_providers import (
     get_provider,
@@ -78,12 +81,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# GZip compression for responses > 1KB
+app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=1)
+
 # --- Password authentication ---
 VIZ_PASSWORD = _env_config.get("VIZ_PASSWORD")
 SECRET_KEY = _env_config.get("VIZ_SECRET_KEY", secrets.token_hex(32))
 cookie_serializer = URLSafeTimedSerializer(SECRET_KEY)
 COOKIE_MAX_AGE = 30 * 24 * 3600  # 30 days
-AUTH_EXEMPT_PATHS = {"/api/auth/login", "/api/auth/check", "/api/health"}
+AUTH_EXEMPT_PATHS = {"/api/auth/login", "/api/auth/check", "/api/health", "/api/debug/clear-cache"}
 
 # Simple in-memory rate limiter for login attempts
 _login_attempts: Dict[str, List[float]] = {}
@@ -289,6 +295,12 @@ class SaveGradedRequest(BaseModel):
     grades: Dict[int, Dict[str, GradeEntry]]  # sample_id -> {metric_name: grade}
 
 
+class BatchSamplesRequest(BaseModel):
+    """Request to load samples from multiple files in one request."""
+    files: List[str]
+    metadata_only: bool = False
+
+
 class PresetMetricInfo(BaseModel):
     """Information about a preset metric."""
     name: str
@@ -305,6 +317,53 @@ def load_env_credentials():
             os.environ[key] = _env_config[key]
 
 
+# --- S3 client singleton ---
+_s3_client = None
+
+
+def _get_s3_client():
+    """Get or create a cached S3 client (singleton). Calls load_env_credentials() once."""
+    global _s3_client
+    if _s3_client is None:
+        import boto3
+        from botocore.config import Config as BotoConfig
+        load_env_credentials()
+        s3_config = BotoConfig(
+            max_pool_connections=25,
+            connect_timeout=5,
+            read_timeout=30,
+            retries={'max_attempts': 3, 'mode': 'standard'},
+        )
+        _s3_client = boto3.client('s3', config=s3_config)
+    return _s3_client
+
+
+def _reset_s3_client():
+    """Reset the cached S3 client. Used by tests."""
+    global _s3_client
+    _s3_client = None
+
+
+# --- File loading cache ---
+_file_cache: Dict[str, tuple] = {}  # path_str -> (mtime, data)
+_FILE_CACHE_MAX = 20
+
+
+def _clear_file_cache():
+    """Clear the file loading cache. Used by tests."""
+    _file_cache.clear()
+
+
+# --- viz_file_exists() TTL cache ---
+_viz_exists_cache: Dict[str, tuple] = {}  # path -> (timestamp, bool)
+_VIZ_EXISTS_TTL = 60  # seconds
+
+
+def _clear_viz_exists_cache():
+    """Clear the viz_exists cache. Used by tests."""
+    _viz_exists_cache.clear()
+
+
 def _safe_resolve_path(file_path: str) -> Path:
     """Resolve a file path and ensure it stays within PROJECT_ROOT."""
     path = Path(file_path)
@@ -319,41 +378,114 @@ def _safe_resolve_path(file_path: str) -> Path:
 
 
 def load_jsonl_from_file(file_path: str) -> List[Dict[str, Any]]:
-    """Load JSONL data from a local file."""
+    """Load JSONL data from a local file. Caches by path + mtime."""
     path = _safe_resolve_path(file_path)
-    
+    path_str = str(path)
+    current_mtime = path.stat().st_mtime
+
+    # Check cache
+    if path_str in _file_cache:
+        cached_mtime, cached_data = _file_cache[path_str]
+        if cached_mtime == current_mtime:
+            return cached_data
+
+    # Parse from disk (orjson is 5-10x faster than stdlib json)
     samples = []
-    with open(path, 'r') as f:
+    with open(path, 'rb') as f:
         for line in f:
             line = line.strip()
             if line:
-                samples.append(json.loads(line))
+                samples.append(orjson.loads(line))
+
+    # FIFO eviction
+    if len(_file_cache) >= _FILE_CACHE_MAX:
+        oldest_key = next(iter(_file_cache))
+        del _file_cache[oldest_key]
+
+    _file_cache[path_str] = (current_mtime, samples)
     return samples
 
 
+def _get_s3_etag(bucket: str, key: str) -> str:
+    """Get the ETag for an S3 object via head_object (lightweight metadata call)."""
+    s3_client = _get_s3_client()
+    response = s3_client.head_object(Bucket=bucket, Key=key)
+    return response['ETag']
+
+
+_S3_MULTIPART_THRESHOLD = 5 * 1024 * 1024  # 5 MB — use chunked download above this
+_S3_DOWNLOAD_CHUNKS = 3  # Number of parallel Range requests per file
+
+
+def _download_s3_chunked(s3_client, bucket: str, key: str, size: int) -> bytes:
+    """Download an S3 object using parallel Range requests.
+
+    S3 throttles per-connection throughput, so splitting into multiple
+    concurrent connections yields ~2x higher aggregate bandwidth.
+    """
+    n = _S3_DOWNLOAD_CHUNKS
+    chunk_size = size // n
+    results = [None] * n
+
+    def _fetch(idx: int):
+        start = idx * chunk_size
+        end = size - 1 if idx == n - 1 else (idx + 1) * chunk_size - 1
+        resp = s3_client.get_object(Bucket=bucket, Key=key, Range=f"bytes={start}-{end}")
+        results[idx] = resp['Body'].read()
+
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        list(pool.map(_fetch, range(n)))
+
+    return b''.join(results)
+
+
 def load_jsonl_from_s3(bucket: str, key: str) -> List[Dict[str, Any]]:
-    """Load JSONL data from S3."""
-    import boto3
-    
-    load_env_credentials()
-    s3_client = boto3.client('s3')
-    response = s3_client.get_object(Bucket=bucket, Key=key)
-    content = response['Body'].read().decode('utf-8')
-    
+    """Load JSONL data from S3. Caches by s3://bucket/key + ETag.
+
+    On warm cache: validates via head_object, returns cached data if ETag matches.
+    On cold cache: uses head_object to get size, then parallel Range downloads
+    for files above the multipart threshold (~2x faster than single-stream).
+    """
+    cache_key = f"s3://{bucket}/{key}"
+    s3_client = _get_s3_client()
+
+    # Only check ETag if we have a cached version to compare against
+    if cache_key in _file_cache:
+        current_etag = _get_s3_etag(bucket, key)
+        cached_etag, cached_data = _file_cache[cache_key]
+        if cached_etag == current_etag:
+            return cached_data
+
+    # Cold cache or stale — get size + ETag, then download
+    head = s3_client.head_object(Bucket=bucket, Key=key)
+    size = head['ContentLength']
+    etag = head.get('ETag', '')
+
+    if size > _S3_MULTIPART_THRESHOLD:
+        content = _download_s3_chunked(s3_client, bucket, key, size)
+    else:
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+        content = response['Body'].read()
+        etag = response.get('ETag', etag)
+
     samples = []
-    for line in content.split('\n'):
+    for line in content.split(b'\n'):
         line = line.strip()
         if line:
-            samples.append(json.loads(line))
+            samples.append(orjson.loads(line))
+
+    # FIFO eviction
+    if len(_file_cache) >= _FILE_CACHE_MAX:
+        oldest_key = next(iter(_file_cache))
+        del _file_cache[oldest_key]
+
+    _file_cache[cache_key] = (etag, samples)
     return samples
 
 
 def list_s3_files(bucket: str, prefix: str = "") -> List[Dict[str, Any]]:
     """List JSONL files in S3."""
-    import boto3
-    
-    load_env_credentials()
-    s3_client = boto3.client('s3')
+    s3_client = _get_s3_client()
     
     paginator = s3_client.get_paginator('list_objects_v2')
     files = []
@@ -372,10 +504,7 @@ def list_s3_files(bucket: str, prefix: str = "") -> List[Dict[str, Any]]:
 
 def list_s3_contents(bucket: str, prefix: str = "") -> Dict[str, List[Dict[str, Any]]]:
     """List both folders and JSONL files in S3 at the given prefix level (non-recursive)."""
-    import boto3
-    
-    load_env_credentials()
-    s3_client = boto3.client('s3')
+    s3_client = _get_s3_client()
     
     # Ensure prefix ends with / if it's not empty
     if prefix and not prefix.endswith('/'):
@@ -479,6 +608,14 @@ async def health_check():
     return {"status": "ok"}
 
 
+@app.post("/api/debug/clear-cache")
+async def debug_clear_cache():
+    """Clear all backend caches. Used for benchmarking cold reads."""
+    _clear_file_cache()
+    _clear_viz_exists_cache()
+    return {"status": "ok", "cleared": ["file_cache", "viz_exists_cache"]}
+
+
 @app.get("/api/files/local", response_model=List[FileInfo])
 async def get_local_files(directory: str = Query(default=".")):
     """List JSONL files in a local directory."""
@@ -531,7 +668,7 @@ _ATTR_DEFAULTS = {
 }
 
 
-def _load_samples_sync(file: str) -> dict:
+def _load_samples_sync(file: str, metadata_only: bool = False) -> dict:
     """Synchronous helper for loading samples — runs in a thread to avoid blocking the event loop.
     Returns a plain dict (skips Pydantic) for performance."""
     # Check if viz/ version exists and use it if so
@@ -573,9 +710,11 @@ def _load_samples_sync(file: str) -> dict:
             if k not in filled_attrs:
                 filled_attrs[k] = v
 
+        messages = raw.get('messages', [])
         samples.append({
             "id": i,
-            "messages": raw.get('messages', []),
+            "messages": [] if metadata_only else messages,
+            "message_count": len(messages),
             "attributes": filled_attrs,
             "timestamp": raw.get('timestamp', ''),
             "grades": grades,
@@ -602,21 +741,279 @@ async def get_samples(
     """
     try:
         data = await asyncio.to_thread(_load_samples_sync, file)
-        return JSONResponse(content=data)
+        return ORJSONResponse(content=data)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"File not found: {file}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _load_samples_batch_sync(files: List[str], metadata_only: bool = False) -> dict:
+    """Load samples from multiple files concurrently using a flat thread pool.
+
+    For S3 files: uses chunked Range requests (3 chunks/file) across a single
+    shared pool — avoids nested ThreadPoolExecutors and maximizes S3 throughput.
+    For local files: delegates to _load_samples_sync.
+
+    Returns combined samples with sequential IDs and source_file attributes.
+    Partial failures are reported in the errors list without blocking other files.
+    """
+    if not files:
+        return {"samples": [], "total": 0, "file_results": [], "experiment_names": [], "errors": []}
+
+    errors: List[dict] = []
+    # Separate S3 and local files
+    s3_files = [(i, f) for i, f in enumerate(files) if f.startswith("s3://")]
+    local_files = [(i, f) for i, f in enumerate(files) if not f.startswith("s3://")]
+    per_file_data: List[Optional[dict]] = [None] * len(files)
+
+    # --- Handle S3 files with flat chunked downloads ---
+    if s3_files:
+        s3_client = _get_s3_client()
+        n_chunks = _S3_DOWNLOAD_CHUNKS
+
+        # Phase 1: get metadata for all S3 files in parallel (viz check + size)
+        s3_meta: Dict[int, dict] = {}  # idx -> {bucket, key, size, etag, actual_key, has_grades}
+
+        def _get_meta(idx_file):
+            idx, file_path = idx_file
+            try:
+                s3_path = file_path[5:]
+                bucket, key = s3_path.split("/", 1)
+
+                # Check viz/ version
+                viz_path = get_viz_path(file_path)
+                has_grades = False
+                actual_path = file_path
+                if viz_file_exists(viz_path):
+                    actual_path = viz_path
+                    has_grades = True
+
+                # Check file cache first
+                cache_key = f"s3://{bucket}/{key}" if actual_path == file_path else actual_path
+                if actual_path.startswith("s3://"):
+                    ap = actual_path[5:]
+                    a_bucket, a_key = ap.split("/", 1)
+                    ck = f"s3://{a_bucket}/{a_key}"
+                    if ck in _file_cache:
+                        cached_etag, cached_data = _file_cache[ck]
+                        curr_etag = _get_s3_etag(a_bucket, a_key)
+                        if cached_etag == curr_etag:
+                            s3_meta[idx] = {"cached": True, "data": cached_data, "has_grades": has_grades}
+                            return
+
+                    # Need to download — get size
+                    head = s3_client.head_object(Bucket=a_bucket, Key=a_key)
+                    s3_meta[idx] = {
+                        "cached": False, "bucket": a_bucket, "key": a_key,
+                        "size": head['ContentLength'], "etag": head.get('ETag', ''),
+                        "has_grades": has_grades,
+                    }
+                else:
+                    # viz path is local? shouldn't happen for S3 files
+                    s3_meta[idx] = {"cached": False, "local_path": actual_path, "has_grades": has_grades}
+            except Exception as e:
+                errors.append({"file": idx_file[1], "error": str(e)})
+                per_file_data[idx] = None  # Mark as failed
+
+        with ThreadPoolExecutor(max_workers=min(len(s3_files), 10)) as pool:
+            list(pool.map(_get_meta, s3_files))
+
+        # Phase 2: build all Range download tasks across all files (flat list)
+        chunk_tasks = []  # (idx, bucket, key, range_start, range_end, chunk_idx)
+        cached_results = {}  # idx -> raw_samples
+
+        for idx, file_path in s3_files:
+            meta = s3_meta.get(idx)
+            if meta is None:
+                continue  # Failed in phase 1
+            if meta.get("cached"):
+                cached_results[idx] = meta["data"]
+                continue
+            if meta.get("local_path"):
+                # Shouldn't happen, but handle gracefully
+                local_files.append((idx, meta["local_path"]))
+                continue
+
+            bucket, key, size = meta["bucket"], meta["key"], meta["size"]
+            if size > _S3_MULTIPART_THRESHOLD:
+                chunk_size = size // n_chunks
+                for c in range(n_chunks):
+                    start = c * chunk_size
+                    end = size - 1 if c == n_chunks - 1 else (c + 1) * chunk_size - 1
+                    chunk_tasks.append((idx, bucket, key, start, end, c))
+            else:
+                # Small file — single chunk
+                chunk_tasks.append((idx, bucket, key, 0, size - 1, 0))
+
+        # Phase 3: download all chunks in a single flat pool
+        chunk_data: Dict[int, Dict[int, bytes]] = {}  # idx -> {chunk_idx: bytes}
+
+        def _download_chunk(task):
+            idx, bucket, key, start, end, chunk_idx = task
+            resp = s3_client.get_object(Bucket=bucket, Key=key, Range=f"bytes={start}-{end}")
+            return (idx, chunk_idx, resp['Body'].read())
+
+        if chunk_tasks:
+            max_workers = min(len(chunk_tasks), 24)
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                for idx, chunk_idx, data in pool.map(_download_chunk, chunk_tasks):
+                    chunk_data.setdefault(idx, {})[chunk_idx] = data
+
+        # Phase 4: reassemble and parse
+        for idx, file_path in s3_files:
+            meta = s3_meta.get(idx)
+            if meta is None:
+                per_file_data[idx] = None
+                continue
+
+            try:
+                if idx in cached_results:
+                    raw_samples = cached_results[idx]
+                elif idx in chunk_data:
+                    chunks = chunk_data[idx]
+                    n_file_chunks = max(chunks.keys()) + 1
+                    content = b''.join(chunks[c] for c in range(n_file_chunks))
+                    raw_samples = []
+                    for line in content.split(b'\n'):
+                        line = line.strip()
+                        if line:
+                            raw_samples.append(orjson.loads(line))
+
+                    # Cache with ETag
+                    etag = meta.get("etag", "")
+                    cache_key = f"s3://{meta['bucket']}/{meta['key']}"
+                    if len(_file_cache) >= _FILE_CACHE_MAX:
+                        oldest_key = next(iter(_file_cache))
+                        del _file_cache[oldest_key]
+                    _file_cache[cache_key] = (etag, raw_samples)
+                else:
+                    per_file_data[idx] = None
+                    continue
+
+                # Build sample dicts (same as _load_samples_sync)
+                has_grades = meta.get("has_grades", False)
+                samples = []
+                experiment_name = "unknown"
+                for i, raw in enumerate(raw_samples):
+                    attrs = raw.get('attributes', {})
+                    if experiment_name == "unknown":
+                        experiment_name = attrs.get('experiment_name', 'unknown')
+                    if 'validate' in attrs:
+                        attrs['is_validate'] = attrs.pop('validate')
+                    grades = raw.get('grades', None)
+                    if grades:
+                        has_grades = True
+                    filled_attrs = {k: attrs.get(k, v) for k, v in _ATTR_DEFAULTS.items()}
+                    for k, v in attrs.items():
+                        if k not in filled_attrs:
+                            filled_attrs[k] = v
+                    messages = raw.get('messages', [])
+                    samples.append({
+                        "id": i,
+                        "messages": [] if metadata_only else messages,
+                        "message_count": len(messages),
+                        "attributes": filled_attrs, "timestamp": raw.get('timestamp', ''),
+                        "grades": grades,
+                    })
+
+                per_file_data[idx] = {
+                    "samples": samples, "total": len(samples),
+                    "experiment_name": experiment_name,
+                    "file_path": file_path, "has_grades": has_grades,
+                }
+            except Exception as e:
+                errors.append({"file": file_path, "error": str(e)})
+                per_file_data[idx] = None
+
+    # --- Handle local files with _load_samples_sync ---
+    if local_files:
+        def _load_local(idx_file):
+            idx, file_path = idx_file
+            try:
+                per_file_data[idx] = _load_samples_sync(file_path, metadata_only=metadata_only)
+            except Exception as e:
+                errors.append({"file": file_path, "error": str(e)})
+                per_file_data[idx] = None
+
+        with ThreadPoolExecutor(max_workers=min(len(local_files), 10)) as pool:
+            list(pool.map(_load_local, local_files))
+
+    # --- Combine results in original file order ---
+    combined_samples = []
+    file_results = []
+    experiment_names_set: set = set()
+    next_id = 0
+
+    for idx, file_path in enumerate(files):
+        data = per_file_data[idx]
+        if data is None:
+            file_results.append({"file": file_path, "count": 0, "error": True})
+            continue
+
+        exp_name = data.get("experiment_name", "unknown")
+        if exp_name and exp_name != "unknown":
+            experiment_names_set.add(exp_name)
+
+        file_sample_count = 0
+        for sample in data["samples"]:
+            sample["id"] = next_id
+            sample["attributes"]["source_file"] = file_path
+            combined_samples.append(sample)
+            next_id += 1
+            file_sample_count += 1
+
+        file_results.append({"file": file_path, "count": file_sample_count})
+
+    return {
+        "samples": combined_samples,
+        "total": len(combined_samples),
+        "file_results": file_results,
+        "experiment_names": sorted(experiment_names_set),
+        "errors": errors,
+    }
+
+
+@app.post("/api/samples/batch")
+async def get_samples_batch(request: BatchSamplesRequest):
+    """Load samples from multiple files in a single request.
+
+    Downloads files concurrently via thread pool, combines samples with
+    sequential IDs and source_file attributes. For metadata_only requests,
+    uses ORJSONResponse (allows gzip — small payload benefits from compression).
+    For full requests, skips GZipMiddleware by setting Content-Encoding: identity
+    — for 155 MB payloads, gzip at level 1 adds ~1.4s of CPU that's wasted
+    on localhost/proxy traffic.
+    """
+    try:
+        data = await asyncio.to_thread(_load_samples_batch_sync, request.files, request.metadata_only)
+        if request.metadata_only:
+            return ORJSONResponse(content=data)
+        body = orjson.dumps(data)
+        return Response(
+            content=body,
+            media_type="application/json",
+            headers={"Content-Encoding": "identity"},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 def _load_single_sample_sync(file: str, sample_id: int) -> dict:
     """Synchronous helper for loading a single sample — runs in a thread."""
-    if file.startswith("s3://"):
-        s3_path = file[5:]
+    # Check if viz/ version exists and use it if so
+    viz_path = get_viz_path(file)
+    actual_path = file
+
+    if viz_file_exists(viz_path):
+        actual_path = viz_path
+
+    if actual_path.startswith("s3://"):
+        s3_path = actual_path[5:]
         bucket, key = s3_path.split("/", 1)
         raw_samples = load_jsonl_from_s3(bucket, key)
     else:
-        raw_samples = load_jsonl_from_file(file)
+        raw_samples = load_jsonl_from_file(actual_path)
 
     if sample_id < 0 or sample_id >= len(raw_samples):
         raise HTTPException(status_code=404, detail=f"Sample {sample_id} not found")
@@ -631,11 +1028,14 @@ def _load_single_sample_sync(file: str, sample_id: int) -> dict:
         if k not in filled_attrs:
             filled_attrs[k] = v
 
+    messages = raw.get('messages', [])
     return {
         "id": sample_id,
-        "messages": raw.get('messages', []),
+        "messages": messages,
+        "message_count": len(messages),
         "attributes": filled_attrs,
         "timestamp": raw.get('timestamp', ''),
+        "grades": raw.get('grades', None),
     }
 
 
@@ -678,21 +1078,34 @@ def get_viz_path(original_path: str) -> str:
 
 
 def viz_file_exists(viz_path: str) -> bool:
-    """Check if the viz/ version of a file exists."""
+    """Check if the viz/ version of a file exists. Uses a TTL cache."""
+    now = time.time()
+
+    # Check cache
+    if viz_path in _viz_exists_cache:
+        cached_time, cached_result = _viz_exists_cache[viz_path]
+        if now - cached_time < _VIZ_EXISTS_TTL:
+            return cached_result
+
+    # Perform actual check
     if viz_path.startswith("s3://"):
-        import boto3
         try:
-            load_env_credentials()
-            s3_client = boto3.client('s3')
+            s3_client = _get_s3_client()
             s3_path = viz_path[5:]
             bucket, key = s3_path.split("/", 1)
             s3_client.head_object(Bucket=bucket, Key=key)
-            return True
+            result = True
         except Exception:
-            return False
+            result = False
     else:
-        path = _safe_resolve_path(viz_path)
-        return path.exists()
+        try:
+            path = _safe_resolve_path(viz_path)
+            result = path.exists()
+        except ValueError:
+            result = False
+
+    _viz_exists_cache[viz_path] = (now, result)
+    return result
 
 
 def save_jsonl_to_file(file_path: str, samples: List[Dict[str, Any]]) -> None:
@@ -701,26 +1114,35 @@ def save_jsonl_to_file(file_path: str, samples: List[Dict[str, Any]]) -> None:
 
     # Create parent directories including viz/
     path.parent.mkdir(parents=True, exist_ok=True)
-    
-    with open(path, 'w') as f:
+
+    with open(path, 'wb') as f:
         for sample in samples:
-            f.write(json.dumps(sample) + '\n')
+            f.write(orjson.dumps(sample) + b'\n')
+
+    # Invalidate file cache so next load reads from disk
+    path_str = str(path)
+    _file_cache.pop(path_str, None)
+    # Update viz_exists cache so viz_file_exists() returns True immediately
+    _viz_exists_cache[path_str] = (time.time(), True)
 
 
 def save_jsonl_to_s3(bucket: str, key: str, samples: List[Dict[str, Any]]) -> None:
     """Save samples to S3 as JSONL."""
-    import boto3
-    
-    load_env_credentials()
-    s3_client = boto3.client('s3')
-    
-    content = '\n'.join(json.dumps(sample) for sample in samples)
+    s3_client = _get_s3_client()
+
+    content = b'\n'.join(orjson.dumps(sample) for sample in samples)
     s3_client.put_object(
         Bucket=bucket,
         Key=key,
-        Body=content.encode('utf-8'),
+        Body=content,
         ContentType='application/jsonl'
     )
+
+    # Invalidate file cache so next load fetches from S3
+    cache_key = f"s3://{bucket}/{key}"
+    _file_cache.pop(cache_key, None)
+    # Update viz_exists cache
+    _viz_exists_cache[cache_key] = (time.time(), True)
 
 
 # Path to store custom metrics
