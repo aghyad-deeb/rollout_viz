@@ -254,13 +254,14 @@ function App() {
           const currentId = selectedSampleIdRef.current;
           const currentlySelected = currentId !== null ? prev.find(s => s.id === currentId) : null;
           const newSamples = fullData.samples;
-          // Re-find the selected sample in the new dataset by rollout_n + step + source_file
+          // Re-find the selected sample in the new dataset by index within its file
+          // (rollout_n + step + source_file is NOT unique — multiple samples can share these)
           if (currentlySelected) {
-            const match = newSamples.find(s =>
-              Number(s.attributes.rollout_n) === Number(currentlySelected.attributes.rollout_n) &&
-              Number(s.attributes.step) === Number(currentlySelected.attributes.step) &&
-              (s.attributes.source_file || '') === (currentlySelected.attributes.source_file || '')
-            );
+            const sourceFile = currentlySelected.attributes.source_file || '';
+            const oldFileSamples = prev.filter(s => (s.attributes.source_file || '') === sourceFile);
+            const indexInFile = oldFileSamples.findIndex(s => s.id === currentlySelected.id);
+            const newFileSamples = newSamples.filter(s => (s.attributes.source_file || '') === sourceFile);
+            const match = indexInFile >= 0 ? newFileSamples[indexInFile] : undefined;
             if (match) {
               setSelectedSampleId(match.id);
             }
