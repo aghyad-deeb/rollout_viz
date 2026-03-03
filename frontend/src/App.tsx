@@ -183,7 +183,20 @@ function App() {
       // Auto-select first sample or URL-targeted sample on first file
       if (!firstFileHandled) {
         firstFileHandled = true;
-        if (urlState.rollout !== undefined) {
+        if (urlState.index !== undefined) {
+          // Use exact index within file for disambiguation
+          const targetSample = fileSamples[urlState.index];
+          if (targetSample) {
+            setSamples(prev => {
+              const found = prev[urlState.index!];
+              if (found) setSelectedSampleId(found.id);
+              else if (prev.length > 0) setSelectedSampleId(prev[0].id);
+              return prev;
+            });
+          } else {
+            setSelectedSampleId(0);
+          }
+        } else if (urlState.rollout !== undefined) {
           const targetSample = fileSamples.find(s =>
             Number(s.attributes.rollout_n) === urlState.rollout &&
             (urlState.step === undefined || Number(s.attributes.step) === urlState.step)
@@ -211,12 +224,20 @@ function App() {
       setExperimentName(result.experimentName);
 
       // If URL-targeted sample wasn't in first file, find it now
-      if (urlState.rollout !== undefined) {
+      if (urlState.index !== undefined || urlState.rollout !== undefined) {
         setSamples(prev => {
-          const found = prev.find(s =>
-            Number(s.attributes.rollout_n) === urlState.rollout &&
-            (urlState.step === undefined || Number(s.attributes.step) === urlState.step)
-          );
+          let found;
+          if (urlState.index !== undefined) {
+            // For index-based lookup, find samples from the URL file
+            const fileSamples = prev.filter(s => (s.attributes.source_file || '') === (urlState.file || ''));
+            found = fileSamples[urlState.index];
+          }
+          if (!found && urlState.rollout !== undefined) {
+            found = prev.find(s =>
+              Number(s.attributes.rollout_n) === urlState.rollout &&
+              (urlState.step === undefined || Number(s.attributes.step) === urlState.step)
+            );
+          }
           if (found) setSelectedSampleId(found.id);
           return prev;
         });
@@ -296,19 +317,41 @@ function App() {
     if (!selectedSample) return;
     // Use the sample's source file if available, otherwise use primary file
     const fileForUrl = selectedSample.attributes.source_file || primaryFilePath;
+    // Compute sample's index within its source file for exact disambiguation
+    const sourceFile = selectedSample.attributes.source_file || '';
+    const samplesFromSameFile = samples.filter(s => (s.attributes.source_file || '') === sourceFile);
+    const indexInFile = samplesFromSameFile.findIndex(s => s.id === selectedSample.id);
     setUrlState({
       file: fileForUrl,
       rollout: selectedSample.attributes.rollout_n,
       step: selectedSample.attributes.step,
+      index: indexInFile >= 0 ? indexInFile : undefined,
     });
   }, [filePaths, primaryFilePath, selectedSampleId, samples, setUrlState]);
 
   const selectedSample = samples.find(s => s.id === selectedSampleId) || null;
-  
+
   // Get the actual file path for links (use sample's source file or primary file)
   const getFilePathForSample = (sample: Sample | null): string => {
     return sample?.attributes.source_file || primaryFilePath;
   };
+
+  // Wrap generateLink to automatically include the selected sample's index_in_file
+  const generateLinkWithIndex = useCallback((options: {
+    file: string;
+    rollout?: number;
+    step?: number;
+    message?: number;
+    highlight?: string;
+  }): string => {
+    if (selectedSample) {
+      const sourceFile = selectedSample.attributes.source_file || '';
+      const samplesFromSameFile = samples.filter(s => (s.attributes.source_file || '') === sourceFile);
+      const indexInFile = samplesFromSameFile.findIndex(s => s.id === selectedSample.id);
+      return generateLink({ ...options, index: indexInFile >= 0 ? indexInFile : undefined });
+    }
+    return generateLink(options);
+  }, [selectedSample, samples, generateLink]);
 
   const handleNavigate = (direction: 'first' | 'prev' | 'next' | 'last') => {
     // Navigate through filtered samples if filtering is active, otherwise all samples
@@ -400,7 +443,7 @@ function App() {
             currentOccurrenceIndex={currentOccurrenceIndex}
             isDarkMode={isDarkMode}
             filePath={getFilePathForSample(selectedSample)}
-            generateLink={generateLink}
+            generateLink={generateLinkWithIndex}
             highlightedMessageIndex={highlightedMessageIndex}
             highlightedText={highlightedText}
             onClearHighlight={() => {

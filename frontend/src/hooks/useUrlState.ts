@@ -4,6 +4,7 @@ interface UrlState {
   file?: string;
   rollout?: number;  // Use rollout_n as unique identifier
   step?: number;     // Disambiguate samples with same rollout_n at different steps
+  index?: number;    // Sample's position within the file (for exact disambiguation)
   message?: number;
   highlight?: string;
 }
@@ -23,6 +24,9 @@ export function useUrlState() {
     const step = params.get('step');
     if (step) state.step = parseInt(step, 10);
 
+    const index = params.get('index');
+    if (index) state.index = parseInt(index, 10);
+
     const message = params.get('message');
     if (message) state.message = parseInt(message, 10);
     
@@ -39,6 +43,7 @@ export function useUrlState() {
     if (state.file) params.set('file', state.file);
     if (state.rollout !== undefined) params.set('rollout', state.rollout.toString());
     if (state.step !== undefined) params.set('step', state.step.toString());
+    if (state.index !== undefined) params.set('index', state.index.toString());
     if (state.message !== undefined) params.set('message', state.message.toString());
     if (state.highlight) params.set('highlight', state.highlight);
     
@@ -54,6 +59,7 @@ export function useUrlState() {
     file: string;
     rollout?: number;  // Use rollout_n as unique identifier
     step?: number;     // Disambiguate samples with same rollout_n
+    index?: number;    // Sample's position within the file (for exact disambiguation)
     message?: number;
     highlight?: string;
   }): string => {
@@ -62,6 +68,7 @@ export function useUrlState() {
     params.set('file', options.file);
     if (options.rollout !== undefined) params.set('rollout', options.rollout.toString());
     if (options.step !== undefined) params.set('step', options.step.toString());
+    if (options.index !== undefined) params.set('index', options.index.toString());
     if (options.message !== undefined) params.set('message', options.message.toString());
     if (options.highlight) params.set('highlight', options.highlight);
     
