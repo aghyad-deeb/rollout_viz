@@ -705,6 +705,16 @@ def _load_samples_sync(file: str, metadata_only: bool = False) -> dict:
 
         # Apply defaults for missing attributes
         filled_attrs = {k: attrs.get(k, v) for k, v in _ATTR_DEFAULTS.items()}
+        # Coerce numeric types — raw JSONL may have strings for numeric fields
+        for int_key in ('step', 'sample_index', 'rollout_n'):
+            try:
+                filled_attrs[int_key] = int(filled_attrs[int_key])
+            except (ValueError, TypeError):
+                pass
+        try:
+            filled_attrs['reward'] = float(filled_attrs['reward'])
+        except (ValueError, TypeError):
+            pass
         # Preserve any extra attributes (e.g., source_file)
         for k, v in attrs.items():
             if k not in filled_attrs:
@@ -905,6 +915,16 @@ def _load_samples_batch_sync(files: List[str], metadata_only: bool = False) -> d
                     if grades:
                         has_grades = True
                     filled_attrs = {k: attrs.get(k, v) for k, v in _ATTR_DEFAULTS.items()}
+                    # Coerce numeric types — raw JSONL may have strings
+                    for int_key in ('step', 'sample_index', 'rollout_n'):
+                        try:
+                            filled_attrs[int_key] = int(filled_attrs[int_key])
+                        except (ValueError, TypeError):
+                            pass
+                    try:
+                        filled_attrs['reward'] = float(filled_attrs['reward'])
+                    except (ValueError, TypeError):
+                        pass
                     for k, v in attrs.items():
                         if k not in filled_attrs:
                             filled_attrs[k] = v
@@ -1024,6 +1044,16 @@ def _load_single_sample_sync(file: str, sample_id: int) -> dict:
         attrs['is_validate'] = attrs.pop('validate')
 
     filled_attrs = {k: attrs.get(k, v) for k, v in _ATTR_DEFAULTS.items()}
+    # Coerce numeric types — raw JSONL may have strings
+    for int_key in ('step', 'sample_index', 'rollout_n'):
+        try:
+            filled_attrs[int_key] = int(filled_attrs[int_key])
+        except (ValueError, TypeError):
+            pass
+    try:
+        filled_attrs['reward'] = float(filled_attrs['reward'])
+    except (ValueError, TypeError):
+        pass
     for k, v in attrs.items():
         if k not in filled_attrs:
             filled_attrs[k] = v

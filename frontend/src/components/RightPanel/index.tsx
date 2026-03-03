@@ -15,7 +15,7 @@ interface RightPanelProps {
   currentOccurrenceIndex: number;
   isDarkMode: boolean;
   filePath: string;
-  generateLink: (options: { file: string; rollout?: number; message?: number; highlight?: string }) => string;
+  generateLink: (options: { file: string; rollout?: number; step?: number; message?: number; highlight?: string }) => string;
   highlightedMessageIndex: number | null;
   highlightedText: string | null;
   onClearHighlight: () => void;

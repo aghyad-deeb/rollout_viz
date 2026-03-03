@@ -9,7 +9,7 @@ interface ChatViewProps {
   currentOccurrenceIndex: number; // Which occurrence to scroll to (0-indexed)
   isDarkMode: boolean;
   filePath: string;
-  generateLink: (options: { file: string; rollout?: number; message?: number; highlight?: string }) => string;
+  generateLink: (options: { file: string; rollout?: number; step?: number; message?: number; highlight?: string }) => string;
   highlightedMessageIndex: number | null;
   highlightedText: string | null;
   onClearHighlight: () => void;
@@ -346,6 +346,7 @@ export function ChatView({
               isCurrentLocalMatch={currentMatchMessageIndex === index}
               isDarkMode={isDarkMode}
               rolloutN={sample.attributes.rollout_n}
+              step={sample.attributes.step}
               filePath={filePath}
               generateLink={generateLink}
               isHighlighted={highlightedMessageIndex === index}

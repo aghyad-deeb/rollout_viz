@@ -9,8 +9,9 @@ interface MessageCardProps {
   isCurrentLocalMatch?: boolean; // Is this message the current local search match
   isDarkMode: boolean;
   rolloutN: number;
+  step: number;
   filePath: string;
-  generateLink: (options: { file: string; rollout?: number; message?: number; highlight?: string }) => string;
+  generateLink: (options: { file: string; rollout?: number; step?: number; message?: number; highlight?: string }) => string;
   isHighlighted: boolean;
   highlightedText: string | null;
   onClearHighlight: () => void;
@@ -63,6 +64,7 @@ function MessageCardInner({
   isCurrentLocalMatch = false,
   isDarkMode,
   rolloutN,
+  step,
   filePath,
   generateLink,
   isHighlighted,
@@ -406,6 +408,7 @@ function MessageCardInner({
     const link = generateLink({
       file: filePath,
       rollout: rolloutN,
+      step,
       message: index,
     });
     navigator.clipboard.writeText(link);
@@ -417,6 +420,7 @@ function MessageCardInner({
     const link = generateLink({
       file: filePath,
       rollout: rolloutN,
+      step,
       message: index,
       highlight: selectionPopup.text,
     });

@@ -3,6 +3,7 @@ import { useCallback } from 'react';
 interface UrlState {
   file?: string;
   rollout?: number;  // Use rollout_n as unique identifier
+  step?: number;     // Disambiguate samples with same rollout_n at different steps
   message?: number;
   highlight?: string;
 }
@@ -18,7 +19,10 @@ export function useUrlState() {
     
     const rollout = params.get('rollout');
     if (rollout) state.rollout = parseInt(rollout, 10);
-    
+
+    const step = params.get('step');
+    if (step) state.step = parseInt(step, 10);
+
     const message = params.get('message');
     if (message) state.message = parseInt(message, 10);
     
@@ -34,6 +38,7 @@ export function useUrlState() {
     
     if (state.file) params.set('file', state.file);
     if (state.rollout !== undefined) params.set('rollout', state.rollout.toString());
+    if (state.step !== undefined) params.set('step', state.step.toString());
     if (state.message !== undefined) params.set('message', state.message.toString());
     if (state.highlight) params.set('highlight', state.highlight);
     
@@ -48,13 +53,15 @@ export function useUrlState() {
   const generateLink = useCallback((options: {
     file: string;
     rollout?: number;  // Use rollout_n as unique identifier
+    step?: number;     // Disambiguate samples with same rollout_n
     message?: number;
     highlight?: string;
   }): string => {
     const params = new URLSearchParams();
-    
+
     params.set('file', options.file);
     if (options.rollout !== undefined) params.set('rollout', options.rollout.toString());
+    if (options.step !== undefined) params.set('step', options.step.toString());
     if (options.message !== undefined) params.set('message', options.message.toString());
     if (options.highlight) params.set('highlight', options.highlight);
     

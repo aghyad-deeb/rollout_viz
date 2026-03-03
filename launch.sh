@@ -27,6 +27,7 @@ cleanup() {
     echo -e "\n${YELLOW}Shutting down...${NC}"
     kill $BACKEND_PID 2>/dev/null || true
     kill $FRONTEND_PID 2>/dev/null || true
+    [ -n "$TUNNEL_PID" ] && kill $TUNNEL_PID 2>/dev/null || true
     exit 0
 }
 
@@ -61,13 +62,24 @@ npm run dev &
 FRONTEND_PID=$!
 cd ..
 
+# Start Cloudflare tunnel if available and tunnel exists
+TUNNEL_PID=""
+if command -v cloudflared &> /dev/null && cloudflared tunnel list 2>/dev/null | grep -q "rollout-viz"; then
+    echo -e "${GREEN}Starting Cloudflare tunnel...${NC}"
+    cloudflared tunnel run --url http://localhost:3000 rollout-viz &
+    TUNNEL_PID=$!
+fi
+
 echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}Rollout Visualizer is running!${NC}"
 echo -e "${GREEN}Frontend: http://localhost:3000${NC}"
 echo -e "${GREEN}Backend:  http://localhost:8000${NC}"
 echo -e "${GREEN}API Docs: http://localhost:8000/docs${NC}"
+if [ -n "$TUNNEL_PID" ]; then
+echo -e "${GREEN}Tunnel:   https://rollout-viz.com${NC}"
+fi
 echo -e "${GREEN}========================================${NC}"
 echo -e "${YELLOW}Press Ctrl+C to stop${NC}"
 
-# Wait for both processes
+# Wait for all processes
 wait

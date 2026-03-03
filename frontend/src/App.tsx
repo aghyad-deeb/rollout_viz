@@ -73,6 +73,8 @@ function App() {
   const [samples, setSamples] = useState<Sample[]>([]);
   const [filteredSamples, setFilteredSamples] = useState<Sample[]>([]);
   const [selectedSampleId, setSelectedSampleId] = useState<number | null>(null);
+  const selectedSampleIdRef = useRef<number | null>(null);
+  selectedSampleIdRef.current = selectedSampleId;
   const [experimentName, setExperimentName] = useState<string>('');
   const [filePaths, setFilePaths] = useState<string[]>([]);
   const [isFileBrowserOpen, setIsFileBrowserOpen] = useState(false);
@@ -91,7 +93,6 @@ function App() {
   const { getUrlState, setUrlState, generateLink } = useUrlState();
   const grading = useGrading();
   const initialLoadDone = useRef(false);
-  const isUserAction = useRef(false);
 
   // Check authentication on mount, with retry for backend startup
   useEffect(() => {
@@ -183,11 +184,17 @@ function App() {
       if (!firstFileHandled) {
         firstFileHandled = true;
         if (urlState.rollout !== undefined) {
-          const targetSample = fileSamples.find(s => s.attributes.rollout_n === urlState.rollout);
+          const targetSample = fileSamples.find(s =>
+            Number(s.attributes.rollout_n) === urlState.rollout &&
+            (urlState.step === undefined || Number(s.attributes.step) === urlState.step)
+          );
           if (targetSample) {
             // Will get ID 0+ based on current state, use functional lookup
             setSamples(prev => {
-              const found = prev.find(s => s.attributes.rollout_n === urlState.rollout);
+              const found = prev.find(s =>
+                Number(s.attributes.rollout_n) === urlState.rollout &&
+                (urlState.step === undefined || Number(s.attributes.step) === urlState.step)
+              );
               if (found) setSelectedSampleId(found.id);
               else if (prev.length > 0) setSelectedSampleId(prev[0].id);
               return prev;
@@ -206,16 +213,39 @@ function App() {
       // If URL-targeted sample wasn't in first file, find it now
       if (urlState.rollout !== undefined) {
         setSamples(prev => {
-          const found = prev.find(s => s.attributes.rollout_n === urlState.rollout);
+          const found = prev.find(s =>
+            Number(s.attributes.rollout_n) === urlState.rollout &&
+            (urlState.step === undefined || Number(s.attributes.step) === urlState.step)
+          );
           if (found) setSelectedSampleId(found.id);
           return prev;
         });
       }
 
       // Phase 2: full load in background → hydrate messages
+      // Preserve currently selected sample across the replacement
+      // NOTE: Use selectedSampleIdRef (not selectedSampleId) to avoid stale closure —
+      // selectedSampleId was null when this effect created, but user may have selected
+      // a sample during Phase 1 by the time this .then() fires.
       loadMultipleSamplesFull(filePaths).then((fullData) => {
         if (!fullData) return;
-        setSamples(fullData.samples);
+        setSamples(prev => {
+          const currentId = selectedSampleIdRef.current;
+          const currentlySelected = currentId !== null ? prev.find(s => s.id === currentId) : null;
+          const newSamples = fullData.samples;
+          // Re-find the selected sample in the new dataset by rollout_n + step + source_file
+          if (currentlySelected) {
+            const match = newSamples.find(s =>
+              Number(s.attributes.rollout_n) === Number(currentlySelected.attributes.rollout_n) &&
+              Number(s.attributes.step) === Number(currentlySelected.attributes.step) &&
+              (s.attributes.source_file || '') === (currentlySelected.attributes.source_file || '')
+            );
+            if (match) {
+              setSelectedSampleId(match.id);
+            }
+          }
+          return newSamples;
+        });
       });
     });
   }, [filePaths, authState, loadFilesProgressively, loadMultipleSamplesFull, getUrlState]);
@@ -238,19 +268,19 @@ function App() {
     const indexInFile = samplesFromSameFile.indexOf(sample);
     if (indexInFile < 0) return;
 
+    const targetId = selectedSampleId; // Capture current value for this request
     loadSingleSample(indexInFile, sourceFile).then((singleSample) => {
       if (!singleSample) return;
       setSamples(prev => prev.map(s =>
-        s.id === selectedSampleId
+        s.id === targetId
           ? { ...s, messages: singleSample.messages, grades: singleSample.grades ?? s.grades }
           : s
       ));
     });
   }, [selectedSampleId, messagesLoaded, samples, filePaths, loadSingleSample]);
 
-  // Only update URL on user-initiated sample selection (not on initial load)
-  const handleSelectSampleWithUrlUpdate = (id: number) => {
-    isUserAction.current = true;
+  // Select a sample and clear highlights (used when user clicks a sample)
+  const handleSelectSample = (id: number) => {
     setSelectedSampleId(id);
     // Clear any highlights and grade selection when user manually changes sample
     setHighlightedMessageIndex(null);
@@ -258,18 +288,19 @@ function App() {
     setSelectedGradeMetric(undefined);
   };
 
-  // Update URL only when user changes sample
+  // Update URL whenever the selected sample changes (user click, navigation, or auto-selection)
   useEffect(() => {
-    if (filePaths.length === 0 || samples.length === 0 || !isUserAction.current) return;
-    
+    if (filePaths.length === 0 || samples.length === 0 || selectedSampleId === null) return;
+
     const selectedSample = samples.find(s => s.id === selectedSampleId);
+    if (!selectedSample) return;
     // Use the sample's source file if available, otherwise use primary file
-    const fileForUrl = selectedSample?.attributes.source_file || primaryFilePath;
+    const fileForUrl = selectedSample.attributes.source_file || primaryFilePath;
     setUrlState({
       file: fileForUrl,
-      rollout: selectedSample?.attributes.rollout_n,
+      rollout: selectedSample.attributes.rollout_n,
+      step: selectedSample.attributes.step,
     });
-    isUserAction.current = false;
   }, [filePaths, primaryFilePath, selectedSampleId, samples, setUrlState]);
 
   const selectedSample = samples.find(s => s.id === selectedSampleId) || null;
@@ -280,11 +311,13 @@ function App() {
   };
 
   const handleNavigate = (direction: 'first' | 'prev' | 'next' | 'last') => {
-    if (samples.length === 0) return;
-    
-    const currentIndex = samples.findIndex(s => s.id === selectedSampleId);
+    // Navigate through filtered samples if filtering is active, otherwise all samples
+    const navSamples = filteredSamples.length > 0 ? filteredSamples : samples;
+    if (navSamples.length === 0) return;
+
+    const currentIndex = navSamples.findIndex(s => s.id === selectedSampleId);
     let newIndex: number;
-    
+
     switch (direction) {
       case 'first':
         newIndex = 0;
@@ -293,16 +326,14 @@ function App() {
         newIndex = Math.max(0, currentIndex - 1);
         break;
       case 'next':
-        newIndex = Math.min(samples.length - 1, currentIndex + 1);
+        newIndex = Math.min(navSamples.length - 1, currentIndex + 1);
         break;
       case 'last':
-        newIndex = samples.length - 1;
+        newIndex = navSamples.length - 1;
         break;
     }
-    
-    setSelectedSampleId(samples[newIndex].id);
-    // Clear grade metric selection when navigating
-    setSelectedGradeMetric(undefined);
+
+    handleSelectSample(navSamples[newIndex].id);
   };
 
   // Reload samples after grading to pick up the viz/ version with grades
@@ -337,7 +368,7 @@ function App() {
           <LeftPanel
             samples={samples}
             selectedSampleId={selectedSampleId}
-            onSelectSample={handleSelectSampleWithUrlUpdate}
+            onSelectSample={handleSelectSample}
             experimentName={experimentName}
             filePaths={filePaths}
             onFilePathsChange={setFilePaths}

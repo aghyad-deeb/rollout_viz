@@ -7,7 +7,7 @@ interface NavigationBarProps {
   onNavigate: (direction: 'first' | 'prev' | 'next' | 'last') => void;
   isDarkMode: boolean;
   filePath: string;
-  generateLink: (options: { file: string; rollout?: number; message?: number; highlight?: string }) => string;
+  generateLink: (options: { file: string; rollout?: number; step?: number; message?: number; highlight?: string }) => string;
   viewMode: ViewMode;
   onViewModeChange: (mode: ViewMode) => void;
 }
@@ -29,6 +29,7 @@ export function NavigationBar({
     const link = generateLink({
       file: filePath,
       rollout: sample?.attributes.rollout_n,
+      step: sample?.attributes.step,
     });
     navigator.clipboard.writeText(link);
   };
