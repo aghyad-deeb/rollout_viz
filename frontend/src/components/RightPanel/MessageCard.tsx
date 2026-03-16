@@ -386,17 +386,22 @@ function MessageCardInner({
   }, [searchConditions, getApplicableSearchTerms, localSearchTerm, isCurrentLocalMatch, highlightedText, onClearHighlight, messageOccurrenceStart, currentOccurrenceIndex, gradeQuotes, index]);
 
   // Parse reasoning from assistant messages
+  // Handles: <think>...</think>, <reasoning>...</reasoning>,
+  // and orphaned </think> (content before it is the reasoning)
   const parseContent = (content: string) => {
     const thinkMatch = content.match(/<think>([\s\S]*?)<\/think>/);
     const reasoningMatch = content.match(/<reasoning>([\s\S]*?)<\/reasoning>/);
-    
-    const reasoning = thinkMatch?.[1] || reasoningMatch?.[1] || null;
-    
+    // Handle orphaned </think> without opening <think> — treat everything before it as reasoning
+    const orphanedThinkMatch = !thinkMatch ? content.match(/^([\s\S]*?)<\/think>/) : null;
+
+    const reasoning = thinkMatch?.[1] || reasoningMatch?.[1] || orphanedThinkMatch?.[1]?.trim() || null;
+
     let mainContent = content
       .replace(/<think>[\s\S]*?<\/think>/g, '')
       .replace(/<reasoning>[\s\S]*?<\/reasoning>/g, '')
+      .replace(/^[\s\S]*?<\/think>/g, '') // Remove orphaned </think> and everything before it
       .trim();
-    
+
     return { reasoning, mainContent };
   };
 
