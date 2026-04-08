@@ -2,6 +2,7 @@ import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import type { Sample, SearchCondition, Quote } from '../../types';
 import { MessageCard } from './MessageCard';
 import { GradesDisplay } from './GradesDisplay';
+import { countMessageOccurrences } from '../../utils/parseContent';
 
 interface ChatViewProps {
   sample: Sample;
@@ -58,31 +59,20 @@ export function ChatView({
   // Get the first active condition for scroll targeting
   const primarySearchTerm = activeSearchTerms[0] || '';
 
-  // Calculate the starting occurrence index for each message (cumulative count)
-  // This tells MessageCard which global index its first occurrence corresponds to
+  // Calculate the starting occurrence index for each message (cumulative count).
+  // Uses the same normalized text and field scoping as MessageCard highlights.
   const messageOccurrenceStarts = useMemo(() => {
     const starts: number[] = [];
     let cumulativeCount = 0;
-    
+    const activeConditions = searchConditions.filter(c => c.operator === 'contains' && c.term.trim());
+
     sample.messages.forEach((message) => {
       starts.push(cumulativeCount);
-      
-      // Count occurrences in this message for all active search terms
-      if (activeSearchTerms.length > 0) {
-        const contentLower = message.content.toLowerCase();
-        activeSearchTerms.forEach(term => {
-          const termLower = term.toLowerCase();
-          let searchIndex = 0;
-          while ((searchIndex = contentLower.indexOf(termLower, searchIndex)) !== -1) {
-            cumulativeCount++;
-            searchIndex += term.length;
-          }
-        });
-      }
+      cumulativeCount += countMessageOccurrences(message, activeConditions);
     });
     
     return starts;
-  }, [sample.messages, activeSearchTerms]);
+  }, [sample.messages, searchConditions]);
 
   const [localSearchTerm, setLocalSearchTerm] = useState('');
   const [currentMatchIndex, setCurrentMatchIndex] = useState(0);

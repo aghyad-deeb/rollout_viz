@@ -1,5 +1,6 @@
 import { useState, useMemo, useRef, useEffect, useCallback, memo } from 'react';
 import type { Message, SearchCondition, SearchField, Quote } from '../../types';
+import { normalizeAssistantMessage, fieldAppliesToContent, fieldAppliesToReasoning } from '../../utils/parseContent';
 
 interface MessageCardProps {
   message: Message;
@@ -46,6 +47,18 @@ const ROLE_CONFIG = {
     className: 'message-tool',
     headerClassName: 'message-tool-header',
     buttonClassName: 'message-tool-button',
+  },
+  developer: {
+    icon: 'code',
+    className: 'message-system',
+    headerClassName: 'message-system-header',
+    buttonClassName: 'message-system-button',
+  },
+  _gptoss_internal_system: {
+    icon: 'contextual_token',
+    className: 'message-system',
+    headerClassName: 'message-system-header',
+    buttonClassName: 'message-system-button',
   },
 } as const;
 
@@ -137,48 +150,14 @@ function MessageCardInner({
     return () => document.removeEventListener('mousedown', handleClick);
   }, [selectionPopup.show]);
 
-  // Helper to check if a search field applies to message content (not reasoning)
-  const fieldAppliesToContent = (field: SearchField): boolean => {
-    switch (field) {
-      case 'chat':
-      case 'all':
-        return true;
-      case 'system':
-        return message.role === 'system';
-      case 'user':
-        return message.role === 'user';
-      case 'assistant':
-        return message.role === 'assistant';
-      case 'tool':
-        return message.role === 'tool';
-      case 'reasoning':
-        return false; // Reasoning is handled separately
-      default:
-        return false;
-    }
-  };
-
-  // Helper to check if a search field applies to reasoning blocks
-  const fieldAppliesToReasoning = (field: SearchField): boolean => {
-    if (message.role !== 'assistant') return false;
-    switch (field) {
-      case 'chat':
-      case 'all':
-      case 'reasoning':
-        return true;
-      case 'assistant':
-        return false; // When searching assistant specifically, exclude reasoning
-      default:
-        return false;
-    }
-  };
-
   // Get search terms that should be highlighted in content/reasoning
   const getApplicableSearchTerms = useMemo(() => {
     return (isReasoning: boolean): string[] => {
       return searchConditions
         .filter(c => c.operator === 'contains' && c.term.trim())
-        .filter(c => isReasoning ? fieldAppliesToReasoning(c.field) : fieldAppliesToContent(c.field))
+        .filter(c => isReasoning
+          ? fieldAppliesToReasoning(c.field, message.role)
+          : fieldAppliesToContent(c.field, message.role))
         .map(c => c.term.trim());
     };
   }, [searchConditions, message.role]);
@@ -385,29 +364,10 @@ function MessageCardInner({
     };
   }, [searchConditions, getApplicableSearchTerms, localSearchTerm, isCurrentLocalMatch, highlightedText, onClearHighlight, messageOccurrenceStart, currentOccurrenceIndex, gradeQuotes, index]);
 
-  // Parse reasoning from assistant messages
-  // Handles: <think>...</think>, <reasoning>...</reasoning>,
-  // and orphaned </think> (content before it is the reasoning)
-  const parseContent = (content: string) => {
-    const thinkMatch = content.match(/<think>([\s\S]*?)<\/think>/);
-    const reasoningMatch = content.match(/<reasoning>([\s\S]*?)<\/reasoning>/);
-    // Handle orphaned </think> without opening <think> — treat everything before it as reasoning
-    const orphanedThinkMatch = !thinkMatch ? content.match(/^([\s\S]*?)<\/think>/) : null;
-
-    const reasoning = thinkMatch?.[1] || reasoningMatch?.[1] || orphanedThinkMatch?.[1]?.trim() || null;
-
-    let mainContent = content
-      .replace(/<think>[\s\S]*?<\/think>/g, '')
-      .replace(/<reasoning>[\s\S]*?<\/reasoning>/g, '')
-      .replace(/^[\s\S]*?<\/think>/g, '') // Remove orphaned </think> and everything before it
-      .trim();
-
-    return { reasoning, mainContent };
-  };
-
-  const { reasoning, mainContent } = message.role === 'assistant' 
-    ? parseContent(message.content) 
-    : { reasoning: null, mainContent: message.content };
+  const { reasoning, mainContent, toolCallText } = useMemo(() =>
+    normalizeAssistantMessage(message),
+    [message.role, message.content, message.content_parts]
+  );
 
   const copyMessageLink = () => {
     const link = generateLink({
@@ -530,6 +490,39 @@ function MessageCardInner({
                 <div className={`mx-3 whitespace-pre-wrap text-sm ${textPrimary}`}>
                   {highlightSearchAndUrl(mainContent, false)}
                 </div>
+
+                {/* Inline tool-call text (from Kimi/ChatML traces) */}
+                {toolCallText && (
+                  <div className={`mx-3 rounded-md border overflow-hidden ${isDarkMode ? 'border-gray-600 bg-gray-800/50' : 'border-gray-200 bg-gray-50'}`}>
+                    <div className={`px-2 py-1 flex items-center gap-1 text-xs font-medium ${isDarkMode ? 'bg-gray-700/50 text-gray-300' : 'bg-gray-100 text-gray-600'}`}>
+                      <span className="material-symbols-outlined" style={{ fontSize: 14 }}>terminal</span>
+                      tool call
+                    </div>
+                    <pre className={`px-2 py-1 text-xs overflow-x-auto ${isDarkMode ? 'text-green-400' : 'text-gray-800'}`}>{toolCallText}</pre>
+                  </div>
+                )}
+
+                {/* Structured tool calls */}
+                {message.tool_calls && message.tool_calls.length > 0 && (
+                  <div className="mx-3 space-y-2">
+                    {message.tool_calls.map((tc, tcIdx) => {
+                      const args = typeof tc.function.arguments === 'string'
+                        ? tc.function.arguments
+                        : tc.function.arguments?.command != null
+                          ? String(tc.function.arguments.command)
+                          : JSON.stringify(tc.function.arguments, null, 2);
+                      return (
+                        <div key={tcIdx} className={`rounded-md border overflow-hidden ${isDarkMode ? 'border-gray-600 bg-gray-800/50' : 'border-gray-200 bg-gray-50'}`}>
+                          <div className={`px-2 py-1 flex items-center gap-1 text-xs font-medium ${isDarkMode ? 'bg-gray-700/50 text-gray-300' : 'bg-gray-100 text-gray-600'}`}>
+                            <span className="material-symbols-outlined" style={{ fontSize: 14 }}>terminal</span>
+                            {tc.function.name}
+                          </div>
+                          <pre className={`px-2 py-1 text-xs overflow-x-auto ${isDarkMode ? 'text-green-400' : 'text-gray-800'}`}>{args}</pre>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
             </div>
           </div>

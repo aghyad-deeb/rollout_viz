@@ -4,6 +4,7 @@ import { SampleTable } from './SampleTable';
 import { FilterBar } from './FilterBar';
 import { MetadataHeader } from './MetadataHeader';
 import { useDebouncedValue } from '../../hooks/useDebouncedValue';
+import { normalizeAssistantMessage, countMessageOccurrences } from '../../utils/parseContent';
 
 interface LeftPanelProps {
   samples: Sample[];
@@ -59,16 +60,9 @@ export function LeftPanel({
   const filteredSamples = useMemo(() => {
     let result = [...samples];
 
-    // Helper to extract reasoning content from a message
-    const getReasoningContent = (content: string): string | null => {
-      const thinkMatch = content.match(/<think>([\s\S]*?)<\/think>/);
-      const reasoningMatch = content.match(/<reasoning>([\s\S]*?)<\/reasoning>/);
-      return thinkMatch?.[1] || reasoningMatch?.[1] || null;
-    };
-
     // Helper to check if a sample matches a single search condition
     const matchesCondition = (sample: Sample, condition: SearchCondition): boolean => {
-      if (!condition.term.trim()) return true; // Empty term matches all
+      if (!condition.term.trim()) return true;
       
       const term = condition.term.toLowerCase();
       const attrs = sample.attributes;
@@ -78,9 +72,11 @@ export function LeftPanel({
       
       switch (field) {
         case 'chat':
-          matches = sample.messages.some(msg => 
-            msg.content.toLowerCase().includes(term)
-          );
+          matches = sample.messages.some(msg => {
+            const { reasoning, mainContent } = normalizeAssistantMessage(msg);
+            const normalized = [mainContent, reasoning].filter(Boolean).join(' ');
+            return normalized.toLowerCase().includes(term);
+          });
           break;
         
         case 'system':
@@ -98,10 +94,7 @@ export function LeftPanel({
         case 'assistant':
           matches = sample.messages.some(msg => {
             if (msg.role !== 'assistant') return false;
-            const contentWithoutReasoning = msg.content
-              .replace(/<think>[\s\S]*?<\/think>/g, '')
-              .replace(/<reasoning>[\s\S]*?<\/reasoning>/g, '');
-            return contentWithoutReasoning.toLowerCase().includes(term);
+            return normalizeAssistantMessage(msg).mainContent.toLowerCase().includes(term);
           });
           break;
         
@@ -114,7 +107,7 @@ export function LeftPanel({
         case 'reasoning':
           matches = sample.messages.some(msg => {
             if (msg.role !== 'assistant') return false;
-            const reasoning = getReasoningContent(msg.content);
+            const reasoning = normalizeAssistantMessage(msg).reasoning;
             return reasoning ? reasoning.toLowerCase().includes(term) : false;
           });
           break;
@@ -141,9 +134,11 @@ export function LeftPanel({
         
         case 'all':
         default:
-          const inMessages = sample.messages.some(msg => 
-            msg.content.toLowerCase().includes(term)
-          );
+          const inMessages = sample.messages.some(msg => {
+            const { reasoning, mainContent } = normalizeAssistantMessage(msg);
+            const normalized = [mainContent, reasoning].filter(Boolean).join(' ');
+            return normalized.toLowerCase().includes(term);
+          });
           const inAttributes = 
             attrs.data_source.toLowerCase().includes(term) ||
             attrs.experiment_name.toLowerCase().includes(term) ||
@@ -155,7 +150,6 @@ export function LeftPanel({
           matches = inMessages || inAttributes || inTimestamp;
       }
       
-      // Apply operator (contains or not_contains)
       return condition.operator === 'contains' ? matches : !matches;
     };
 
@@ -358,14 +352,13 @@ export function LeftPanel({
     return filteredSamples.findIndex(s => s.id === selectedSampleId);
   }, [selectedSampleId, filteredSamples]);
 
-  // Count occurrences in the current sample for message-based searches
+  // Count occurrences in the current sample (uses same normalized text + field scoping as MessageCard)
   const matchesInCurrentSample = useMemo(() => {
     if (!selectedSampleId) return 0;
     
     const sample = samples.find(s => s.id === selectedSampleId);
     if (!sample) return 0;
 
-    // Only count for message-based search conditions
     const messageFields = ['chat', 'system', 'user', 'assistant', 'tool', 'reasoning', 'all'];
     const activeMessageConditions = searchConditions.filter(
       c => c.operator === 'contains' && c.term.trim() && messageFields.includes(c.field)
@@ -374,16 +367,8 @@ export function LeftPanel({
     if (activeMessageConditions.length === 0) return 0;
 
     let count = 0;
-    const firstCondition = activeMessageConditions[0]; // Use first condition for counting
-    const term = firstCondition.term.toLowerCase();
-
     sample.messages.forEach(msg => {
-      const content = msg.content.toLowerCase();
-      let searchIndex = 0;
-      while ((searchIndex = content.indexOf(term, searchIndex)) !== -1) {
-        count++;
-        searchIndex += term.length;
-      }
+      count += countMessageOccurrences(msg, activeMessageConditions);
     });
 
     return count;

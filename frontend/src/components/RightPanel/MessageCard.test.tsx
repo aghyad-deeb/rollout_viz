@@ -128,4 +128,54 @@ describe('MessageCard', () => {
     const elapsed = performance.now() - start;
     expect(elapsed).toBeLessThan(100);
   });
+
+  it('strips Kimi ChatML tokens from assistant content', () => {
+    const message = {
+      role: 'assistant' as const,
+      content: '<|im_assistant|>assistant<|im_middle|><think></think> The answer is 42.<|im_end|>',
+    };
+    render(<MessageCard {...defaultProps} message={message} />);
+    expect(screen.getByText('The answer is 42.')).toBeInTheDocument();
+    expect(screen.queryByText(/im_assistant/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/im_end/)).not.toBeInTheDocument();
+  });
+
+  it('renders inline Kimi tool calls in a tool-call panel', () => {
+    const message = {
+      role: 'assistant' as const,
+      content:
+        '<|im_assistant|>assistant<|im_middle|><think></think> Checking ' +
+        '<|tool_calls_section_begin|><|tool_call_begin|>functions.bash:0' +
+        '<|tool_call_argument_begin|>{"command": "ls"}<|tool_call_end|>' +
+        '<|tool_calls_section_end|><|im_end|>',
+    };
+    render(<MessageCard {...defaultProps} message={message} />);
+    expect(screen.getByText('Checking')).toBeInTheDocument();
+    expect(screen.getByText('tool call')).toBeInTheDocument();
+  });
+
+  it('extracts redacted_thinking tags', () => {
+    const message = {
+      role: 'assistant' as const,
+      content: '<redacted_thinking>hidden plan</redacted_thinking>Public answer',
+    };
+    render(<MessageCard {...defaultProps} message={message} />);
+    expect(screen.getByText('hidden plan')).toBeInTheDocument();
+    expect(screen.getByText('Public answer')).toBeInTheDocument();
+  });
+
+  it('prefers content_parts over raw content', () => {
+    const message = {
+      role: 'assistant' as const,
+      content: 'raw noisy content',
+      content_parts: [
+        { type: 'thinking' as const, thinking: 'structured thinking' },
+        { type: 'text' as const, text: 'clean answer' },
+      ],
+    };
+    render(<MessageCard {...defaultProps} message={message} />);
+    expect(screen.getByText('structured thinking')).toBeInTheDocument();
+    expect(screen.getByText('clean answer')).toBeInTheDocument();
+    expect(screen.queryByText('raw noisy content')).not.toBeInTheDocument();
+  });
 });

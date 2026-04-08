@@ -1,7 +1,23 @@
+export interface ToolCall {
+  type: string;
+  function: {
+    name: string;
+    arguments: Record<string, unknown> | string;
+  };
+}
+
+export interface ContentPart {
+  type: 'thinking' | 'text';
+  thinking?: string;
+  text?: string;
+}
+
 export interface Message {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
   reasoning?: string;
+  content_parts?: ContentPart[];
+  tool_calls?: ToolCall[];
 }
 
 export interface SampleAttributes {
