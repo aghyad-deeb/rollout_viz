@@ -34,14 +34,35 @@ export interface SampleAttributes {
 // Grading types
 export interface Quote {
   message_index: number;
+  /**
+   * Which channel of the message this quote is drawn from. Auto_eval's
+   * multi-channel renderer decomposes a single message into separate
+   * streams for thinking, visible text, tool-call intent, tool-result
+   * output, and (rl_late) reasoning summaries; the channel attribute
+   * specifies which one this quote came from.
+   *
+   * Optional for backward compat with grades produced before
+   * multi-channel rendering. Consumers should treat `undefined` as
+   * `'text'` (the only channel pre-multi-channel forks could see).
+   *
+   * Highlight rendering today is text-substring-based and ignores
+   * `start`/`end`, so this field is purely advisory for now — but
+   * future channel-aware rendering (e.g. rendering thinking blocks
+   * collapsed) will use it to pick the correct sub-region.
+   */
+  channel?: 'thinking' | 'text' | 'tool_call' | 'tool_result' | 'reasoning_summary';
   start: number;
   end: number;
   text: string;
 }
 
+export type GradeType = 'float' | 'int' | 'bool' | 'freeform';
+
 export interface GradeEntry {
-  grade: number | boolean;
-  grade_type: 'float' | 'int' | 'bool';
+  // `string` is populated when grade_type === 'freeform' — the LLM's prose
+  // answer goes directly into `grade`. Numeric/bool grades keep their types.
+  grade: number | boolean | string;
+  grade_type: GradeType;
   quotes: Quote[];
   explanation: string;
   model: string;
@@ -68,7 +89,7 @@ export interface GradeRequest {
   sample_ids: number[];
   metric_name: string;
   metric_prompt: string;
-  grade_type: 'float' | 'int' | 'bool';
+  grade_type: GradeType;
   provider: LLMProvider;
   model: string;
   api_key?: string;  // Optional - server will use .env if not provided
@@ -90,7 +111,7 @@ export interface GradeResponse {
 export interface PresetMetric {
   name: string;
   description: string;
-  grade_type: 'float' | 'int' | 'bool';
+  grade_type: GradeType;
   is_custom?: boolean;  // True if user-created
   prompt: string;
 }
@@ -226,3 +247,13 @@ export interface SearchCondition {
 }
 
 export type SearchLogic = 'AND' | 'OR';
+
+// Ephemeral, session-only highlight created by the user selecting text and
+// clicking "Highlight" in the selection popup. Cleared automatically when the
+// user navigates to a different sample. Never persisted (no URL, no storage,
+// no backend).
+export interface EphemeralHighlight {
+  id: string;
+  messageIndex: number;
+  text: string;
+}
