@@ -1,5 +1,6 @@
 import { useState, lazy, Suspense } from 'react';
 import type { Sample, ViewMode, SearchCondition, ExportWidth, FontSize } from '../../types';
+import type { PresentationMessageDrafts } from '../../utils/presentationDraft';
 import { NavigationBar } from './NavigationBar';
 import { ChatView } from './ChatView';
 
@@ -37,6 +38,9 @@ interface RightPanelProps {
   imageTheme?: 'light' | 'dark';
   exportWidth?: ExportWidth;
   fontSize?: FontSize;
+  presentationDrafts?: PresentationMessageDrafts;
+  presentationActiveIndex?: number | null;
+  onPresentationActiveIndexChange?: (index: number | null) => void;
 }
 
 export function RightPanel({
@@ -66,6 +70,9 @@ export function RightPanel({
   imageTheme = 'light',
   exportWidth = 'paper1',
   fontSize = 'md',
+  presentationDrafts = {},
+  presentationActiveIndex = null,
+  onPresentationActiveIndexChange,
 }: RightPanelProps) {
   const [viewMode, setViewMode] = useState<ViewMode>('chat');
 
@@ -104,6 +111,7 @@ export function RightPanel({
     if (sample) {
       return (
         <ChatView 
+          key={sample.id}
           sample={sample} 
           searchConditions={searchConditions}
           currentOccurrenceIndex={currentOccurrenceIndex}
@@ -123,6 +131,9 @@ export function RightPanel({
           exportWidth={exportWidth}
           fontSize={fontSize}
           onPresentationPreview={onPresentationPreview}
+          presentationDrafts={presentationDrafts}
+          presentationActiveIndex={presentationActiveIndex}
+          onPresentationActiveIndexChange={onPresentationActiveIndexChange}
         />
       );
     }

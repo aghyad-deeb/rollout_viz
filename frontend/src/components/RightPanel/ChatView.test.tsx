@@ -10,12 +10,19 @@ vi.mock('./MessageCard', () => ({
     message,
     index,
     onAddEphemeralHighlight,
+    isPresentationMode,
+    onPreviewSelect,
   }: {
     message: { role: string; content: string };
     index: number;
     onAddEphemeralHighlight?: (messageIndex: number, text: string) => void;
+    isPresentationMode?: boolean;
+    onPreviewSelect?: (messageIndex: number) => void;
   }) => (
-    <div data-testid={`message-${index}`}>
+    <div
+      data-testid={`message-${index}`}
+      onMouseDown={() => { if (isPresentationMode) onPreviewSelect?.(index); }}
+    >
       <span data-testid={`role-${index}`}>{message.role}</span>
       <span data-testid={`content-${index}`}>{message.content}</span>
       <button
@@ -96,6 +103,53 @@ describe('ChatView', () => {
     render(<ChatView {...defaultProps} />);
     expect(screen.getByTestId('role-0')).toHaveTextContent('user');
     expect(screen.getByTestId('role-1')).toHaveTextContent('assistant');
+  });
+
+  it('applies presentation drafts only while presentation mode is active', () => {
+    const presentationDrafts = {
+      0: {
+        role: 'assistant' as const,
+        content: 'Edited for presentation',
+        reasoning: '',
+        toolCallsJson: '',
+      },
+    };
+    const { rerender } = render(
+      <ChatView
+        {...defaultProps}
+        isPresentationMode={true}
+        presentationDrafts={presentationDrafts}
+      />,
+    );
+
+    expect(screen.getByTestId('role-0')).toHaveTextContent('assistant');
+    expect(screen.getByTestId('content-0')).toHaveTextContent('Edited for presentation');
+
+    rerender(
+      <ChatView
+        {...defaultProps}
+        isPresentationMode={false}
+        presentationDrafts={presentationDrafts}
+      />,
+    );
+
+    expect(screen.getByTestId('role-0')).toHaveTextContent('user');
+    expect(screen.getByTestId('content-0')).toHaveTextContent('Hello, how are you?');
+  });
+
+  it('reports the active presentation card when a message is selected', () => {
+    const onPresentationActiveIndexChange = vi.fn();
+    render(
+      <ChatView
+        {...defaultProps}
+        isPresentationMode={true}
+        onPresentationActiveIndexChange={onPresentationActiveIndexChange}
+      />,
+    );
+
+    fireEvent.mouseDown(screen.getByTestId('message-1'));
+
+    expect(onPresentationActiveIndexChange).toHaveBeenCalledWith(1);
   });
 
   it('renders multiple messages in a longer conversation', () => {
@@ -224,12 +278,14 @@ describe('ChatView', () => {
   });
 
   it('clears ephemeral highlights when the user navigates to a different sample', () => {
-    const { rerender } = render(<ChatView {...defaultProps} />);
+    const { rerender } = render(<ChatView key={defaultProps.sample.id} {...defaultProps} />);
     fireEvent.click(screen.getByTestId('add-highlight-0'));
     expect(screen.getByTitle(/Clear all highlights/)).toBeInTheDocument();
 
-    // Swap in a different sample — ephemeral highlights are sample-scoped.
-    rerender(<ChatView {...defaultProps} sample={makeSample({ id: 999 })} />);
+    // RightPanel keys ChatView by sample id, so sample-scoped presentation state
+    // clears via remount when the selected sample changes.
+    const nextSample = makeSample({ id: 999 });
+    rerender(<ChatView key={nextSample.id} {...defaultProps} sample={nextSample} />);
     expect(screen.queryByTitle(/Clear all highlights/)).not.toBeInTheDocument();
   });
 

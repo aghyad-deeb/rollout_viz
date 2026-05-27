@@ -236,7 +236,7 @@ export function FilterBar({
     }
 
     return { type: 'field' as SuggestionType, currentToken: '', fieldType: null, fieldName: null };
-  }, [filterExpression]);
+  }, [filterExpression, FILTER_FIELDS]);
 
   // Generate suggestions based on context
   const suggestions = useMemo((): Suggestion[] => {
@@ -302,12 +302,11 @@ export function FilterBar({
       default:
         return [];
     }
-  }, [parseContext, uniqueValues]);
+  }, [parseContext, uniqueValues, FILTER_FIELDS]);
 
-  // Reset selection when suggestions change
-  useEffect(() => {
-    setSelectedSuggestionIndex(0);
-  }, [suggestions]);
+  const activeSuggestionIndex = suggestions.length === 0
+    ? 0
+    : Math.min(selectedSuggestionIndex, suggestions.length - 1);
 
   // Close suggestions when clicking outside
   useEffect(() => {
@@ -349,8 +348,8 @@ export function FilterBar({
       case 'Enter':
       case 'Tab':
         e.preventDefault();
-        if (suggestions[selectedSuggestionIndex]) {
-          applySuggestion(suggestions[selectedSuggestionIndex]);
+        if (suggestions[activeSuggestionIndex]) {
+          applySuggestion(suggestions[activeSuggestionIndex]);
         }
         break;
       case 'Escape':
@@ -405,6 +404,7 @@ export function FilterBar({
     }
 
     onFilterChange(newValue);
+    setSelectedSuggestionIndex(0);
     filterInputRef.current?.focus();
     
     // Keep suggestions open for next step (except after logical operators give field suggestions)
@@ -518,7 +518,7 @@ export function FilterBar({
                     key={`${suggestion.type}-${suggestion.value}`}
                     onClick={() => handleSuggestionClick(suggestion)}
                     className={`block w-full text-left px-3 py-1.5 text-sm flex items-center justify-between ${
-                      index === selectedSuggestionIndex
+                      index === activeSuggestionIndex
                         ? isDarkMode 
                           ? 'bg-blue-900 text-blue-200' 
                           : 'bg-blue-100 text-blue-800'

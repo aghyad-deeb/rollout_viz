@@ -7,6 +7,11 @@ import {
   FONT_SIZE_PRESETS,
   type DownloadFormat,
 } from '../../utils/captureImage';
+import {
+  PRESENTATION_ROLE_OPTIONS,
+  parsePresentationToolCallsJson,
+  type PresentationMessageDraft,
+} from '../../utils/presentationDraft';
 import type { ExportWidth, FontSize } from '../../types';
 
 interface PresentationPreviewPanelProps {
@@ -22,6 +27,15 @@ interface PresentationPreviewPanelProps {
   onImageThemeChange: (theme: 'light' | 'dark') => void;
   onExportWidthChange: (width: ExportWidth) => void;
   onFontSizeChange: (size: FontSize) => void;
+  activeMessageIndex: number | null;
+  messageCount: number;
+  activeDraft: PresentationMessageDraft | null;
+  activeDraftDirty: boolean;
+  draftCount: number;
+  onActiveMessageIndexChange: (index: number | null) => void;
+  onActiveDraftChange: (draft: PresentationMessageDraft) => void;
+  onResetActiveDraft: () => void;
+  onClearDrafts: () => void;
 }
 
 const FORMATS: { id: DownloadFormat; label: string; ext: string }[] = [
@@ -34,15 +48,20 @@ const FORMATS: { id: DownloadFormat; label: string; ext: string }[] = [
 // Persisted so the download format-picker stays on the user's last choice.
 const FORMAT_KEY = 'rollout_viz_capture_format';
 
+function isDownloadFormat(value: string | null): value is DownloadFormat {
+  return FORMATS.some((format) => format.id === value);
+}
+
 function loadFormat(): DownloadFormat {
   const saved = localStorage.getItem(FORMAT_KEY);
-  return saved === 'jpeg' || saved === 'webp' || saved === 'png' ? saved : 'png';
+  return isDownloadFormat(saved) ? saved : 'png';
 }
 
 /**
  * Left-panel content while Presentation Mode is on: the image-capture
- * settings, a live preview of the active card's capture, and a download
- * control whose format picker remembers the last format used.
+ * settings, presentation-only card edits, a live preview of the active card's
+ * capture, and a download control whose format picker remembers the last
+ * format used.
  */
 export function PresentationPreviewPanel({
   imageUrl,
@@ -54,6 +73,15 @@ export function PresentationPreviewPanel({
   onImageThemeChange,
   onExportWidthChange,
   onFontSizeChange,
+  activeMessageIndex,
+  messageCount,
+  activeDraft,
+  activeDraftDirty,
+  draftCount,
+  onActiveMessageIndexChange,
+  onActiveDraftChange,
+  onResetActiveDraft,
+  onClearDrafts,
 }: PresentationPreviewPanelProps) {
   const [format, setFormat] = useState<DownloadFormat>(loadFormat);
   const [busy, setBusy] = useState(false);
@@ -90,11 +118,24 @@ export function PresentationPreviewPanel({
     finally { setBusy(false); }
   };
 
+  const updateDraft = (patch: Partial<PresentationMessageDraft>) => {
+    if (!activeDraft) return;
+    onActiveDraftChange({ ...activeDraft, ...patch });
+  };
+
+  const toolCallsParse = activeDraft
+    ? parsePresentationToolCallsJson(activeDraft.toolCallsJson)
+    : null;
+  const toolCallsError = toolCallsParse && !toolCallsParse.ok ? toolCallsParse.error : null;
+
   const muted = isDarkMode ? 'text-gray-400' : 'text-gray-500';
   const border = isDarkMode ? 'border-gray-700' : 'border-gray-200';
   const ctrl = isDarkMode
     ? 'bg-gray-800 border-gray-600 text-gray-200'
     : 'bg-white border-gray-300 text-gray-700';
+  const ghostBtn = isDarkMode
+    ? 'text-gray-300 hover:bg-gray-700 disabled:text-gray-600'
+    : 'text-gray-600 hover:bg-gray-100 disabled:text-gray-300';
 
   return (
     <div className={`h-full flex flex-col ${isDarkMode ? 'bg-[#16213e]' : 'bg-gray-50'}`}>
@@ -151,6 +192,107 @@ export function PresentationPreviewPanel({
             ))}
           </select>
         </label>
+      </div>
+
+      <div className={`px-3 py-2 border-b space-y-2 text-xs ${border}`}>
+        <div className="flex items-center justify-between gap-2">
+          <span className={`inline-flex items-center gap-1.5 font-medium ${isDarkMode ? 'text-gray-200' : 'text-gray-700'}`}>
+            <span className="material-symbols-outlined" style={{ fontSize: 17 }}>edit_square</span>
+            Card edit
+            {activeDraftDirty && <span className={isDarkMode ? 'text-sky-300' : 'text-sky-700'}>Modified</span>}
+          </span>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={onResetActiveDraft}
+              disabled={!activeDraft || !activeDraftDirty}
+              className={`px-1.5 py-0.5 rounded disabled:pointer-events-none ${ghostBtn}`}
+            >
+              Reset
+            </button>
+            <button
+              onClick={onClearDrafts}
+              disabled={draftCount === 0}
+              className={`px-1.5 py-0.5 rounded disabled:pointer-events-none ${ghostBtn}`}
+            >
+              Clear all
+            </button>
+          </div>
+        </div>
+
+        <label className="flex items-center gap-1.5">
+          <span className={muted}>Card</span>
+          <select
+            aria-label="Card"
+            value={activeMessageIndex ?? ''}
+            onChange={(e) => onActiveMessageIndexChange(e.target.value === '' ? null : Number(e.target.value))}
+            className={`min-w-0 flex-1 px-1.5 py-0.5 rounded border ${ctrl}`}
+          >
+            <option value="">Select a card</option>
+            {Array.from({ length: messageCount }, (_, index) => (
+              <option key={index} value={index}>#{index + 1}</option>
+            ))}
+          </select>
+        </label>
+
+        {activeDraft ? (
+          <div className="space-y-2">
+            <label className="flex items-center gap-1.5">
+              <span className={muted}>Role</span>
+              <select
+                aria-label="Role"
+                value={activeDraft.role}
+                onChange={(e) => updateDraft({ role: e.target.value as PresentationMessageDraft['role'] })}
+                className={`min-w-0 flex-1 px-1.5 py-0.5 rounded border ${ctrl}`}
+              >
+                {PRESENTATION_ROLE_OPTIONS.map((role) => (
+                  <option key={role} value={role}>{role}</option>
+                ))}
+              </select>
+            </label>
+
+            <label className="block space-y-1">
+              <span className={muted}>Content</span>
+              <textarea
+                aria-label="Content"
+                value={activeDraft.content}
+                onChange={(e) => updateDraft({ content: e.target.value })}
+                rows={5}
+                className={`w-full resize-y rounded border px-2 py-1 font-mono text-[11px] leading-4 ${ctrl}`}
+              />
+            </label>
+
+            {activeDraft.role === 'assistant' && (
+              <>
+                <label className="block space-y-1">
+                  <span className={muted}>Reasoning</span>
+                  <textarea
+                    aria-label="Reasoning"
+                    value={activeDraft.reasoning}
+                    onChange={(e) => updateDraft({ reasoning: e.target.value })}
+                    rows={3}
+                    className={`w-full resize-y rounded border px-2 py-1 font-mono text-[11px] leading-4 ${ctrl}`}
+                  />
+                </label>
+
+                <label className="block space-y-1">
+                  <span className={muted}>Tool calls JSON</span>
+                  <textarea
+                    aria-label="Tool calls JSON"
+                    value={activeDraft.toolCallsJson}
+                    onChange={(e) => updateDraft({ toolCallsJson: e.target.value })}
+                    rows={3}
+                    className={`w-full resize-y rounded border px-2 py-1 font-mono text-[11px] leading-4 ${
+                      toolCallsError ? 'border-red-400 text-red-700 bg-red-50' : ctrl
+                    }`}
+                  />
+                </label>
+                {toolCallsError && <div className="text-red-500">{toolCallsError}</div>}
+              </>
+            )}
+          </div>
+        ) : (
+          <div className={`py-3 text-center ${muted}`}>Click or select a message card to edit it.</div>
+        )}
       </div>
 
       <div className="flex-1 overflow-auto p-3 flex items-start justify-center">

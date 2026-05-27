@@ -327,11 +327,12 @@ export function FileBrowser({
       let comparison = 0;
       
       switch (sortColumn) {
-        case 'name':
+        case 'name': {
           const nameA = (a.name || getFileName(a.key)).toLowerCase();
           const nameB = (b.name || getFileName(b.key)).toLowerCase();
           comparison = nameA.localeCompare(nameB);
           break;
+        }
         case 'size':
           comparison = a.size - b.size;
           break;

@@ -8,6 +8,7 @@ import { findAllMatchesCI } from '../../utils/textMatch';
 import { extractHighlightAnchor } from '../../utils/textSnippet';
 import { captureCardToPng, copyImageToClipboard, downloadBlob, FONT_SIZE_PRESETS } from '../../utils/captureImage';
 import { addPngTextChunk, readPngTextChunks } from '../../utils/pngMetadata';
+import { applyPresentationDraft, type PresentationMessageDrafts } from '../../utils/presentationDraft';
 import { CapturePreviewModal } from './CapturePreviewModal';
 import { PUBLIC_BASE_URL } from '../../config';
 
@@ -38,6 +39,9 @@ interface ChatViewProps {
   exportWidth?: ExportWidth;
   fontSize?: FontSize;
   onPresentationPreview?: (url: string | null, blob?: Blob | null) => void;
+  presentationDrafts?: PresentationMessageDrafts;
+  presentationActiveIndex?: number | null;
+  onPresentationActiveIndexChange?: (index: number | null) => void;
 }
 
 interface LocalMatch {
@@ -65,6 +69,9 @@ export function ChatView({
   exportWidth = 'paper1',
   fontSize = 'md',
   onPresentationPreview,
+  presentationDrafts = {},
+  presentationActiveIndex = null,
+  onPresentationActiveIndexChange,
 }: ChatViewProps) {
   // Extract quotes from the selected grade metric
   const gradeQuotes = useMemo((): Quote[] => {
@@ -89,6 +96,12 @@ export function ChatView({
   // Get the first active condition for scroll targeting
   const primarySearchTerm = activeSearchTerms[0] || '';
 
+  const displayedMessages = useMemo(() => (
+    isPresentationMode
+      ? sample.messages.map((message, index) => applyPresentationDraft(message, presentationDrafts[index]))
+      : sample.messages
+  ), [isPresentationMode, presentationDrafts, sample.messages]);
+
   // Calculate the starting occurrence index for each message (cumulative count).
   // Uses the same normalized text and field scoping as MessageCard highlights.
   const messageOccurrenceStarts = useMemo(() => {
@@ -96,18 +109,18 @@ export function ChatView({
     let cumulativeCount = 0;
     const activeConditions = searchConditions.filter(c => c.operator === 'contains' && c.term.trim());
 
-    sample.messages.forEach((message) => {
+    displayedMessages.forEach((message) => {
       starts.push(cumulativeCount);
       cumulativeCount += countMessageOccurrences(message, activeConditions);
     });
     
     return starts;
-  }, [sample.messages, searchConditions]);
+  }, [displayedMessages, searchConditions]);
 
   const [localSearchTerm, setLocalSearchTerm] = useState('');
-  const [currentMatchIndex, setCurrentMatchIndex] = useState(0);
+  const [localMatchCursor, setLocalMatchCursor] = useState({ term: '', index: 0 });
   const [isSearchOpen, setIsSearchOpen] = useState(false);
-  const [currentQuoteIndex, setCurrentQuoteIndex] = useState(0);
+  const [quoteCursor, setQuoteCursor] = useState<{ metric: string | undefined; index: number }>({ metric: undefined, index: 0 });
   // Ephemeral, session-only highlights: not persisted anywhere, cleared
   // whenever the user navigates to a different sample.
   const [ephemeralHighlights, setEphemeralHighlights] = useState<EphemeralHighlight[]>([]);
@@ -139,8 +152,15 @@ export function ChatView({
   // The card under the pointer (kept when the pointer leaves, so it falls
   // back to the last one touched) — subject of the left-panel live preview.
   // The message being captured/previewed: index of the card last clicked.
-  const [activeIndex, setActiveIndex] = useState<number | null>(null);
+  const [uncontrolledActiveIndex, setUncontrolledActiveIndex] = useState<number | null>(null);
+  const activeIndex = onPresentationActiveIndexChange
+    ? presentationActiveIndex ?? null
+    : uncontrolledActiveIndex;
   const leftPreviewUrlRef = useRef<string | null>(null);
+  const setActivePresentationIndex = useCallback((index: number | null) => {
+    if (!onPresentationActiveIndexChange) setUncontrolledActiveIndex(index);
+    onPresentationActiveIndexChange?.(index);
+  }, [onPresentationActiveIndexChange]);
   // Off-screen <body>-level host (outside #root, so it escapes the app
   // theme). The capture card is portalled into it in the image theme;
   // captures clone from here, making them theme-independent.
@@ -201,16 +221,6 @@ export function ChatView({
     setPreview(null);
   }, []);
 
-  // Drop all session-only state when the user moves to a different sample.
-  useEffect(() => {
-    setEphemeralHighlights([]);
-    setCollapsedRegions([]);
-    setWrappedToolCalls(new Set());
-    collapseUndoRef.current = [];
-    collapseScrollAnchorRef.current = null;
-    closePreview();
-    setActiveIndex(null);
-  }, [sample.id, closePreview]);
 
   const newId = (prefix: string) =>
     (typeof crypto !== 'undefined' && 'randomUUID' in crypto)
@@ -323,7 +333,7 @@ export function ChatView({
   // whether it was reached by a click — which pre-sets `activeIndex` — or
   // by the `P` shortcut on a merely-hovered card.
   const buildCapturePng = useCallback(async (messageIndex: number) => {
-    flushSync(() => setActiveIndex(messageIndex));
+    flushSync(() => setActivePresentationIndex(messageIndex));
     const cardEl = captureHost.firstElementChild as HTMLElement | null;
     if (!cardEl) throw new Error('capture card is not mounted');
     const rawPng = await captureCardToPng(cardEl, { exportWidth, imageTheme, fontScale });
@@ -332,7 +342,7 @@ export function ChatView({
       `${sample.attributes.experiment_name} · rollout ${sample.attributes.rollout_n}` +
       ` · step ${sample.attributes.step}`;
     return { png, caption };
-  }, [captureHost, exportWidth, imageTheme, fontScale, buildLinkMeta, sample.attributes]);
+  }, [captureHost, exportWidth, imageTheme, fontScale, buildLinkMeta, sample.attributes, setActivePresentationIndex]);
 
   // P / camera button: capture straight to the clipboard.
   const captureMessage = useCallback(async (messageIndex: number) => {
@@ -361,8 +371,8 @@ export function ChatView({
   // A MessageCard reports its index when clicked; that card becomes the
   // subject of the off-screen capture portal and the left-panel preview.
   const handlePreviewSelect = useCallback((messageIndex: number) => {
-    setActiveIndex(messageIndex);
-  }, []);
+    setActivePresentationIndex(messageIndex);
+  }, [setActivePresentationIndex]);
 
   // Keep the left-panel preview in sync with the active (clicked) card.
   // Reads the off-screen portal card — rendered in the image theme — so the
@@ -385,7 +395,7 @@ export function ChatView({
       } catch { /* best-effort — leave the last preview in place */ }
     }, 380);
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [isPresentationMode, activeIndex, collapsedRegions, ephemeralHighlights, wrappedToolCalls, exportWidth, imageTheme, fontScale, onPresentationPreview, captureHost, buildLinkMeta]);
+  }, [isPresentationMode, activeIndex, displayedMessages, collapsedRegions, ephemeralHighlights, wrappedToolCalls, exportWidth, imageTheme, fontScale, onPresentationPreview, captureHost, buildLinkMeta]);
 
   // Free the left-panel preview URL on unmount.
   useEffect(() => () => {
@@ -437,9 +447,9 @@ export function ChatView({
     });
   }, []);
   
-  // Reset quote index when metric changes
-  useEffect(() => {
-    setCurrentQuoteIndex(0);
+  const currentQuoteIndex = quoteCursor.metric === selectedGradeMetric ? quoteCursor.index : 0;
+  const handleQuoteIndexChange = useCallback((index: number) => {
+    setQuoteCursor({ metric: selectedGradeMetric, index });
   }, [selectedGradeMetric]);
 
   // Find all matches in the current chat.
@@ -459,7 +469,7 @@ export function ChatView({
     const term = localSearchTerm.trim();
     if (!term) return [];
     const matches: LocalMatch[] = [];
-    sample.messages.forEach((message, messageIndex) => {
+    displayedMessages.forEach((message, messageIndex) => {
       const corpus = buildSearchCorpus(message);
       const found = findAllMatchesCI(corpus, term);
       for (let i = 0; i < found.length; i++) {
@@ -467,12 +477,14 @@ export function ChatView({
       }
     });
     return matches;
-  }, [sample.messages, localSearchTerm]);
+  }, [displayedMessages, localSearchTerm]);
 
-  // Reset current match when search term changes
-  useEffect(() => {
-    setCurrentMatchIndex(0);
-  }, [localSearchTerm]);
+  const currentMatchIndex = localMatches.length === 0
+    ? 0
+    : Math.min(
+      localMatchCursor.term === localSearchTerm ? localMatchCursor.index : 0,
+      localMatches.length - 1,
+    );
 
   // Scroll to current match
   const scrollToMatch = useCallback((matchIdx: number) => {
@@ -497,9 +509,9 @@ export function ChatView({
       newIndex = (currentMatchIndex - 1 + localMatches.length) % localMatches.length;
     }
     
-    setCurrentMatchIndex(newIndex);
+    setLocalMatchCursor({ term: localSearchTerm, index: newIndex });
     scrollToMatch(newIndex);
-  }, [currentMatchIndex, localMatches.length, scrollToMatch]);
+  }, [currentMatchIndex, localMatches.length, localSearchTerm, scrollToMatch]);
 
   // Handle keyboard shortcuts
   const handleSearchKeyDown = (e: React.KeyboardEvent) => {
@@ -915,7 +927,7 @@ export function ChatView({
         }}
         isDarkMode={isDarkMode}
         currentQuoteIndex={currentQuoteIndex}
-        onQuoteIndexChange={setCurrentQuoteIndex}
+        onQuoteIndexChange={handleQuoteIndexChange}
       />
 
       {/* Messages area — in presentation mode it also accepts a dropped PNG
@@ -926,7 +938,7 @@ export function ChatView({
         onDragOver={isPresentationMode ? (e) => e.preventDefault() : undefined}
         onDrop={isPresentationMode ? handlePngDrop : undefined}
       >
-        {sample.messages.map((message, index) => (
+        {displayedMessages.map((message, index) => (
           <div key={index} ref={(el) => setMessageRef(index, el)}>
             {renderMessageCard(message, index)}
           </div>
@@ -937,9 +949,9 @@ export function ChatView({
           theme, portalled outside #root. Captures and the left-panel preview
           clone from here, so the exported image stays independent of the
           app UI theme. */}
-      {isPresentationMode && activeIndex !== null && sample.messages[activeIndex] != null &&
+      {isPresentationMode && activeIndex !== null && displayedMessages[activeIndex] != null &&
         createPortal(
-          renderMessageCard(sample.messages[activeIndex], activeIndex, {
+          renderMessageCard(displayedMessages[activeIndex], activeIndex, {
             dark: imageTheme === 'dark',
             forCapture: true,
           }),

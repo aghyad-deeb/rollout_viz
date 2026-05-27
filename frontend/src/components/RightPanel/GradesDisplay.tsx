@@ -93,16 +93,11 @@ export function GradesDisplay({
   onQuoteIndexChange,
 }: GradesDisplayProps) {
   const [isExpanded, setIsExpanded] = useState(false);
-
-  if (!grades || Object.keys(grades).length === 0) {
-    return null;
-  }
-
-  const metrics = Object.entries(grades);
+  const metrics = useMemo(() => Object.entries(grades ?? {}), [grades]);
   
   // Get sorted quotes for the selected metric
   const selectedQuotes = useMemo(() => {
-    if (!selectedMetric || !grades[selectedMetric]) return [];
+    if (!selectedMetric || !grades?.[selectedMetric]) return [];
     const gradeList = grades[selectedMetric];
     const latest = gradeList[gradeList.length - 1];
     if (!latest?.quotes) return [];
@@ -112,6 +107,10 @@ export function GradesDisplay({
       return a.start - b.start;
     });
   }, [grades, selectedMetric]);
+
+  if (metrics.length === 0) {
+    return null;
+  }
 
   return (
     <div className={`border-b ${isDarkMode ? 'border-gray-700' : 'border-gray-200'}`}>

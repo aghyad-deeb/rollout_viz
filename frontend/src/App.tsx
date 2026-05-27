@@ -13,6 +13,7 @@ import { useDarkMode } from './hooks/useDarkMode';
 import { useUrlState } from './hooks/useUrlState';
 import { useGrading } from './hooks/useGrading';
 import { loadCaptureWidth, saveCaptureWidth, loadCaptureFontSize, saveCaptureFontSize } from './utils/captureImage';
+import { messageToPresentationDraft, type PresentationMessageDraft, type PresentationMessageDrafts } from './utils/presentationDraft';
 import type { Sample, SearchCondition, SearchLogic, ExportWidth, FontSize } from './types';
 
 // Helper to generate unique IDs
@@ -188,6 +189,8 @@ function App() {
   const [imageTheme, setImageTheme] = useState<'light' | 'dark'>('light');
   const [exportWidth, setExportWidth] = useState<ExportWidth>(loadCaptureWidth);
   const [fontSize, setFontSize] = useState<FontSize>(loadCaptureFontSize);
+  const [presentationActiveIndex, setPresentationActiveIndex] = useState<number | null>(null);
+  const [presentationDrafts, setPresentationDrafts] = useState<PresentationMessageDrafts>({});
   useEffect(() => {
     saveCaptureWidth(exportWidth);
     saveCaptureFontSize(fontSize);
@@ -366,7 +369,7 @@ function App() {
     let firstFileHandled = false;
 
     // Phase 1: progressive per-file metadata loading
-    loadFilesProgressively(filePaths, (fileSamples, _filePath) => {
+    loadFilesProgressively(filePaths, (fileSamples) => {
       // Called as each file completes — append samples with sequential IDs
       setSamples(prev => {
         const nextId = prev.length;
@@ -530,6 +533,44 @@ function App() {
 
   const selectedSample = samples.find(s => s.id === selectedSampleId) || null;
 
+  useEffect(() => {
+    setPresentationActiveIndex(null);
+    setPresentationDrafts({});
+    setPresentationPreview(null);
+  }, [selectedSample?.id]);
+
+  const activePresentationMessage = presentationActiveIndex !== null
+    ? selectedSample?.messages[presentationActiveIndex] ?? null
+    : null;
+
+  const activePresentationDraft = useMemo(() => {
+    if (presentationActiveIndex === null || !activePresentationMessage) return null;
+    return presentationDrafts[presentationActiveIndex] ?? messageToPresentationDraft(activePresentationMessage);
+  }, [activePresentationMessage, presentationActiveIndex, presentationDrafts]);
+
+  const activePresentationDraftDirty = useMemo(() => {
+    if (presentationActiveIndex === null || !activePresentationMessage || !activePresentationDraft) return false;
+    return JSON.stringify(activePresentationDraft) !== JSON.stringify(messageToPresentationDraft(activePresentationMessage));
+  }, [activePresentationDraft, activePresentationMessage, presentationActiveIndex]);
+
+  const updateActivePresentationDraft = useCallback((draft: PresentationMessageDraft) => {
+    if (presentationActiveIndex === null) return;
+    setPresentationDrafts((prev) => ({ ...prev, [presentationActiveIndex]: draft }));
+  }, [presentationActiveIndex]);
+
+  const resetActivePresentationDraft = useCallback(() => {
+    if (presentationActiveIndex === null) return;
+    setPresentationDrafts((prev) => {
+      const next = { ...prev };
+      delete next[presentationActiveIndex];
+      return next;
+    });
+  }, [presentationActiveIndex]);
+
+  const clearPresentationDrafts = useCallback(() => {
+    setPresentationDrafts({});
+  }, []);
+
   // Get the actual file path for links (use sample's source file or primary file)
   const getFilePathForSample = (sample: Sample | null): string => {
     return sample?.attributes.source_file || primaryFilePath;
@@ -651,6 +692,15 @@ function App() {
               onImageThemeChange={setImageTheme}
               onExportWidthChange={setExportWidth}
               onFontSizeChange={setFontSize}
+              activeMessageIndex={presentationActiveIndex}
+              messageCount={selectedSample?.messages.length ?? 0}
+              activeDraft={activePresentationDraft}
+              activeDraftDirty={activePresentationDraftDirty}
+              draftCount={Object.keys(presentationDrafts).length}
+              onActiveMessageIndexChange={setPresentationActiveIndex}
+              onActiveDraftChange={updateActivePresentationDraft}
+              onResetActiveDraft={resetActivePresentationDraft}
+              onClearDrafts={clearPresentationDrafts}
             />
           ) : isRolloutChatOpen ? (
             <RolloutChatPanel
@@ -717,6 +767,9 @@ function App() {
             imageTheme={imageTheme}
             exportWidth={exportWidth}
             fontSize={fontSize}
+            presentationDrafts={presentationDrafts}
+            presentationActiveIndex={presentationActiveIndex}
+            onPresentationActiveIndexChange={setPresentationActiveIndex}
           />
         </Panel>
       </PanelGroup>

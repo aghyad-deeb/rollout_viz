@@ -89,7 +89,7 @@ export function useApi(shareToken?: string | null) {
         setLoading(false);
       }
     }
-  }, []);
+  }, [shareHeaders]);
 
   // Load multiple files via batch endpoint (single request, server-side concurrency)
   const loadMultipleSamples = useCallback(async (filePaths: string[]): Promise<MultiFileSamplesResponse | null> => {
@@ -158,7 +158,7 @@ export function useApi(shareToken?: string | null) {
         setLoading(false);
       }
     }
-  }, []);
+  }, [shareHeaders]);
 
   // Progressive per-file metadata loading: fire individual requests per file,
   // call onFileLoaded as each completes. Clears loading spinner after first file.
@@ -248,7 +248,7 @@ export function useApi(shareToken?: string | null) {
         : '';
 
     return { experimentName };
-  }, []);
+  }, [shareHeaders]);
 
   // Load full samples with messages — second phase of two-phase loading (background)
   const loadMultipleSamplesFull = useCallback(async (filePaths: string[]): Promise<MultiFileSamplesResponse | null> => {
@@ -310,7 +310,7 @@ export function useApi(shareToken?: string | null) {
         setMessagesLoading(false);
       }
     }
-  }, []);
+  }, [shareHeaders]);
 
   // Load a single sample by ID (for on-demand message hydration)
   const loadSingleSample = useCallback(async (sampleId: number, filePath: string): Promise<Sample | null> => {
@@ -326,7 +326,7 @@ export function useApi(shareToken?: string | null) {
     } catch {
       return null;
     }
-  }, []);
+  }, [shareHeaders]);
 
   const listLocalFiles = useCallback(async (directory: string): Promise<FileInfo[]> => {
     setLoading(true);
@@ -348,7 +348,7 @@ export function useApi(shareToken?: string | null) {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [shareHeaders]);
 
   const listS3Files = useCallback(async (bucket: string, prefix: string): Promise<FileInfo[]> => {
     setLoading(true);
@@ -370,7 +370,7 @@ export function useApi(shareToken?: string | null) {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [shareHeaders]);
 
   return {
     loading,

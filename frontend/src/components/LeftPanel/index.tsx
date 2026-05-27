@@ -135,7 +135,7 @@ export function LeftPanel({
           break;
         
         case 'all':
-        default:
+        default: {
           const inMessages = sample.messages.some(msg => {
             const { reasoning, mainContent } = normalizeAssistantMessage(msg);
             const normalized = [mainContent, reasoning].filter(Boolean).join(' ');
@@ -150,6 +150,8 @@ export function LeftPanel({
             String(attrs.sample_index).includes(term);
           const inTimestamp = sample.timestamp.toLowerCase().includes(term);
           matches = inMessages || inAttributes || inTimestamp;
+          break;
+        }
       }
       
       return condition.operator === 'contains' ? matches : !matches;
@@ -342,6 +344,11 @@ export function LeftPanel({
     }
   };
 
+  const handleSelectSample = useCallback((id: number) => {
+    setCurrentOccurrenceIndex(0);
+    onSelectSample(id);
+  }, [onSelectSample]);
+
   // Notify parent of filtered samples changes
   useEffect(() => {
     onFilteredSamplesChange?.(filteredSamples);
@@ -380,10 +387,6 @@ export function LeftPanel({
     return count;
   }, [selectedSampleId, samples, searchConditions]);
 
-  // Reset occurrence index when sample changes
-  useEffect(() => {
-    setCurrentOccurrenceIndex(0);
-  }, [selectedSampleId]);
 
   // Navigate to next occurrence (Enter) - within sample first, then next sample
   const handleNavigateNextOccurrence = useCallback(() => {
@@ -400,9 +403,8 @@ export function LeftPanel({
       ? 0 
       : (currentMatchIndex + 1) % filteredSamples.length;
     
-    setCurrentOccurrenceIndex(0);
-    onSelectSample(filteredSamples[nextIndex].id);
-  }, [filteredSamples, currentMatchIndex, matchesInCurrentSample, currentOccurrenceIndex, onSelectSample]);
+    handleSelectSample(filteredSamples[nextIndex].id);
+  }, [filteredSamples, currentMatchIndex, matchesInCurrentSample, currentOccurrenceIndex, handleSelectSample]);
 
   // Navigate to next sample (Shift+Enter) - always go to next sample
   const handleNavigateNextSample = useCallback(() => {
@@ -412,9 +414,8 @@ export function LeftPanel({
       ? 0 
       : (currentMatchIndex + 1) % filteredSamples.length;
     
-    setCurrentOccurrenceIndex(0);
-    onSelectSample(filteredSamples[nextIndex].id);
-  }, [filteredSamples, currentMatchIndex, onSelectSample]);
+    handleSelectSample(filteredSamples[nextIndex].id);
+  }, [filteredSamples, currentMatchIndex, handleSelectSample]);
 
   // Navigate to previous sample
   const handleNavigatePrevSample = useCallback(() => {
@@ -424,9 +425,8 @@ export function LeftPanel({
       ? filteredSamples.length - 1 
       : currentMatchIndex - 1;
     
-    setCurrentOccurrenceIndex(0);
-    onSelectSample(filteredSamples[prevIndex].id);
-  }, [filteredSamples, currentMatchIndex, onSelectSample]);
+    handleSelectSample(filteredSamples[prevIndex].id);
+  }, [filteredSamples, currentMatchIndex, handleSelectSample]);
 
   return (
     <div className={`h-full flex flex-col ${isDarkMode ? 'bg-[#1a1a2e] text-gray-200' : 'bg-white text-gray-900'}`}>
@@ -537,7 +537,7 @@ export function LeftPanel({
           <SampleTable
             samples={filteredSamples}
             selectedSampleId={selectedSampleId}
-            onSelectSample={onSelectSample}
+            onSelectSample={handleSelectSample}
             sortColumn={sortColumn}
             sortOrder={sortOrder}
             onSort={handleSort}
