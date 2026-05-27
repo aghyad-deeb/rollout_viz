@@ -21,11 +21,14 @@ export function useDarkMode() {
   });
 
   useEffect(() => {
-    // Update document class
+    // Update theme class. It lives on #root (not <html>) so off-screen
+    // capture containers appended to <body> are outside it — letting a
+    // capture render in its own image-theme, independent of the UI theme.
+    const themeRoot = document.getElementById('root') ?? document.documentElement;
     if (isDarkMode) {
-      document.documentElement.classList.add('dark');
+      themeRoot.classList.add('dark');
     } else {
-      document.documentElement.classList.remove('dark');
+      themeRoot.classList.remove('dark');
     }
     
     // Persist to localStorage

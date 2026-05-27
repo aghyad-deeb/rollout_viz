@@ -37,7 +37,7 @@ export function FileBrowser({
   onToggleMark,
   isDarkMode,
 }: FileBrowserProps) {
-  const [directoryPath, setDirectoryPath] = useState('');
+  const [directoryPath, setDirectoryPath] = useState('s3://rewardseeker/logs_jsonl/');
   const [currentPath, setCurrentPath] = useState(''); // The path we're currently viewing
   const [folders, setFolders] = useState<FolderInfo[]>([]);
   const [files, setFiles] = useState<FileInfoExtended[]>([]);
@@ -148,13 +148,16 @@ export function FileBrowser({
     }
   }, []);
 
-  // Reset state when modal opens
+  // Auto-load default path when modal opens
   useEffect(() => {
     if (isOpen) {
-      // Don't reset path if user had entered one
       setError(null);
+      // Auto-fetch if there's a pre-filled path and nothing loaded yet
+      if (directoryPath.trim() && folders.length === 0 && files.length === 0 && !currentPath) {
+        fetchContents(directoryPath);
+      }
     }
-  }, [isOpen]);
+  }, [isOpen]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleNavigate = () => {
     fetchContents(directoryPath);
@@ -352,15 +355,17 @@ export function FileBrowser({
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       {/* Backdrop */}
       <div
         className="absolute inset-0 bg-black/50"
         onClick={onClose}
       />
 
-      {/* Modal */}
-      <div className={`relative rounded-lg shadow-xl w-[800px] max-h-[80vh] flex flex-col ${isDarkMode ? 'bg-gray-900' : 'bg-white'}`}>
+      {/* Modal — `max-h-full` relies on the outer p-4 gutter; `overflow-hidden`
+          clips any stray child so the rounded corners stay clean and the
+          inner scroll area is the single scroll surface. */}
+      <div className={`relative rounded-lg shadow-xl w-full max-w-[800px] max-h-full flex flex-col overflow-hidden ${isDarkMode ? 'bg-gray-900' : 'bg-white'}`}>
         {/* Header */}
         <div className={`flex items-center justify-between px-4 py-3 border-b ${isDarkMode ? 'border-gray-700' : 'border-gray-200'}`}>
           <h2 className={`text-lg font-semibold flex items-center gap-2 ${isDarkMode ? 'text-gray-200' : 'text-gray-800'}`}>
@@ -380,14 +385,14 @@ export function FileBrowser({
           <label className={`block text-sm font-medium mb-2 ${isDarkMode ? 'text-gray-300' : 'text-gray-700'}`}>
             Enter S3 path or local directory:
           </label>
-          <div className="flex gap-2">
+          <div className="flex gap-2 flex-wrap">
             <input
               type="text"
               value={directoryPath}
               onChange={(e) => setDirectoryPath(e.target.value)}
               onKeyDown={handleKeyDown}
               placeholder="s3://bucket/prefix or /path/to/local/dir"
-              className={`flex-1 px-3 py-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-sm ${isDarkMode ? 'bg-gray-800 border-gray-600 text-gray-200 placeholder-gray-500' : 'border-gray-300'}`}
+              className={`flex-1 min-w-[200px] px-3 py-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-sm ${isDarkMode ? 'bg-gray-800 border-gray-600 text-gray-200 placeholder-gray-500' : 'border-gray-300'}`}
             />
             <button
               onClick={handleNavigate}
@@ -471,8 +476,8 @@ export function FileBrowser({
           </div>
 
           {/* Stats and controls */}
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-4">
+          <div className="flex items-center justify-between flex-wrap gap-y-2">
+            <div className="flex items-center gap-4 flex-wrap">
               <div className="flex items-center gap-2">
                 {folders.length > 0 && (
                   <span className={`text-sm ${isDarkMode ? 'text-gray-400' : 'text-gray-600'}`}>
@@ -526,8 +531,10 @@ export function FileBrowser({
           </div>
         </div>
 
-        {/* File list */}
-        <div className="flex-1 overflow-auto min-h-[300px]">
+        {/* File list — `min-h-0` lets this flex child shrink below its
+            content size so the footer stays visible on short viewports.
+            The internal `overflow-auto` provides the scroll. */}
+        <div className="flex-1 overflow-auto min-h-0">
           {error && (
             <div className={`p-4 text-center ${isDarkMode ? 'text-red-400' : 'text-red-500'}`}>
               <span className="material-symbols-outlined">error</span>
@@ -715,11 +722,11 @@ export function FileBrowser({
         </div>
 
         {/* Footer */}
-        <div className={`px-4 py-3 border-t flex items-center justify-between ${isDarkMode ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-gray-50'}`}>
+        <div className={`px-4 py-3 border-t flex items-center justify-between flex-wrap gap-2 ${isDarkMode ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-gray-50'}`}>
           <p className={`text-xs ${isDarkMode ? 'text-gray-500' : 'text-gray-400'}`}>
             Click to select files, double-click to load single file
           </p>
-          <div className="flex gap-2">
+          <div className="flex gap-2 flex-wrap">
             <button
               onClick={onClose}
               className={`px-4 py-2 border rounded-md transition-colors ${isDarkMode ? 'text-gray-300 bg-gray-700 border-gray-600 hover:bg-gray-600' : 'text-gray-700 bg-white border-gray-300 hover:bg-gray-50'}`}

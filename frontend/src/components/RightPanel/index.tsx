@@ -1,5 +1,5 @@
 import { useState, lazy, Suspense } from 'react';
-import type { Sample, ViewMode, SearchCondition } from '../../types';
+import type { Sample, ViewMode, SearchCondition, ExportWidth, FontSize } from '../../types';
 import { NavigationBar } from './NavigationBar';
 import { ChatView } from './ChatView';
 
@@ -21,6 +21,22 @@ interface RightPanelProps {
   onClearHighlight: () => void;
   selectedGradeMetric?: string;
   onSelectGradeMetric?: (metric: string | undefined) => void;
+  isSharedMode?: boolean;
+  shareToken?: string | null;
+  // Position of the selected sample inside its JSONL file — passed to share
+  // link creation so the backend can pin the recipient to the exact row.
+  selectedIndexInFile?: number;
+  // Presentation Mode + capture settings — lifted to App so the left panel
+  // can show the preview and host the capture-settings controls.
+  isPresentationMode?: boolean;
+  onTogglePresentationMode?: () => void;
+  // "Discuss this rollout" chat toggle.
+  isRolloutChatOpen?: boolean;
+  onToggleRolloutChat?: () => void;
+  onPresentationPreview?: (url: string | null, blob?: Blob | null) => void;
+  imageTheme?: 'light' | 'dark';
+  exportWidth?: ExportWidth;
+  fontSize?: FontSize;
 }
 
 export function RightPanel({
@@ -39,8 +55,23 @@ export function RightPanel({
   onClearHighlight,
   selectedGradeMetric,
   onSelectGradeMetric,
+  isSharedMode = false,
+  shareToken,
+  selectedIndexInFile,
+  isPresentationMode = false,
+  onTogglePresentationMode,
+  isRolloutChatOpen = false,
+  onToggleRolloutChat,
+  onPresentationPreview,
+  imageTheme = 'light',
+  exportWidth = 'paper1',
+  fontSize = 'md',
 }: RightPanelProps) {
   const [viewMode, setViewMode] = useState<ViewMode>('chat');
+
+  // The right panel always follows the app UI theme. The capture's image
+  // theme is independent and applied only to the off-screen capture render
+  // (in ChatView), so toggling it no longer re-themes this panel.
 
   const renderContent = () => {
     if (viewMode === 'analysis') {
@@ -84,6 +115,14 @@ export function RightPanel({
           onClearHighlight={onClearHighlight}
           selectedGradeMetric={selectedGradeMetric}
           onSelectGradeMetric={onSelectGradeMetric}
+          isSharedMode={isSharedMode}
+          shareToken={shareToken}
+          selectedIndexInFile={selectedIndexInFile}
+          isPresentationMode={isPresentationMode}
+          imageTheme={imageTheme}
+          exportWidth={exportWidth}
+          fontSize={fontSize}
+          onPresentationPreview={onPresentationPreview}
         />
       );
     }
@@ -110,6 +149,15 @@ export function RightPanel({
         generateLink={generateLink}
         viewMode={viewMode}
         onViewModeChange={setViewMode}
+        isSharedMode={isSharedMode}
+        highlightedMessageIndex={highlightedMessageIndex}
+        highlightedText={highlightedText}
+        shareToken={shareToken}
+        selectedIndexInFile={selectedIndexInFile}
+        isPresentationMode={isPresentationMode}
+        onTogglePresentationMode={onTogglePresentationMode}
+        isRolloutChatOpen={isRolloutChatOpen}
+        onToggleRolloutChat={onToggleRolloutChat}
       />
       
       <div className="flex-1 overflow-hidden">

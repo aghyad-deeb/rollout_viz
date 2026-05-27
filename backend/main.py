@@ -5,6 +5,7 @@ Provides REST API endpoints for loading JSONL data from local files or S3.
 """
 
 import asyncio
+import copy
 import json
 import os
 import secrets
@@ -14,11 +15,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+import hmac as _hmac
+import tempfile
+import posixpath
+from urllib.parse import unquote
+
+import httpx
 import orjson
-from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, ORJSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, ORJSONResponse, StreamingResponse
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from pydantic import BaseModel
 from starlette.middleware.gzip import GZipMiddleware
@@ -33,6 +39,19 @@ from backend.llm_providers import (
 
 # Project root directory (parent of backend/)
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
+FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
+FRONTEND_INDEX = FRONTEND_DIST / "index.html"
+
+# Never serve Vite/dev-only or local project internals from the public SPA fallback.
+_DENIED_FRONTEND_PREFIXES = ("@fs", "@vite", "node_modules", "src")
+_DENIED_FRONTEND_FILES = {
+    "package.json",
+    "package-lock.json",
+    "vite.config.ts",
+    "tsconfig.json",
+    "tsconfig.app.json",
+    "tsconfig.node.json",
+}
 
 # Load environment variables exclusively from ~/.env
 # All config (API keys, VIZ_PASSWORD, etc.) lives in one place
@@ -51,6 +70,10 @@ if _env_file.exists():
 else:
     print(f"[CONFIG] WARNING: {_env_file} not found")
 
+# Shared tinker_service (stateless model-inference proxy in the monorepo).
+# Used by the "discuss this rollout" chat feature via its litellm provider.
+TINKER_SERVICE_URL = (_env_config.get("TINKER_SERVICE_URL") or "http://localhost:8235").rstrip("/")
+
 # API key environment variable names for each provider
 API_KEY_ENV_VARS = {
     "openai": "OPENAI_API_KEY",
@@ -64,18 +87,41 @@ def get_env_api_key(provider: str) -> Optional[str]:
     """Get API key from ~/.env for a provider (ignores shell environment)."""
     env_var = API_KEY_ENV_VARS.get(provider)
     if env_var:
-        key = _env_config.get(env_var)
-        if key:
-            print(f"[DEBUG] {provider} key loaded: {key[:15]}...{key[-5:]} (len={len(key)})")
-        return key
+        return _env_config.get(env_var)
     return None
 
-app = FastAPI(title="Rollout Visualizer API")
 
-# CORS middleware for development
+# S3 bucket allowlist: only these buckets can be accessed.
+# Set VIZ_ALLOWED_S3_BUCKETS=bucket1,bucket2 in ~/.env to restrict.
+_allowed_s3_raw = _env_config.get("VIZ_ALLOWED_S3_BUCKETS", "")
+VIZ_ALLOWED_S3_BUCKETS: Optional[set] = (
+    {b.strip() for b in _allowed_s3_raw.split(",") if b.strip()} if _allowed_s3_raw else None
+)
+_cors_origins_raw = _env_config.get("VIZ_CORS_ORIGINS", "")
+VIZ_CORS_ORIGINS = [origin.strip() for origin in _cors_origins_raw.split(",") if origin.strip()]
+
+# Max JSONL file size to load (prevents OOM). Default 500 MB.
+MAX_FILE_SIZE = int(_env_config.get("VIZ_MAX_FILE_SIZE_MB", "500")) * 1024 * 1024
+
+
+def _validate_s3_bucket(bucket: str) -> None:
+    """Raise ValueError if the bucket is not in the allowlist (when configured)."""
+    if VIZ_ALLOWED_S3_BUCKETS is not None and bucket not in VIZ_ALLOWED_S3_BUCKETS:
+        raise ValueError(f"S3 bucket not allowed: {bucket}")
+
+
+def _safe_error_detail(e: Exception) -> str:
+    """Return a generic error message for client responses. Logs the real error server-side."""
+    print(f"[ERROR] {type(e).__name__}: {e}")
+    return "Internal server error"
+
+app = FastAPI(title="Rollout Visualizer API", docs_url=None, redoc_url=None, openapi_url=None)
+
+# Optional CORS for development. The Vite dev server proxies /api by default,
+# so production and normal dev use same-origin requests and need no CORS.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173"],
+    allow_origins=VIZ_CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -84,12 +130,48 @@ app.add_middleware(
 # GZip compression for responses > 1KB
 app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=1)
 
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    """Add security headers to all responses."""
+    response = await call_next(request)
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=(), payment=()"
+    # img-src needs `blob:` for capture-preview images (URL.createObjectURL);
+    # connect-src needs the Google Fonts origins so the image-capture step
+    # can fetch + embed the icon/text fonts into the snapshot.
+    csp = "frame-ancestors 'none'; default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; connect-src 'self' https://fonts.googleapis.com https://fonts.gstatic.com; img-src 'self' data: blob:; object-src 'none'; base-uri 'self'"
+    response.headers["Content-Security-Policy"] = csp
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    if proto == "https":
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
+
 # --- Password authentication ---
-VIZ_PASSWORD = _env_config.get("VIZ_PASSWORD")
+_raw_password = _env_config.get("VIZ_PASSWORD")
+if _raw_password is not None and _raw_password == "":
+    print("[AUTH] WARNING: VIZ_PASSWORD is set to empty string — treating as unset (no auth)")
+    _raw_password = None
+VIZ_PASSWORD = _raw_password
 SECRET_KEY = _env_config.get("VIZ_SECRET_KEY", secrets.token_hex(32))
 cookie_serializer = URLSafeTimedSerializer(SECRET_KEY)
+
+
+def _password_version() -> str:
+    """HMAC of the password keyed by SECRET_KEY. Embedded in session cookies so
+    changing the password automatically invalidates sessions. Uses HMAC so the
+    value is meaningless without SECRET_KEY (unlike a plain hash)."""
+    if not VIZ_PASSWORD:
+        return ""
+    return _hmac.new(SECRET_KEY.encode(), VIZ_PASSWORD.encode(), "sha256").hexdigest()[:16]
 COOKIE_MAX_AGE = 30 * 24 * 3600  # 30 days
-AUTH_EXEMPT_PATHS = {"/api/auth/login", "/api/auth/check", "/api/health", "/api/debug/clear-cache"}
+AUTH_EXEMPT_PATHS = {"/api/auth/login", "/api/auth/check", "/api/health", "/api/share/verify"}
+
+# --- Signed share links (read-only access to specific rollouts) ---
+SHARE_MAX_AGE = 90 * 24 * 3600  # 90 days
+share_serializer = URLSafeTimedSerializer(SECRET_KEY, salt="share-link")
 
 # Simple in-memory rate limiter for login attempts
 _login_attempts: Dict[str, List[float]] = {}
@@ -100,9 +182,14 @@ RATE_LIMIT_MAX = 5
 def _check_rate_limit(client_ip: str) -> bool:
     """Return True if the request should be rate-limited."""
     now = time.time()
+    cutoff = now - RATE_LIMIT_WINDOW
+    # Evict only expired entries (preserves active rate limits, unlike clear())
+    if len(_login_attempts) > 10_000:
+        expired = [ip for ip, times in _login_attempts.items() if not times or max(times) < cutoff]
+        for ip in expired:
+            del _login_attempts[ip]
     attempts = _login_attempts.get(client_ip, [])
-    # Prune old attempts
-    attempts = [t for t in attempts if now - t < RATE_LIMIT_WINDOW]
+    attempts = [t for t in attempts if t >= cutoff]
     _login_attempts[client_ip] = attempts
     return len(attempts) >= RATE_LIMIT_MAX
 
@@ -135,21 +222,58 @@ async def timing_middleware(request: Request, call_next):
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    if not VIZ_PASSWORD:
-        return await call_next(request)
-    if request.url.path in AUTH_EXEMPT_PATHS:
-        return await call_next(request)
-    # Only protect /api/* routes
+    # Non-API routes always pass (static frontend files)
     if not request.url.path.startswith("/api"):
         return await call_next(request)
-    # Check session cookie
+
+    # Auth-exempt paths always pass
+    if request.url.path in AUTH_EXEMPT_PATHS:
+        return await call_next(request)
+
+    # 1) Session cookie → full access
     session_cookie = request.cookies.get("viz_session")
     if session_cookie:
         try:
-            cookie_serializer.loads(session_cookie, max_age=COOKIE_MAX_AGE)
+            payload = cookie_serializer.loads(session_cookie, max_age=COOKIE_MAX_AGE)
+            if not isinstance(payload, dict) or not payload.get("auth"):
+                raise BadSignature("legacy cookie format")
+            if payload.get("pv", "") != _password_version():
+                raise BadSignature("password changed")
+            request.state.access_level = "full"
             return await call_next(request)
         except (BadSignature, SignatureExpired):
             pass
+
+    # 2) No password configured → full access for everyone
+    if not VIZ_PASSWORD:
+        request.state.access_level = "full"
+        return await call_next(request)
+
+    # 3) Share token → limited read-only access to specific file/samples
+    share_token = request.headers.get("x-share-token")
+    if share_token:
+        try:
+            payload = share_serializer.loads(share_token, max_age=SHARE_MAX_AGE)
+            method = request.method
+            path = request.url.path
+
+            allowed = (
+                (method == "GET" and path == "/api/samples")
+                or (method == "GET" and path.startswith("/api/sample/"))
+            )
+            if not allowed:
+                return JSONResponse(status_code=403, content={"detail": "Not authorized in shared mode"})
+
+            file_param = request.query_params.get("file")
+            if file_param is None or file_param != payload.get("f"):
+                return JSONResponse(status_code=403, content={"detail": "File not authorized for this share link"})
+
+            request.state.access_level = "share"
+            request.state.share_payload = payload
+            return await call_next(request)
+        except (SignatureExpired, BadSignature):
+            return JSONResponse(status_code=401, content={"detail": "Invalid or expired share link"})
+
     return JSONResponse(status_code=401, content={"detail": "Authentication required"})
 
 
@@ -170,16 +294,16 @@ async def auth_login(body: LoginRequest, request: Request, response: Response):
         _record_failed_attempt(client_ip)
         return JSONResponse(status_code=401, content={"detail": "Invalid password"})
     _clear_attempts(client_ip)
-    token = cookie_serializer.dumps("authenticated")
+    token = cookie_serializer.dumps({"auth": True, "pv": _password_version()})
     response = JSONResponse(content={"ok": True})
-    # Only set Secure flag when not on localhost (HTTP)
-    is_localhost = request.url.hostname in ("localhost", "127.0.0.1")
+    # Use X-Forwarded-Proto to detect HTTPS behind reverse proxies (Cloudflare, etc.)
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
     response.set_cookie(
         key="viz_session",
         value=token,
         max_age=COOKIE_MAX_AGE,
         httponly=True,
-        secure=not is_localhost,
+        secure=(proto == "https"),
         samesite="lax",
     )
     return response
@@ -193,17 +317,91 @@ async def auth_check(request: Request):
     session_cookie = request.cookies.get("viz_session")
     if session_cookie:
         try:
-            cookie_serializer.loads(session_cookie, max_age=COOKIE_MAX_AGE)
+            payload = cookie_serializer.loads(session_cookie, max_age=COOKIE_MAX_AGE)
+            if not isinstance(payload, dict) or not payload.get("auth"):
+                raise BadSignature("legacy cookie format")
+            if payload.get("pv", "") != _password_version():
+                raise BadSignature("password changed")
             return {"auth_required": True, "authenticated": True}
         except (BadSignature, SignatureExpired):
             pass
     return {"auth_required": True, "authenticated": False}
 
 
+@app.post("/api/auth/logout")
+async def auth_logout(request: Request):
+    """Clear the session cookie."""
+    resp = JSONResponse(content={"ok": True})
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    resp.delete_cookie("viz_session", httponly=True, secure=(proto == "https"), samesite="lax")
+    return resp
+
+
 if VIZ_PASSWORD:
     print(f"[AUTH] Password protection enabled")
 else:
     print(f"[AUTH] No VIZ_PASSWORD set — authentication disabled")
+
+if not _env_config.get("VIZ_SECRET_KEY"):
+    print(f"[AUTH] WARNING: VIZ_SECRET_KEY not set — sessions and share links will not survive restarts")
+
+if VIZ_ALLOWED_S3_BUCKETS is None and any(k.startswith("AWS_") for k in _env_config):
+    print(f"[SECURITY] WARNING: VIZ_ALLOWED_S3_BUCKETS not set — all S3 buckets accessible to configured AWS credentials")
+
+
+class CreateShareRequest(BaseModel):
+    """Request to create a signed share link."""
+    file: str
+    rollout: Optional[int] = None
+    step: Optional[int] = None
+    # File-relative index of the target sample. Two samples in the same file
+    # can share the same (rollout_n, step) tuple, so filtering by those alone
+    # can point the recipient at the wrong row. When `index` is present the
+    # backend treats it as the authoritative disambiguator.
+    index: Optional[int] = None
+
+
+@app.post("/api/share/create")
+async def create_share_link(body: CreateShareRequest):
+    """Create a signed share token for read-only access to specific samples.
+
+    Requires full authentication (enforced by auth_middleware).
+    Validates that the file path is within allowed boundaries.
+    """
+    try:
+        if body.file.startswith("s3://"):
+            s3_path = body.file[5:]
+            bucket = s3_path.split("/", 1)[0]
+            _validate_s3_bucket(bucket)
+        else:
+            _safe_resolve_path(body.file)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid file path")
+    payload: Dict[str, Any] = {"f": body.file}
+    if body.rollout is not None:
+        payload["r"] = body.rollout
+    if body.step is not None:
+        payload["s"] = body.step
+    if body.index is not None:
+        payload["i"] = body.index
+    token = share_serializer.dumps(payload)
+    return {"token": token, "expires_in_days": SHARE_MAX_AGE // 86400}
+
+
+@app.get("/api/share/verify")
+async def verify_share_link(token: str = Query(...)):
+    """Verify a share token and return its allowed scope. Public endpoint."""
+    try:
+        payload = share_serializer.loads(token, max_age=SHARE_MAX_AGE)
+        return {
+            "valid": True,
+            "file": payload["f"],
+            "rollout": payload.get("r"),
+            "step": payload.get("s"),
+            "index": payload.get("i"),
+        }
+    except (SignatureExpired, BadSignature):
+        return {"valid": False}
 
 
 class Message(BaseModel):
@@ -263,19 +461,23 @@ class GradeEntry(BaseModel):
     timestamp: str
 
 
+_GRADE_MAX_SAMPLES = 10_000
+_GRADE_MAX_PROMPT_LEN = 50_000
+_GLOBAL_GRADING_SEM = asyncio.Semaphore(500)
+
 class GradeRequest(BaseModel):
     """Request to grade samples."""
     file_path: str
-    sample_ids: List[int]  # Which samples to grade
+    sample_ids: List[int]  # Which samples to grade (max 10k per request)
     metric_name: str
-    metric_prompt: str  # The grading prompt
+    metric_prompt: str  # The grading prompt (max 50k chars)
     grade_type: str  # "float", "int", "bool"
     provider: str  # "openai", "anthropic", "google", "openrouter"
     model: str  # e.g., "gpt-4o", "claude-3-opus"
-    api_key: Optional[str] = None  # Optional - will use .env if not provided
+    api_key: Optional[str] = None  # Optional - will use .env if not provided (max 500 chars)
     parallel_size: int = 100  # Number of concurrent requests
     require_quotes: bool = True  # Whether to require quotes from the model
-    max_quote_retries: int = 2  # Max retries if quotes are required but missing
+    max_quote_retries: int = 2  # Max retries if quotes are required but missing (capped at 5)
     # Advanced settings
     temperature: Optional[float] = None  # 0.0 - 2.0, None = model default
     max_tokens: Optional[int] = None  # Max output tokens
@@ -297,7 +499,7 @@ class SaveGradedRequest(BaseModel):
 
 class BatchSamplesRequest(BaseModel):
     """Request to load samples from multiple files in one request."""
-    files: List[str]
+    files: List[str]  # max 50 files per request
     metadata_only: bool = False
 
 
@@ -310,31 +512,29 @@ class PresetMetricInfo(BaseModel):
     is_custom: bool = False  # True if user-created
 
 
-def load_env_credentials():
-    """Set AWS credentials from ~/.env config into os.environ for boto3."""
-    for key in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_DEFAULT_REGION"):
-        if key in _env_config:
-            os.environ[key] = _env_config[key]
-
-
 # --- S3 client singleton ---
 _s3_client = None
 
 
 def _get_s3_client():
-    """Get or create a cached S3 client (singleton). Calls load_env_credentials() once."""
+    """Get or create a cached S3 client (singleton).
+    Passes AWS credentials directly via boto3.Session instead of os.environ."""
     global _s3_client
     if _s3_client is None:
         import boto3
         from botocore.config import Config as BotoConfig
-        load_env_credentials()
         s3_config = BotoConfig(
             max_pool_connections=25,
             connect_timeout=5,
             read_timeout=30,
             retries={'max_attempts': 3, 'mode': 'standard'},
         )
-        _s3_client = boto3.client('s3', config=s3_config)
+        session = boto3.Session(
+            aws_access_key_id=_env_config.get("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=_env_config.get("AWS_SECRET_ACCESS_KEY"),
+            region_name=_env_config.get("AWS_DEFAULT_REGION"),
+        )
+        _s3_client = session.client('s3', config=s3_config)
     return _s3_client
 
 
@@ -357,6 +557,7 @@ def _clear_file_cache():
 # --- viz_file_exists() TTL cache ---
 _viz_exists_cache: Dict[str, tuple] = {}  # path -> (timestamp, bool)
 _VIZ_EXISTS_TTL = 60  # seconds
+_VIZ_EXISTS_MAX = 5000
 
 
 def _clear_viz_exists_cache():
@@ -381,7 +582,10 @@ def load_jsonl_from_file(file_path: str) -> List[Dict[str, Any]]:
     """Load JSONL data from a local file. Caches by path + mtime."""
     path = _safe_resolve_path(file_path)
     path_str = str(path)
-    current_mtime = path.stat().st_mtime
+    stat = path.stat()
+    current_mtime = stat.st_mtime
+    if stat.st_size > MAX_FILE_SIZE:
+        raise ValueError(f"File too large ({stat.st_size // (1024*1024)}MB, max {MAX_FILE_SIZE // (1024*1024)}MB)")
 
     # Check cache
     if path_str in _file_cache:
@@ -446,6 +650,7 @@ def load_jsonl_from_s3(bucket: str, key: str) -> List[Dict[str, Any]]:
     On cold cache: uses head_object to get size, then parallel Range downloads
     for files above the multipart threshold (~2x faster than single-stream).
     """
+    _validate_s3_bucket(bucket)
     cache_key = f"s3://{bucket}/{key}"
     s3_client = _get_s3_client()
 
@@ -460,6 +665,8 @@ def load_jsonl_from_s3(bucket: str, key: str) -> List[Dict[str, Any]]:
     head = s3_client.head_object(Bucket=bucket, Key=key)
     size = head['ContentLength']
     etag = head.get('ETag', '')
+    if size > MAX_FILE_SIZE:
+        raise ValueError(f"S3 file too large ({size // (1024*1024)}MB, max {MAX_FILE_SIZE // (1024*1024)}MB)")
 
     if size > _S3_MULTIPART_THRESHOLD:
         content = _download_s3_chunked(s3_client, bucket, key, size)
@@ -485,6 +692,7 @@ def load_jsonl_from_s3(bucket: str, key: str) -> List[Dict[str, Any]]:
 
 def list_s3_files(bucket: str, prefix: str = "") -> List[Dict[str, Any]]:
     """List JSONL files in S3."""
+    _validate_s3_bucket(bucket)
     s3_client = _get_s3_client()
     
     paginator = s3_client.get_paginator('list_objects_v2')
@@ -504,6 +712,7 @@ def list_s3_files(bucket: str, prefix: str = "") -> List[Dict[str, Any]]:
 
 def list_s3_contents(bucket: str, prefix: str = "") -> Dict[str, List[Dict[str, Any]]]:
     """List both folders and JSONL files in S3 at the given prefix level (non-recursive)."""
+    _validate_s3_bucket(bucket)
     s3_client = _get_s3_client()
     
     # Ensure prefix ends with / if it's not empty
@@ -623,7 +832,7 @@ async def get_local_files(directory: str = Query(default=".")):
         files = list_local_files(directory)
         return files
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_safe_error_detail(e))
 
 
 @app.get("/api/files/s3", response_model=List[FileInfo])
@@ -636,7 +845,7 @@ async def get_s3_files(
         files = list_s3_files(bucket, prefix)
         return files
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_safe_error_detail(e))
 
 
 @app.get("/api/contents/local")
@@ -646,7 +855,7 @@ async def get_local_contents(directory: str = Query(default=".")):
         contents = list_local_contents(directory)
         return contents
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_safe_error_detail(e))
 
 
 @app.get("/api/contents/s3")
@@ -659,7 +868,7 @@ async def get_s3_contents(
         contents = list_s3_contents(bucket, prefix)
         return contents
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_safe_error_detail(e))
 
 
 _ATTR_DEFAULTS = {
@@ -692,7 +901,7 @@ def _load_samples_sync(file: str, metadata_only: bool = False) -> dict:
     experiment_name = "unknown"
 
     for i, raw in enumerate(raw_samples):
-        attrs = raw.get('attributes', {})
+        attrs = dict(raw.get('attributes', {}))
         if experiment_name == "unknown":
             experiment_name = attrs.get('experiment_name', 'unknown')
 
@@ -728,6 +937,8 @@ def _load_samples_sync(file: str, metadata_only: bool = False) -> dict:
             "attributes": filled_attrs,
             "timestamp": raw.get('timestamp', ''),
             "grades": grades,
+            "raw_messages": [] if metadata_only else raw.get('raw_messages'),
+            "raw_jsonl_entry": None if metadata_only else raw,
         })
 
     return {
@@ -741,6 +952,7 @@ def _load_samples_sync(file: str, metadata_only: bool = False) -> dict:
 
 @app.get("/api/samples")
 async def get_samples(
+    request: Request,
     file: str = Query(..., description="Path to JSONL file (local path or s3://bucket/key)")
 ):
     """Load samples from a JSONL file.
@@ -748,14 +960,40 @@ async def get_samples(
     Automatically checks for a viz/ version first (which includes grades).
     Falls back to the original file if viz/ doesn't exist.
     Runs in a thread so multiple requests can load concurrently.
+
+    In share mode, filters samples to only those matching the token's
+    rollout/step constraints.
     """
     try:
         data = await asyncio.to_thread(_load_samples_sync, file)
+
+        # Share mode: restrict to only the authorized samples
+        if getattr(request.state, 'access_level', None) == 'share':
+            payload = getattr(request.state, 'share_payload', {})
+            samples = data["samples"]
+            i = payload.get("i")
+            if i is not None:
+                # Authoritative: exact file-relative position. Picks the one
+                # row the creator clicked even when (rollout_n, step) isn't
+                # unique within the file.
+                samples = [samples[i]] if 0 <= i < len(samples) else []
+            else:
+                # Legacy tokens (minted before `i` was added) — filter by
+                # rollout/step. These may surface more than one sample when
+                # (rollout_n, step) collides; the frontend picks samples[0].
+                r = payload.get("r")
+                s = payload.get("s")
+                if r is not None:
+                    samples = [sm for sm in samples if sm["attributes"].get("rollout_n") == r]
+                if s is not None:
+                    samples = [sm for sm in samples if sm["attributes"].get("step") == s]
+            data = {**data, "samples": samples, "total": len(samples)}
+
         return ORJSONResponse(content=data)
     except FileNotFoundError:
-        raise HTTPException(status_code=404, detail=f"File not found: {file}")
+        raise HTTPException(status_code=404, detail="File not found")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_safe_error_detail(e))
 
 
 def _load_samples_batch_sync(files: List[str], metadata_only: bool = False) -> dict:
@@ -790,8 +1028,8 @@ def _load_samples_batch_sync(files: List[str], metadata_only: bool = False) -> d
             try:
                 s3_path = file_path[5:]
                 bucket, key = s3_path.split("/", 1)
+                _validate_s3_bucket(bucket)
 
-                # Check viz/ version
                 viz_path = get_viz_path(file_path)
                 has_grades = False
                 actual_path = file_path
@@ -804,6 +1042,7 @@ def _load_samples_batch_sync(files: List[str], metadata_only: bool = False) -> d
                 if actual_path.startswith("s3://"):
                     ap = actual_path[5:]
                     a_bucket, a_key = ap.split("/", 1)
+                    _validate_s3_bucket(a_bucket)
                     ck = f"s3://{a_bucket}/{a_key}"
                     if ck in _file_cache:
                         cached_etag, cached_data = _file_cache[ck]
@@ -812,18 +1051,20 @@ def _load_samples_batch_sync(files: List[str], metadata_only: bool = False) -> d
                             s3_meta[idx] = {"cached": True, "data": cached_data, "has_grades": has_grades}
                             return
 
-                    # Need to download — get size
                     head = s3_client.head_object(Bucket=a_bucket, Key=a_key)
+                    size = head['ContentLength']
+                    if size > MAX_FILE_SIZE:
+                        raise ValueError(f"S3 file too large ({size // (1024*1024)}MB)")
                     s3_meta[idx] = {
                         "cached": False, "bucket": a_bucket, "key": a_key,
-                        "size": head['ContentLength'], "etag": head.get('ETag', ''),
+                        "size": size, "etag": head.get('ETag', ''),
                         "has_grades": has_grades,
                     }
                 else:
                     # viz path is local? shouldn't happen for S3 files
                     s3_meta[idx] = {"cached": False, "local_path": actual_path, "has_grades": has_grades}
             except Exception as e:
-                errors.append({"file": idx_file[1], "error": str(e)})
+                errors.append({"file": idx_file[1], "error": _safe_error_detail(e)})
                 per_file_data[idx] = None  # Mark as failed
 
         with ThreadPoolExecutor(max_workers=min(len(s3_files), 10)) as pool:
@@ -906,7 +1147,7 @@ def _load_samples_batch_sync(files: List[str], metadata_only: bool = False) -> d
                 samples = []
                 experiment_name = "unknown"
                 for i, raw in enumerate(raw_samples):
-                    attrs = raw.get('attributes', {})
+                    attrs = dict(raw.get('attributes', {}))
                     if experiment_name == "unknown":
                         experiment_name = attrs.get('experiment_name', 'unknown')
                     if 'validate' in attrs:
@@ -935,6 +1176,8 @@ def _load_samples_batch_sync(files: List[str], metadata_only: bool = False) -> d
                         "message_count": len(messages),
                         "attributes": filled_attrs, "timestamp": raw.get('timestamp', ''),
                         "grades": grades,
+                        "raw_messages": [] if metadata_only else raw.get('raw_messages'),
+                        "raw_jsonl_entry": None if metadata_only else raw,
                     })
 
                 per_file_data[idx] = {
@@ -943,7 +1186,7 @@ def _load_samples_batch_sync(files: List[str], metadata_only: bool = False) -> d
                     "file_path": file_path, "has_grades": has_grades,
                 }
             except Exception as e:
-                errors.append({"file": file_path, "error": str(e)})
+                errors.append({"file": file_path, "error": _safe_error_detail(e)})
                 per_file_data[idx] = None
 
     # --- Handle local files with _load_samples_sync ---
@@ -953,7 +1196,7 @@ def _load_samples_batch_sync(files: List[str], metadata_only: bool = False) -> d
             try:
                 per_file_data[idx] = _load_samples_sync(file_path, metadata_only=metadata_only)
             except Exception as e:
-                errors.append({"file": file_path, "error": str(e)})
+                errors.append({"file": file_path, "error": _safe_error_detail(e)})
                 per_file_data[idx] = None
 
         with ThreadPoolExecutor(max_workers=min(len(local_files), 10)) as pool:
@@ -977,9 +1220,8 @@ def _load_samples_batch_sync(files: List[str], metadata_only: bool = False) -> d
 
         file_sample_count = 0
         for sample in data["samples"]:
-            sample["id"] = next_id
-            sample["attributes"]["source_file"] = file_path
-            combined_samples.append(sample)
+            s = {**sample, "id": next_id, "attributes": {**sample.get("attributes", {}), "source_file": file_path}}
+            combined_samples.append(s)
             next_id += 1
             file_sample_count += 1
 
@@ -999,12 +1241,14 @@ async def get_samples_batch(request: BatchSamplesRequest):
     """Load samples from multiple files in a single request.
 
     Downloads files concurrently via thread pool, combines samples with
-    sequential IDs and source_file attributes. For metadata_only requests,
-    uses ORJSONResponse (allows gzip — small payload benefits from compression).
+    sequential IDs and source_file attributes. Max 50 files per request.
+    For metadata_only requests, uses ORJSONResponse (allows gzip — small payload benefits from compression).
     For full requests, skips GZipMiddleware by setting Content-Encoding: identity
     — for 155 MB payloads, gzip at level 1 adds ~1.4s of CPU that's wasted
     on localhost/proxy traffic.
     """
+    if len(request.files) > 50:
+        raise HTTPException(status_code=400, detail="Too many files (max 50)")
     try:
         data = await asyncio.to_thread(_load_samples_batch_sync, request.files, request.metadata_only)
         if request.metadata_only:
@@ -1016,7 +1260,7 @@ async def get_samples_batch(request: BatchSamplesRequest):
             headers={"Content-Encoding": "identity"},
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_safe_error_detail(e))
 
 
 def _load_single_sample_sync(file: str, sample_id: int) -> dict:
@@ -1039,7 +1283,7 @@ def _load_single_sample_sync(file: str, sample_id: int) -> dict:
         raise HTTPException(status_code=404, detail=f"Sample {sample_id} not found")
 
     raw = raw_samples[sample_id]
-    attrs = raw.get('attributes', {})
+    attrs = dict(raw.get('attributes', {}))
     if 'validate' in attrs:
         attrs['is_validate'] = attrs.pop('validate')
 
@@ -1066,22 +1310,49 @@ def _load_single_sample_sync(file: str, sample_id: int) -> dict:
         "attributes": filled_attrs,
         "timestamp": raw.get('timestamp', ''),
         "grades": raw.get('grades', None),
+        "raw_messages": raw.get('raw_messages'),
+        "raw_jsonl_entry": raw,
     }
 
 
 @app.get("/api/sample/{sample_id}")
 async def get_sample(
+    request: Request,
     sample_id: int,
     file: str = Query(..., description="Path to JSONL file")
 ):
-    """Get a single sample by ID."""
+    """Get a single sample by ID.
+
+    In share mode, validates the sample matches the token's constraints.
+    """
     try:
         data = await asyncio.to_thread(_load_single_sample_sync, file, sample_id)
+
+        # Share mode: verify this sample is within the authorized scope
+        if getattr(request.state, 'access_level', None) == 'share':
+            payload = getattr(request.state, 'share_payload', {})
+            i = payload.get("i")
+            if i is not None:
+                # Authoritative: only the sample at file-relative index `i`
+                # is authorized. `sample_id` is the caller's requested file
+                # index (see _load_single_sample_sync).
+                if sample_id != i:
+                    raise HTTPException(status_code=403, detail="Sample not authorized for this share link")
+            else:
+                # Legacy tokens: fall back to rollout/step attribute check.
+                attrs = data.get("attributes", {})
+                r = payload.get("r")
+                s = payload.get("s")
+                if r is not None and attrs.get("rollout_n") != r:
+                    raise HTTPException(status_code=403, detail="Sample not authorized for this share link")
+                if s is not None and attrs.get("step") != s:
+                    raise HTTPException(status_code=403, detail="Sample not authorized for this share link")
+
         return JSONResponse(content=data)
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_safe_error_detail(e))
 
 
 # Helper functions for viz/ path handling
@@ -1120,9 +1391,10 @@ def viz_file_exists(viz_path: str) -> bool:
     # Perform actual check
     if viz_path.startswith("s3://"):
         try:
-            s3_client = _get_s3_client()
             s3_path = viz_path[5:]
             bucket, key = s3_path.split("/", 1)
+            _validate_s3_bucket(bucket)
+            s3_client = _get_s3_client()
             s3_client.head_object(Bucket=bucket, Key=key)
             result = True
         except Exception:
@@ -1134,30 +1406,42 @@ def viz_file_exists(viz_path: str) -> bool:
         except ValueError:
             result = False
 
+    if len(_viz_exists_cache) >= _VIZ_EXISTS_MAX:
+        oldest = min(_viz_exists_cache, key=lambda k: _viz_exists_cache[k][0])
+        del _viz_exists_cache[oldest]
     _viz_exists_cache[viz_path] = (now, result)
     return result
 
 
 def save_jsonl_to_file(file_path: str, samples: List[Dict[str, Any]]) -> None:
-    """Save samples to a local JSONL file."""
+    """Save samples to a local JSONL file. Uses atomic write-to-temp + rename."""
     path = _safe_resolve_path(file_path)
 
-    # Create parent directories including viz/
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(path, 'wb') as f:
-        for sample in samples:
-            f.write(orjson.dumps(sample) + b'\n')
+    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            for sample in samples:
+                f.write(orjson.dumps(sample) + b'\n')
+            f.flush()
+            os.fsync(f.fileno())
+        os.rename(tmp_path, str(path))
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
-    # Invalidate file cache so next load reads from disk
     path_str = str(path)
     _file_cache.pop(path_str, None)
-    # Update viz_exists cache so viz_file_exists() returns True immediately
     _viz_exists_cache[path_str] = (time.time(), True)
 
 
 def save_jsonl_to_s3(bucket: str, key: str, samples: List[Dict[str, Any]]) -> None:
     """Save samples to S3 as JSONL."""
+    _validate_s3_bucket(bucket)
     s3_client = _get_s3_client()
 
     content = b'\n'.join(orjson.dumps(sample) for sample in samples)
@@ -1177,6 +1461,7 @@ def save_jsonl_to_s3(bucket: str, key: str, samples: List[Dict[str, Any]]) -> No
 
 # Path to store custom metrics
 CUSTOM_METRICS_FILE = PROJECT_ROOT / "custom_metrics.json"
+_custom_metrics_lock = asyncio.Lock()
 
 
 def load_custom_metrics() -> Dict[str, dict]:
@@ -1191,9 +1476,20 @@ def load_custom_metrics() -> Dict[str, dict]:
 
 
 def save_custom_metrics(metrics: Dict[str, dict]) -> None:
-    """Save custom metrics to file."""
-    with open(CUSTOM_METRICS_FILE, 'w') as f:
-        json.dump(metrics, f, indent=2)
+    """Save custom metrics to file. Uses atomic write."""
+    fd, tmp_path = tempfile.mkstemp(dir=str(CUSTOM_METRICS_FILE.parent), suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(metrics, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.rename(tmp_path, str(CUSTOM_METRICS_FILE))
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 @app.get("/api/preset-metrics", response_model=Dict[str, PresetMetricInfo])
@@ -1215,42 +1511,42 @@ async def get_preset_metrics():
     return all_metrics
 
 
+_MAX_SAVE_LOCKS = 1000
+
 class SaveCustomMetricRequest(BaseModel):
     """Request to save a custom metric."""
-    key: str  # Unique identifier (lowercase, no spaces)
-    name: str  # Display name
-    description: str
+    key: str  # Unique identifier (lowercase, no spaces, max 100 chars)
+    name: str  # Display name (max 200 chars)
+    description: str  # max 1000 chars
     grade_type: str  # 'float', 'int', or 'bool'
-    prompt: str
+    prompt: str  # max 50000 chars
 
 
 @app.post("/api/save-custom-metric")
 async def save_custom_metric(request: SaveCustomMetricRequest):
     """Save a custom metric for future use."""
-    # Validate key format
+    if len(request.key) > 100 or len(request.name) > 200 or len(request.description) > 1000 or len(request.prompt) > 50000:
+        raise HTTPException(status_code=400, detail="Field too long")
+    if request.grade_type not in ("float", "int", "bool"):
+        raise HTTPException(status_code=400, detail="grade_type must be 'float', 'int', or 'bool'")
     key = request.key.lower().replace(" ", "_")
     
-    # Don't allow overriding built-in presets
     if key in PRESET_METRICS:
         raise HTTPException(
             status_code=400,
             detail=f"Cannot override built-in preset '{key}'"
         )
     
-    # Load existing custom metrics
-    custom_metrics = load_custom_metrics()
-    
-    # Add/update the metric
-    custom_metrics[key] = {
-        "name": request.name,
-        "description": request.description,
-        "grade_type": request.grade_type,
-        "prompt": request.prompt,
-        "is_custom": True,
-    }
-    
-    # Save
-    save_custom_metrics(custom_metrics)
+    async with _custom_metrics_lock:
+        custom_metrics = load_custom_metrics()
+        custom_metrics[key] = {
+            "name": request.name,
+            "description": request.description,
+            "grade_type": request.grade_type,
+            "prompt": request.prompt,
+            "is_custom": True,
+        }
+        save_custom_metrics(custom_metrics)
     
     return {"status": "saved", "key": key}
 
@@ -1258,13 +1554,12 @@ async def save_custom_metric(request: SaveCustomMetricRequest):
 @app.delete("/api/custom-metric/{key}")
 async def delete_custom_metric(key: str):
     """Delete a custom metric."""
-    custom_metrics = load_custom_metrics()
-    
-    if key not in custom_metrics:
-        raise HTTPException(status_code=404, detail=f"Custom metric '{key}' not found")
-    
-    del custom_metrics[key]
-    save_custom_metrics(custom_metrics)
+    async with _custom_metrics_lock:
+        custom_metrics = load_custom_metrics()
+        if key not in custom_metrics:
+            raise HTTPException(status_code=404, detail=f"Custom metric '{key}' not found")
+        del custom_metrics[key]
+        save_custom_metrics(custom_metrics)
     
     return {"status": "deleted", "key": key}
 
@@ -1286,12 +1581,21 @@ class TestProviderRequest(BaseModel):
     api_key: Optional[str] = None
 
 
+# Cache for test-provider results: (provider, model, key_hash) -> (timestamp, ok)
+_test_provider_cache: Dict[tuple, tuple] = {}
+_TEST_PROVIDER_TTL = 300  # 5 minutes
+_TEST_PROVIDER_MAX = 1000
+
+def _clear_test_provider_cache():
+    """Clear the test-provider cache (for tests)."""
+    _test_provider_cache.clear()
+
 @app.post("/api/test-provider")
 async def test_provider(request: TestProviderRequest):
     """Test that an LLM provider + model + API key combination works.
 
     Makes a minimal API call to validate the configuration before
-    starting a full grading job.
+    starting a full grading job. Results are cached for 5 minutes.
     """
     try:
         api_key = request.api_key
@@ -1304,11 +1608,19 @@ async def test_provider(request: TestProviderRequest):
                 content={"ok": False, "error": f"No API key for {request.provider}"}
             )
 
+        # Check cache
+        import hashlib
+        key_hash = hashlib.sha256(api_key.encode()).hexdigest()[:16]
+        cache_key = (request.provider, request.model, key_hash)
+        now = time.time()
+        if cache_key in _test_provider_cache:
+            cached_time, cached_ok = _test_provider_cache[cache_key]
+            if now - cached_time < _TEST_PROVIDER_TTL:
+                return {"ok": cached_ok}
+
         provider = get_provider(request.provider, api_key, request.model, max_tokens=200)
 
         # Make a minimal call to validate the key + model.
-        # We only care that the API accepts the request (valid key + model).
-        # JSON parsing errors are OK here — they mean the connection works.
         try:
             await provider.grade_sample(
                 messages=[{"role": "user", "content": "Say OK."}],
@@ -1320,19 +1632,37 @@ async def test_provider(request: TestProviderRequest):
             # ValueError = JSON parse error = API responded but format was off.
             # That's fine — the connection works.
             pass
+        if len(_test_provider_cache) >= _TEST_PROVIDER_MAX:
+            oldest = min(_test_provider_cache, key=lambda k: _test_provider_cache[k][0])
+            del _test_provider_cache[oldest]
+        _test_provider_cache[cache_key] = (now, True)
         return {"ok": True}
     except Exception as e:
         return JSONResponse(
             status_code=400,
-            content={"ok": False, "error": str(e)}
+            content={"ok": False, "error": _safe_error_detail(e)}
         )
 
 
 @app.post("/api/grade", response_model=GradeResponse)
 async def grade_samples(request: GradeRequest):
     """Grade samples using an LLM provider."""
+    request.sample_ids = list(dict.fromkeys(request.sample_ids))
+    request.max_quote_retries = min(request.max_quote_retries, 5)
+    request.parallel_size = max(1, min(request.parallel_size, 500))
+    if request.max_tokens is not None:
+        request.max_tokens = min(request.max_tokens, 16384)
+    if request.temperature is not None:
+        request.temperature = max(0.0, min(request.temperature, 2.0))
+    if request.top_p is not None:
+        request.top_p = max(0.0, min(request.top_p, 1.0))
+    if request.api_key and len(request.api_key) > 500:
+        raise HTTPException(status_code=400, detail="API key too long")
+    if len(request.sample_ids) > _GRADE_MAX_SAMPLES:
+        raise HTTPException(status_code=400, detail=f"Too many samples (max {_GRADE_MAX_SAMPLES})")
+    if len(request.metric_prompt) > _GRADE_MAX_PROMPT_LEN:
+        raise HTTPException(status_code=400, detail=f"Prompt too long (max {_GRADE_MAX_PROMPT_LEN} chars)")
     try:
-        # Get API key - use provided key or fall back to environment
         api_key = request.api_key
         if not api_key:
             api_key = get_env_api_key(request.provider)
@@ -1340,7 +1670,7 @@ async def grade_samples(request: GradeRequest):
         if not api_key:
             raise HTTPException(
                 status_code=400,
-                detail=f"No API key provided for {request.provider} and none found in .env file"
+                detail=f"No API key provided for {request.provider}"
             )
         
         # Load the samples (check viz/ version first, same as GET /api/samples)
@@ -1372,7 +1702,7 @@ async def grade_samples(request: GradeRequest):
 
         async def grade_one(sample_id: int) -> tuple:
             if sample_id < 0 or sample_id >= len(raw_samples):
-                return sample_id, None, f"Sample {sample_id} not found (file has {len(raw_samples)} samples)"
+                return sample_id, None, f"Sample {sample_id} not found"
             
             raw = raw_samples[sample_id]
             messages = raw.get('messages', [])
@@ -1403,7 +1733,7 @@ async def grade_samples(request: GradeRequest):
                 grade_entry = GradeEntry(
                     grade=result.grade,
                     grade_type=result.grade_type,
-                    quotes=[Quote(**q.dict()) for q in result.quotes],
+                    quotes=[Quote(**q.model_dump()) for q in result.quotes],
                     explanation=result.explanation,
                     model=result.model,
                     prompt_version=result.prompt_version,
@@ -1411,19 +1741,21 @@ async def grade_samples(request: GradeRequest):
                 )
                 return sample_id, grade_entry, None
             except Exception as e:
-                return sample_id, None, str(e)
+                return sample_id, None, _safe_error_detail(e)
         
-        # Grade samples concurrently with configurable parallelism
-        batch_size = min(request.parallel_size, 500)  # Cap at 500 to avoid overwhelming APIs
-        
-        import time
+        batch_size = min(request.parallel_size, 500)
+
+        async def _grade_with_global_limit(sid: int):
+            async with _GLOBAL_GRADING_SEM:
+                return await grade_one(sid)
+
         total_start = time.time()
         print(f"[Grading] Starting {len(request.sample_ids)} samples with batch_size={batch_size}")
         
         for i in range(0, len(request.sample_ids), batch_size):
             batch = request.sample_ids[i:i + batch_size]
             batch_start = time.time()
-            results = await asyncio.gather(*[grade_one(sid) for sid in batch])
+            results = await asyncio.gather(*[_grade_with_global_limit(sid) for sid in batch])
             batch_time = time.time() - batch_start
             
             for sample_id, grade_entry, error in results:
@@ -1444,12 +1776,27 @@ async def grade_samples(request: GradeRequest):
         )
     
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_safe_error_detail(e))
 
 
 @app.post("/api/grade-stream")
 async def grade_samples_stream(request: GradeRequest):
     """Grade samples using an LLM provider with SSE streaming progress."""
+    request.sample_ids = list(dict.fromkeys(request.sample_ids))
+    request.max_quote_retries = min(request.max_quote_retries, 5)
+    request.parallel_size = max(1, min(request.parallel_size, 500))
+    if request.max_tokens is not None:
+        request.max_tokens = min(request.max_tokens, 16384)
+    if request.temperature is not None:
+        request.temperature = max(0.0, min(request.temperature, 2.0))
+    if request.top_p is not None:
+        request.top_p = max(0.0, min(request.top_p, 1.0))
+    if request.api_key and len(request.api_key) > 500:
+        raise HTTPException(status_code=400, detail="API key too long")
+    if len(request.sample_ids) > _GRADE_MAX_SAMPLES:
+        raise HTTPException(status_code=400, detail=f"Too many samples (max {_GRADE_MAX_SAMPLES})")
+    if len(request.metric_prompt) > _GRADE_MAX_PROMPT_LEN:
+        raise HTTPException(status_code=400, detail=f"Prompt too long (max {_GRADE_MAX_PROMPT_LEN} chars)")
     import time
     
     async def generate_events():
@@ -1469,15 +1816,15 @@ async def grade_samples_stream(request: GradeRequest):
             # Load the samples (check viz/ version first, same as GET /api/samples)
             actual_path = request.file_path
             viz_path = get_viz_path(request.file_path)
-            if viz_file_exists(viz_path):
+            if await asyncio.to_thread(viz_file_exists, viz_path):
                 actual_path = viz_path
 
             if actual_path.startswith("s3://"):
                 s3_path = actual_path[5:]
                 bucket, key = s3_path.split("/", 1)
-                raw_samples = load_jsonl_from_s3(bucket, key)
+                raw_samples = await asyncio.to_thread(load_jsonl_from_s3, bucket, key)
             else:
-                raw_samples = load_jsonl_from_file(actual_path)
+                raw_samples = await asyncio.to_thread(load_jsonl_from_file, actual_path)
 
             print(f"[SSE Grading] Loaded {len(raw_samples)} samples from {actual_path}, grading IDs: {request.sample_ids[:5]}{'...' if len(request.sample_ids) > 5 else ''}")
 
@@ -1501,7 +1848,7 @@ async def grade_samples_stream(request: GradeRequest):
 
             async def grade_one(sample_id: int) -> tuple:
                 if sample_id < 0 or sample_id >= len(raw_samples):
-                    return sample_id, None, f"Sample {sample_id} not found (file has {len(raw_samples)} samples)"
+                    return sample_id, None, f"Sample {sample_id} not found"
                 
                 raw = raw_samples[sample_id]
                 messages = raw.get('messages', [])
@@ -1527,7 +1874,7 @@ async def grade_samples_stream(request: GradeRequest):
                     grade_entry = {
                         "grade": result.grade,
                         "grade_type": result.grade_type,
-                        "quotes": [q.dict() for q in result.quotes],
+                        "quotes": [q.model_dump() for q in result.quotes],
                         "explanation": result.explanation,
                         "model": result.model,
                         "prompt_version": result.prompt_version,
@@ -1535,15 +1882,15 @@ async def grade_samples_stream(request: GradeRequest):
                     }
                     return sample_id, grade_entry, None
                 except Exception as e:
-                    return sample_id, None, str(e)
+                    return sample_id, None, _safe_error_detail(e)
             
-            # Run requests with bounded concurrency using a semaphore
-            batch_size = min(request.parallel_size, 500)  # Cap at 500
+            batch_size = min(request.parallel_size, 500)
             sem = asyncio.Semaphore(batch_size)
 
             async def grade_with_limit(sample_id: int) -> tuple:
-                async with sem:
-                    return await grade_one(sample_id)
+                async with _GLOBAL_GRADING_SEM:
+                    async with sem:
+                        return await grade_one(sample_id)
 
             tasks = [asyncio.create_task(grade_with_limit(sid)) for sid in request.sample_ids]
 
@@ -1573,7 +1920,7 @@ async def grade_samples_stream(request: GradeRequest):
         except Exception as e:
             total_time = time.time() - start_time
             print(f"[SSE Grading] Error after {total_time:.2f}s: {str(e)}")
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            yield f"data: {json.dumps({'type': 'error', 'message': _safe_error_detail(e)})}\n\n"
     
     return StreamingResponse(
         generate_events(),
@@ -1586,71 +1933,214 @@ async def grade_samples_stream(request: GradeRequest):
     )
 
 
+_save_locks: Dict[str, asyncio.Lock] = {}
+
+
 @app.post("/api/save-graded")
 async def save_graded_samples(request: SaveGradedRequest):
     """Save graded samples to the viz/ subdirectory.
     
     This merges new grades with any existing grades in the viz/ file.
+    Uses a per-file lock to prevent concurrent writes from clobbering each other.
     """
-    try:
-        # Determine paths
-        original_path = request.file_path
-        viz_path = get_viz_path(original_path)
-        
-        # Load existing samples (prefer viz/ if exists, else original)
-        if viz_file_exists(viz_path):
-            source_path = viz_path
-        else:
-            source_path = original_path
-        
-        if source_path.startswith("s3://"):
-            s3_path = source_path[5:]
-            bucket, key = s3_path.split("/", 1)
-            raw_samples = load_jsonl_from_s3(bucket, key)
-        else:
-            raw_samples = load_jsonl_from_file(source_path)
-        
-        # Merge new grades into samples
-        for sample_id_str, metric_grades in request.grades.items():
-            sample_id = int(sample_id_str)
-            if sample_id < 0 or sample_id >= len(raw_samples):
-                continue
-            
-            sample = raw_samples[sample_id]
-            
-            # Initialize grades dict if not present
-            if 'grades' not in sample:
-                sample['grades'] = {}
-            
-            # Merge each metric's grades
-            for metric_name, grade_entry in metric_grades.items():
-                if metric_name not in sample['grades']:
-                    sample['grades'][metric_name] = []
-                
-                # Add the new grade entry
-                if isinstance(grade_entry, dict):
-                    sample['grades'][metric_name].append(grade_entry)
-                else:
-                    sample['grades'][metric_name].append(grade_entry.dict())
-        
-        # Save to viz/ path
-        if viz_path.startswith("s3://"):
-            s3_path = viz_path[5:]
-            bucket, key = s3_path.split("/", 1)
-            save_jsonl_to_s3(bucket, key, raw_samples)
-        else:
-            save_jsonl_to_file(viz_path, raw_samples)
-        
-        return {
-            "success": True,
-            "viz_path": viz_path,
-            "samples_updated": len(request.grades),
-        }
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    lock_key = str(_safe_resolve_path(request.file_path)) if not request.file_path.startswith("s3://") else request.file_path
+    if len(_save_locks) >= _MAX_SAVE_LOCKS:
+        oldest_key = next(iter(_save_locks))
+        del _save_locks[oldest_key]
+    lock = _save_locks.setdefault(lock_key, asyncio.Lock())
+    async with lock:
+        try:
+            original_path = request.file_path
+            viz_path = get_viz_path(original_path)
+
+            if viz_file_exists(viz_path):
+                source_path = viz_path
+            else:
+                source_path = original_path
+
+            if source_path.startswith("s3://"):
+                s3_path = source_path[5:]
+                bucket, key = s3_path.split("/", 1)
+                raw_samples = load_jsonl_from_s3(bucket, key)
+            else:
+                raw_samples = load_jsonl_from_file(source_path)
+
+            raw_samples = list(raw_samples)
+
+            for sample_id_str, metric_grades in request.grades.items():
+                sample_id = int(sample_id_str)
+                if sample_id < 0 or sample_id >= len(raw_samples):
+                    continue
+
+                sample = copy.deepcopy(raw_samples[sample_id])
+                raw_samples[sample_id] = sample
+
+                if 'grades' not in sample:
+                    sample['grades'] = {}
+
+                for metric_name, grade_entry in metric_grades.items():
+                    if metric_name not in sample['grades']:
+                        sample['grades'][metric_name] = []
+
+                    if isinstance(grade_entry, dict):
+                        sample['grades'][metric_name].append(grade_entry)
+                    else:
+                        sample['grades'][metric_name].append(grade_entry.model_dump())
+
+            if viz_path.startswith("s3://"):
+                s3_path = viz_path[5:]
+                bucket, key = s3_path.split("/", 1)
+                save_jsonl_to_s3(bucket, key, raw_samples)
+            else:
+                save_jsonl_to_file(viz_path, raw_samples)
+
+            return {
+                "success": True,
+                "samples_updated": len(request.grades),
+            }
+
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=_safe_error_detail(e))
+
+
+def _frontend_response(full_path: str) -> FileResponse:
+    """Serve the production frontend build without exposing dev source files."""
+    decoded = unquote(full_path).replace("\\", "/")
+    normalized = posixpath.normpath("/" + decoded).lstrip("/")
+    if normalized == ".":
+        normalized = ""
+    first_part = normalized.split("/", 1)[0] if normalized else ""
+    parts = [part for part in normalized.split("/") if part]
+
+    if (
+        any(part.lower() == "api" for part in parts)
+        or normalized in _DENIED_FRONTEND_FILES
+        or first_part in _DENIED_FRONTEND_PREFIXES
+        or any(part.startswith(".") for part in parts)
+    ):
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    if not FRONTEND_INDEX.is_file():
+        raise HTTPException(status_code=404, detail="Frontend build not found")
+
+    if normalized:
+        requested = (FRONTEND_DIST / normalized).resolve()
+        try:
+            requested.relative_to(FRONTEND_DIST.resolve())
+        except ValueError:
+            raise HTTPException(status_code=404, detail="Not Found")
+        if requested.is_file():
+            return FileResponse(requested)
+
+    return FileResponse(FRONTEND_INDEX)
+
+
+# --- Rollout discussion chat -------------------------------------------------
+# A normal-mode feature: the user chats with a frontier model about one
+# rollout. The frontend builds the full message list (a system message holding
+# the rollout transcript + grades, then the chat turns) and this endpoint
+# streams a reply by proxying tinker_service's litellm provider. Stateless —
+# the whole history is re-sent each turn. Auth-protected like every /api route.
+
+class RolloutChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class RolloutChatRequest(BaseModel):
+    model: str
+    messages: List[RolloutChatMessage]
+    # Generous budget: the frontier models are reasoning models, and this
+    # ceiling covers hidden reasoning *plus* the visible answer.
+    max_tokens: int = 32000
+
+
+def _sse_frame(event: str, data: dict) -> bytes:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
+
+
+@app.post("/api/rollout-chat-stream")
+async def rollout_chat_stream(request: RolloutChatRequest):
+    """Stream one assistant turn from a frontier model discussing a rollout.
+
+    Thin SSE proxy to tinker_service `/step` (provider: litellm). The tinker
+    event names (`response.output_text.delta`, `response.reasoning.delta`,
+    `response.done`, `response.error`) pass straight through to the browser.
+    """
+    payload = {
+        "provider": "litellm",
+        "model_name": request.model,
+        "messages": [{"role": m.role, "content": m.content} for m in request.messages],
+        # `reasoning_effort: low` keeps the reasoning models (GPT-5.5, etc.)
+        # snappy and stops them from burning the whole token budget on hidden
+        # reasoning and emitting no visible answer.
+        "sampling": {
+            "stream": True,
+            "max_tokens": request.max_tokens,
+            "reasoning_effort": "low",
+        },
+    }
+
+    async def generate_events():
+        try:
+            timeout = httpx.Timeout(600.0, connect=10.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                async with client.stream(
+                    "POST", f"{TINKER_SERVICE_URL}/step", json=payload
+                ) as resp:
+                    if resp.status_code != 200:
+                        body = await resp.aread()
+                        detail = body.decode("utf-8", errors="replace")[:500]
+                        yield _sse_frame(
+                            "response.error",
+                            {"message": f"tinker_service HTTP {resp.status_code}: {detail}"},
+                        )
+                        return
+                    async for chunk in resp.aiter_raw():
+                        if chunk:
+                            yield chunk
+        except httpx.ConnectError:
+            yield _sse_frame(
+                "response.error",
+                {
+                    "message": (
+                        f"Could not reach tinker_service at {TINKER_SERVICE_URL}. "
+                        "Start it: reward_seeker/tinker_service/start.sh"
+                    )
+                },
+            )
+        except Exception as e:
+            yield _sse_frame(
+                "response.error",
+                {"message": f"chat proxy failed: {_safe_error_detail(e)}"},
+            )
+
+    return StreamingResponse(
+        generate_events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/", include_in_schema=False)
+async def serve_frontend_root():
+    return _frontend_response("")
+
+
+@app.get("/{full_path:path}", include_in_schema=False)
+async def serve_frontend(full_path: str):
+    decoded = unquote(full_path).replace("\\", "/")
+    normalized = posixpath.normpath("/" + decoded).lstrip("/")
+    parts = [part for part in normalized.split("/") if part and part != "."]
+    if any(part.lower() == "api" for part in parts):
+        raise HTTPException(status_code=404, detail="Not Found")
+    return _frontend_response(full_path)
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8000)

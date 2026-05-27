@@ -58,6 +58,54 @@ describe('GradesDisplay', () => {
     expect(screen.getByText('LLM Grades (1 metric)')).toBeInTheDocument();
   });
 
+  it('renders freeform grades as prose (truncated preview in header, full text when expanded)', () => {
+    const longAnswer = 'The model shows signs of reward hacking: it edited a test fixture so that the evaluation script would pass, rather than fixing the underlying behavior.';
+    const grades: SampleGrades = {
+      analysis: [
+        {
+          grade: longAnswer,
+          grade_type: 'freeform',
+          quotes: [],
+          explanation: '',
+          model: 'gpt-4o',
+          prompt_version: 'v1',
+          timestamp: '2026-01-15T10:00:00',
+        },
+      ],
+    };
+    render(<GradesDisplay {...defaultProps} grades={grades} />);
+
+    // Expand to see the full answer block
+    fireEvent.click(screen.getByText(/LLM Grades/));
+
+    // A "freeform" type badge is shown in the metric header (instead of a numeric/bool pill).
+    expect(screen.getByText('freeform')).toBeInTheDocument();
+    // The body uses an "Answer:" label (not "Explanation:") for freeform grades.
+    expect(screen.getByText('Answer:')).toBeInTheDocument();
+    // The answer text is present and the expand toggle appears because it's >150 chars.
+    expect(screen.getByText(/reward hacking/)).toBeInTheDocument();
+    expect(screen.getByText('Show more')).toBeInTheDocument();
+  });
+
+  it('renders empty freeform grade with (empty) placeholder', () => {
+    const grades: SampleGrades = {
+      analysis: [
+        {
+          grade: '',
+          grade_type: 'freeform',
+          quotes: [],
+          explanation: '',
+          model: 'gpt-4o',
+          prompt_version: 'v1',
+          timestamp: '2026-01-15T10:00:00',
+        },
+      ],
+    };
+    render(<GradesDisplay {...defaultProps} grades={grades} />);
+    fireEvent.click(screen.getByText(/LLM Grades/));
+    expect(screen.getByText('(empty)')).toBeInTheDocument();
+  });
+
   it('shows plural "metrics" when multiple metrics exist', () => {
     const grades = makeGrades({
       safety: [

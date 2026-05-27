@@ -183,8 +183,7 @@ def authenticated_client():
 
     async def _get_client():
         transport = ASGITransport(app=main_module.app)
-        # Create a valid session token
-        token = serializer.dumps("authenticated")
+        token = serializer.dumps({"auth": True, "pv": main_module._password_version()})
         client = httpx.AsyncClient(
             transport=transport,
             base_url="http://test",
@@ -205,10 +204,12 @@ def reset_rate_limiter():
     main_module._login_attempts.clear()
     main_module._clear_file_cache()
     main_module._clear_viz_exists_cache()
+    main_module._clear_test_provider_cache()
     yield
     main_module._login_attempts.clear()
     main_module._clear_file_cache()
     main_module._clear_viz_exists_cache()
+    main_module._clear_test_provider_cache()
 
 
 @pytest.fixture

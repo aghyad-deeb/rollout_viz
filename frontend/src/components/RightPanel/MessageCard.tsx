@@ -1,6 +1,9 @@
-import { useState, useMemo, useRef, useEffect, useCallback, memo } from 'react';
-import type { Message, SearchCondition, SearchField, Quote } from '../../types';
-import { normalizeAssistantMessage, fieldAppliesToContent, fieldAppliesToReasoning } from '../../utils/parseContent';
+import { useState, useMemo, useRef, useEffect, useLayoutEffect, memo, Fragment } from 'react';
+import type { Message, ToolCall, SearchCondition, SearchField, Quote, EphemeralHighlight, CollapsedRegion, RegionLocator } from '../../types';
+import { normalizeAssistantMessage, fieldAppliesToContent, fieldAppliesToReasoning, formatMessageText } from '../../utils/parseContent';
+import { findAllMatches, findAllMatchesCI } from '../../utils/textMatch';
+import { PUBLIC_BASE_URL } from '../../config';
+import { ElisionPill } from './ElisionPill';
 
 interface MessageCardProps {
   message: Message;
@@ -12,7 +15,7 @@ interface MessageCardProps {
   rolloutN: number;
   step: number;
   filePath: string;
-  generateLink: (options: { file: string; rollout?: number; step?: number; message?: number; highlight?: string }) => string;
+  generateLink: (options: { file: string; rollout?: number; step?: number; index?: number; message?: number; highlight?: string }) => string;
   isHighlighted: boolean;
   highlightedText: string | null;
   onClearHighlight: () => void;
@@ -21,6 +24,33 @@ interface MessageCardProps {
   currentOccurrenceIndex: number; // Which occurrence is currently focused
   // Grade quotes to highlight
   gradeQuotes?: Quote[];
+  // Share-mode metadata threaded down so message-level / quote-level
+  // share-link buttons can mint correct tokens.
+  isSharedMode?: boolean;
+  shareToken?: string | null;
+  selectedIndexInFile?: number;
+  // Ephemeral, session-only highlights (full list passed in; this card
+  // filters to entries whose messageIndex === index).
+  ephemeralHighlights?: EphemeralHighlight[];
+  onAddEphemeralHighlight?: (messageIndex: number, text: string, style?: 'highlight' | 'bold' | 'italic', locator?: RegionLocator) => void;
+  onRemoveEphemeralHighlight?: (id: string) => void;
+  // Presentation Mode: collapse spans into editable `[...]` pills, and
+  // capture the card as an image.
+  isPresentationMode?: boolean;
+  collapsedRegions?: CollapsedRegion[];
+  onAddCollapsedRegion?: (messageIndex: number, text: string, locator?: RegionLocator) => void;
+  onRemoveCollapsedRegion?: (id: string) => void;
+  onUpdateCollapsedRegionLabel?: (id: string, label: string | undefined) => void;
+  onHideCollapsedRegion?: (id: string) => void;
+  onUpdateCollapsedRegionJoin?: (id: string, side: 'before' | 'after', value: boolean) => void;
+  onExpandMessageCollapses?: (messageIndex: number) => void;
+  // Per-tool-call soft-wrap state, lifted so the off-screen capture card
+  // mirrors it. Keyed `"${messageIndex}:${toolCallIndex}"`.
+  wrappedToolCalls?: Set<string>;
+  onToggleToolCallWrap?: (messageIndex: number, toolCallIndex: number) => void;
+  onCaptureMessage?: (messageIndex: number) => void;
+  onPreviewMessage?: (messageIndex: number) => void;
+  onPreviewSelect?: (messageIndex: number) => void;
 }
 
 const ROLE_CONFIG = {
@@ -62,11 +92,41 @@ const ROLE_CONFIG = {
   },
 } as const;
 
+// The text shown for a tool call's arguments: the bare command when the
+// args are a {command: "..."} object (the common bash case — full JSON is
+// noise), else the raw string / pretty-printed object.
+function toolCallArgsText(tc: ToolCall): string {
+  if (typeof tc.function.arguments === 'string') {
+    try {
+      const parsed = JSON.parse(tc.function.arguments) as Record<string, unknown>;
+      return parsed?.command != null ? String(parsed.command) : tc.function.arguments;
+    } catch {
+      return tc.function.arguments;
+    }
+  }
+  return tc.function.arguments?.command != null
+    ? String(tc.function.arguments.command)
+    : JSON.stringify(tc.function.arguments, null, 2);
+}
+
+// Stable empty default for the wrappedToolCalls prop (avoids allocating a
+// new Set on every render when the prop is omitted).
+const EMPTY_WRAP_SET = new Set<string>();
+
 interface SelectionPopup {
   show: boolean;
   x: number;
   y: number;
   text: string;
+  // The text of the containing block before / after the selection — used
+  // by "Isolate" to collapse everything around the selection.
+  before: string;
+  after: string;
+  // Which renderable block the selection sits in, so "Isolate" can collapse
+  // every *other* block whole. '' when the selection isn't inside a known
+  // block; blockIndex is the tool-call index when blockKind === 'tool'.
+  blockKind: '' | 'reasoning' | 'content' | 'tool';
+  blockIndex: number;
 }
 
 function MessageCardInner({
@@ -86,56 +146,132 @@ function MessageCardInner({
   messageOccurrenceStart,
   currentOccurrenceIndex,
   gradeQuotes = [],
+  isSharedMode = false,
+  shareToken,
+  selectedIndexInFile,
+  ephemeralHighlights = [],
+  onAddEphemeralHighlight,
+  onRemoveEphemeralHighlight,
+  isPresentationMode = false,
+  collapsedRegions = [],
+  onAddCollapsedRegion,
+  onRemoveCollapsedRegion,
+  onUpdateCollapsedRegionLabel,
+  onHideCollapsedRegion,
+  onUpdateCollapsedRegionJoin,
+  onExpandMessageCollapses,
+  wrappedToolCalls = EMPTY_WRAP_SET,
+  onToggleToolCallWrap,
+  onCaptureMessage,
+  onPreviewMessage,
+  onPreviewSelect,
 }: MessageCardProps) {
+  void isSharedMode;
   const [isExpanded, setIsExpanded] = useState(true);
-  const [selectionPopup, setSelectionPopup] = useState<SelectionPopup>({ show: false, x: 0, y: 0, text: '' });
+  const [isHovered, setIsHovered] = useState(false);
+  const [selectionPopup, setSelectionPopup] = useState<SelectionPopup>({ show: false, x: 0, y: 0, text: '', before: '', after: '', blockKind: '', blockIndex: -1 });
   const [copiedLink, setCopiedLink] = useState(false);
   const [copiedSelection, setCopiedSelection] = useState(false);
+  const [copiedText, setCopiedText] = useState(false);
+  const [sharedMsg, setSharedMsg] = useState(false);
   const cardRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
-  
+  const popupRef = useRef<HTMLDivElement>(null);
+
   const config = ROLE_CONFIG[message.role] || ROLE_CONFIG.user;
 
-  // Scroll to this message if it's highlighted from URL
+  // Smooth-scroll the card into view when it becomes the URL-shared target.
   useEffect(() => {
     if (isHighlighted && cardRef.current) {
       cardRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }
   }, [isHighlighted]);
 
-  // Handle text selection
-  const handleMouseUp = useCallback(() => {
-    const selection = window.getSelection();
-    if (!selection || selection.isCollapsed || !contentRef.current) {
-      return;
-    }
+  // Clamp the selection popup horizontally so it can't slide under the left
+  // panel when the selection is near the card's left edge. The popup is
+  // centered on the selection (`-translate-x-1/2`); measured after it mounts
+  // and its center pinned so the whole popup stays inside the card.
+  useLayoutEffect(() => {
+    const popup = popupRef.current;
+    const card = cardRef.current;
+    if (!selectionPopup.show || !popup || !card) return;
+    const margin = 8;
+    const half = popup.offsetWidth / 2;
+    const cardW = card.offsetWidth;
+    const min = margin + half;
+    const max = Math.max(min, cardW - margin - half);
+    popup.style.left = `${Math.max(min, Math.min(max, selectionPopup.x))}px`;
+  }, [selectionPopup.show, selectionPopup.x]);
 
-    const selectedText = selection.toString().trim();
-    if (selectedText.length === 0) {
-      setSelectionPopup(prev => ({ ...prev, show: false }));
-      return;
-    }
-
-    // Check if selection is within this message's content
-    const range = selection.getRangeAt(0);
-    if (!contentRef.current.contains(range.commonAncestorContainer)) {
-      return;
-    }
-
-    // Get position for popup
-    const rect = range.getBoundingClientRect();
-    const cardRect = cardRef.current?.getBoundingClientRect();
-    if (!cardRect) return;
-
-    setSelectionPopup({
-      show: true,
-      x: rect.left + rect.width / 2 - cardRect.left,
-      y: rect.top - cardRect.top - 10,
-      text: selectedText,
-    });
+  // Show the selection action popup when the user finishes a text selection
+  // inside this card. Listens on `document` (not the content element) so a
+  // mouse-up that lands outside the text - common when dragging across
+  // several lines - still registers.
+  useEffect(() => {
+    const onDocMouseUp = (e: MouseEvent) => {
+      // Ignore mouse-ups on the popup itself (e.g. clicking its buttons).
+      if ((e.target as Element | null)?.closest?.('.selection-popup')) return;
+      const content = contentRef.current;
+      const card = cardRef.current;
+      if (!content || !card) return;
+      const selection = window.getSelection();
+      if (!selection || selection.isCollapsed) return;
+      const selectedText = selection.toString().trim();
+      if (!selectedText) {
+        setSelectionPopup((prev) => (prev.show ? { ...prev, show: false } : prev));
+        return;
+      }
+      const range = selection.getRangeAt(0);
+      // Both ends of the selection must lie inside this card's content.
+      if (!content.contains(range.startContainer) || !content.contains(range.endContainer)) {
+        return;
+      }
+      // Compute the before/after text within the containing renderable block
+      // (a `[data-msg-block]` ancestor) so "Isolate" can collapse around the
+      // selection. Best-effort: on a block that already has collapse pills
+      // these strings include `[...]` and isolate degrades gracefully.
+      let before = '';
+      let after = '';
+      let blockKind: SelectionPopup['blockKind'] = '';
+      let blockIndex = -1;
+      const anchorEl = range.commonAncestorContainer.nodeType === Node.ELEMENT_NODE
+        ? (range.commonAncestorContainer as Element)
+        : range.commonAncestorContainer.parentElement;
+      const block = anchorEl?.closest('[data-msg-block]');
+      if (block) {
+        const kind = block.getAttribute('data-block-kind');
+        if (kind === 'reasoning' || kind === 'content' || kind === 'tool') blockKind = kind;
+        const bi = block.getAttribute('data-block-index');
+        if (bi != null) blockIndex = Number(bi);
+        try {
+          const br = document.createRange();
+          br.selectNodeContents(block);
+          br.setEnd(range.startContainer, range.startOffset);
+          before = br.toString();
+          const ar = document.createRange();
+          ar.selectNodeContents(block);
+          ar.setStart(range.endContainer, range.endOffset);
+          after = ar.toString();
+        } catch { /* ignore - isolate just won't have flanks */ }
+      }
+      const rect = range.getBoundingClientRect();
+      const cardRect = card.getBoundingClientRect();
+      setSelectionPopup({
+        show: true,
+        x: rect.left + rect.width / 2 - cardRect.left,
+        y: rect.top - cardRect.top - 10,
+        text: selectedText,
+        before,
+        after,
+        blockKind,
+        blockIndex,
+      });
+    };
+    document.addEventListener('mouseup', onDocMouseUp);
+    return () => document.removeEventListener('mouseup', onDocMouseUp);
   }, []);
 
-  // Hide popup when clicking elsewhere
+  // Hide popup when clicking elsewhere.
   useEffect(() => {
     const handleClick = (e: MouseEvent) => {
       if (selectionPopup.show) {
@@ -145,12 +281,128 @@ function MessageCardInner({
         }
       }
     };
-
     document.addEventListener('mousedown', handleClick);
     return () => document.removeEventListener('mousedown', handleClick);
   }, [selectionPopup.show]);
 
-  // Get search terms that should be highlighted in content/reasoning
+  // --- Presentation Mode actions ---
+  const closePopup = () => {
+    setSelectionPopup(prev => ({ ...prev, show: false }));
+    window.getSelection()?.removeAllRanges();
+  };
+  // Source text of one of the message's renderable blocks.
+  const blockSourceText = (kind: string, blockIdx: number): string => {
+    const p = normalizeAssistantMessage(message);
+    if (kind === 'reasoning') return p.reasoning ?? '';
+    if (kind === 'content') return p.mainContent ?? '';
+    if (kind === 'tool') return p.toolCalls[blockIdx] ? toolCallArgsText(p.toolCalls[blockIdx]) : '';
+    return '';
+  };
+  // Pin a selection to the exact occurrence the user picked, so the same
+  // string elsewhere in the message isn't collapsed / highlighted too. The
+  // occurrence is the block match closest to the selection's rendered offset
+  // (exact when the block has no earlier pills shifting that offset).
+  const selectionLocator = (): RegionLocator | undefined => {
+    const { blockKind, blockIndex, before, text } = selectionPopup;
+    if (!blockKind || !text) return undefined;
+    const ms = findAllMatches(blockSourceText(blockKind, blockIndex), text);
+    if (ms.length === 0) return undefined;
+    let occurrence = 0;
+    let bestDist = Infinity;
+    ms.forEach((m, i) => {
+      const dist = Math.abs(m.start - before.length);
+      if (dist < bestDist) { bestDist = dist; occurrence = i; }
+    });
+    return {
+      blockKind,
+      blockIndex: blockKind === 'tool' ? blockIndex : undefined,
+      occurrence,
+    };
+  };
+  // Apply an ephemeral text style (highlight / bold / italic) to the
+  // current selection, then dismiss the popup.
+  const applyFormat = (style: 'highlight' | 'bold' | 'italic') => {
+    if (selectionPopup.text) {
+      onAddEphemeralHighlight?.(index, selectionPopup.text, style, selectionLocator());
+    }
+    closePopup();
+  };
+  // Collapse the selection into a `[...]` pill.
+  const doCollapse = () => {
+    if (selectionPopup.text) {
+      onAddCollapsedRegion?.(index, selectionPopup.text, selectionLocator());
+    }
+    closePopup();
+  };
+  // Isolate: keep only the selection visible. The flanking text within the
+  // selection's own block is collapsed (each flank a `[...]` pill), and
+  // every *other* renderable block of the message — reasoning, main
+  // content, each tool call — is collapsed whole. So isolating from the
+  // main content also collapses the bash output and the reasoning, and
+  // vice versa. Skipped when the selection isn't inside a recognized
+  // block, so isolate can never nuke the entire message.
+  const doIsolate = () => {
+    const before = selectionPopup.before.trim();
+    const after = selectionPopup.after.trim();
+    if (before) onAddCollapsedRegion?.(index, before);
+    if (after) onAddCollapsedRegion?.(index, after);
+    const { blockKind, blockIndex } = selectionPopup;
+    if (blockKind) {
+      const parsed = normalizeAssistantMessage(message);
+      const collapseWhole = (t: string | null | undefined) => {
+        if (!t || !t.trim()) return;
+        const already = collapsedRegions.some(
+          (r) => r.messageIndex === index && r.text === t,
+        );
+        if (!already) onAddCollapsedRegion?.(index, t);
+      };
+      if (blockKind !== 'reasoning') collapseWhole(parsed.reasoning);
+      if (blockKind !== 'content') collapseWhole(parsed.mainContent);
+      parsed.toolCalls.forEach((tc, i) => {
+        if (blockKind === 'tool' && i === blockIndex) return;
+        collapseWhole(toolCallArgsText(tc));
+      });
+    }
+    closePopup();
+  };
+  const captureThisCard = () => onCaptureMessage?.(index);
+  const previewThisCard = () => onPreviewMessage?.(index);
+
+  // Keyboard shortcuts (presentation mode only), while a selection popup is
+  // open: `c` collapse, `o` (or `Shift+C`) isolate, `h` highlight, `b` bold,
+  // `i` italic. `p` captures the hovered card.
+  useEffect(() => {
+    if (!isPresentationMode) return;
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const k = e.key.toLowerCase();
+      if (k === 'c' && selectionPopup.show) {
+        e.preventDefault();
+        if (e.shiftKey) doIsolate(); else doCollapse();
+      } else if (k === 'o' && selectionPopup.show) {
+        e.preventDefault();
+        doIsolate();
+      } else if (k === 'h' && selectionPopup.show) {
+        e.preventDefault();
+        applyFormat('highlight');
+      } else if (k === 'b' && selectionPopup.show) {
+        e.preventDefault();
+        applyFormat('bold');
+      } else if (k === 'i' && selectionPopup.show) {
+        e.preventDefault();
+        applyFormat('italic');
+      } else if (k === 'p' && !e.shiftKey && isHovered) {
+        e.preventDefault();
+        captureThisCard();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPresentationMode, selectionPopup.show, selectionPopup.text, selectionPopup.before, selectionPopup.after, selectionPopup.blockKind, selectionPopup.blockIndex, isHovered, index]);
+
   const getApplicableSearchTerms = useMemo(() => {
     return (isReasoning: boolean): string[] => {
       return searchConditions
@@ -162,218 +414,365 @@ function MessageCardInner({
     };
   }, [searchConditions, message.role]);
 
-  // Function to highlight search terms in text
+  // Highlight cascade. Priorities (highest wins, exclusive):
+  //   1. URL share (blue fill + underline; click to clear; carries
+  //      `url-highlight-mark` so ChatView can target it for scroll)
+  //   2. Ephemeral session highlights (fuchsia fill; click to remove)
+  //   3. Grade quotes (purple fill + bottom border; carries
+  //      `grade-quote-mark` so ChatView's prev/next can find them)
+  //   4. Local Ctrl+F search (green; orange when current match)
+  //   5. Global filter-bar search (yellow; orange ring when current)
+  // All matchers go through findAllMatches[CI] from utils/textMatch.ts so
+  // a U+202F vs U+0020 mismatch between source and query doesn't cause
+  // false negatives. The rendered <mark> always slices the *original*
+  // text so visible whitespace is preserved verbatim.
   const highlightSearchAndUrl = useMemo(() => {
-    return (text: string, isReasoning: boolean = false): React.ReactNode => {
-      // Priority 1: URL highlight (from shareable links)
-      if (highlightedText && text.includes(highlightedText)) {
-        const parts: React.ReactNode[] = [];
-        let lastIndex = 0;
-        let matchIndex = text.indexOf(highlightedText);
-
-        while (matchIndex !== -1) {
-          if (matchIndex > lastIndex) {
-            parts.push(text.slice(lastIndex, matchIndex));
+    return (
+      text: string,
+      isReasoning: boolean = false,
+      blockKind?: 'reasoning' | 'content' | 'tool',
+      blockIndex = -1,
+    ): React.ReactNode => {
+      // Priority 1: URL highlight
+      if (highlightedText) {
+        const urlMatches = findAllMatches(text, highlightedText);
+        if (urlMatches.length > 0) {
+          const parts: React.ReactNode[] = [];
+          let lastIndex = 0;
+          for (const m of urlMatches) {
+            if (m.start > lastIndex) parts.push(text.slice(lastIndex, m.start));
+            parts.push(
+              <mark
+                key={`url-${m.start}`}
+                className="url-highlight-mark bg-blue-100 dark:bg-blue-500/25 text-inherit px-1 py-0.5 rounded underline decoration-blue-500 dark:decoration-blue-400 decoration-2 underline-offset-2"
+                onClick={onClearHighlight}
+                title="Click to clear highlight"
+                style={{ cursor: 'pointer' }}
+              >
+                {text.slice(m.start, m.end)}
+              </mark>
+            );
+            lastIndex = m.end;
           }
-          parts.push(
-            <mark
-              key={`url-${matchIndex}`}
-              className="bg-blue-300 text-blue-900 px-0.5 rounded animate-pulse"
-              onClick={onClearHighlight}
-              title="Click to clear highlight"
-              style={{ cursor: 'pointer' }}
-            >
-              {text.slice(matchIndex, matchIndex + highlightedText.length)}
-            </mark>
-          );
-          lastIndex = matchIndex + highlightedText.length;
-          matchIndex = text.indexOf(highlightedText, lastIndex);
+          if (lastIndex < text.length) parts.push(text.slice(lastIndex));
+          return parts;
         }
-
-        if (lastIndex < text.length) {
-          parts.push(text.slice(lastIndex));
-        }
-
-        return parts.length > 0 ? parts : text;
       }
 
-      // Priority 2: Grade quotes (from LLM grading) - purple highlight
-      // Use text matching instead of position matching since the message content
-      // may be parsed (reasoning extracted) differently than the raw content
+      // Priority 2: Ephemeral user formatting — highlight / bold / italic
+      if (ephemeralHighlights.length > 0) {
+        const forThisMessage = ephemeralHighlights.filter(h => h.messageIndex === index);
+        if (forThisMessage.length > 0) {
+          const matches: { start: number; end: number; id: string; style: 'highlight' | 'bold' | 'italic' }[] = [];
+          for (const h of forThisMessage) {
+            const ms = findAllMatches(text, h.text);
+            const loc = h.locator;
+            if (loc) {
+              // Scoped to one occurrence in one block — same string
+              // elsewhere in the message is left un-styled.
+              if (!blockKind || loc.blockKind !== blockKind) continue;
+              if (loc.blockKind === 'tool' && loc.blockIndex !== blockIndex) continue;
+              const m = ms[loc.occurrence];
+              if (m) matches.push({ start: m.start, end: m.end, id: h.id, style: h.style ?? 'highlight' });
+            } else {
+              for (const m of ms) {
+                matches.push({ start: m.start, end: m.end, id: h.id, style: h.style ?? 'highlight' });
+              }
+            }
+          }
+          if (matches.length > 0) {
+            matches.sort((a, b) => a.start - b.start);
+            const parts: React.ReactNode[] = [];
+            let lastIndex = 0;
+            for (const match of matches) {
+              if (match.start < lastIndex) continue;
+              if (match.start > lastIndex) parts.push(text.slice(lastIndex, match.start));
+              const seg = text.slice(match.start, match.end);
+              const key = `ephemeral-${match.id}-${match.start}`;
+              const remove = (e: React.MouseEvent) => { e.stopPropagation(); onRemoveEphemeralHighlight?.(match.id); };
+              if (match.style === 'bold') {
+                parts.push(
+                  <strong key={key} className="ephemeral-bold-mark font-bold cursor-pointer" onClick={remove} title="Click to remove bold">
+                    {seg}
+                  </strong>
+                );
+              } else if (match.style === 'italic') {
+                parts.push(
+                  <em key={key} className="ephemeral-italic-mark italic cursor-pointer" onClick={remove} title="Click to remove italic">
+                    {seg}
+                  </em>
+                );
+              } else {
+                parts.push(
+                  <mark
+                    key={key}
+                    className="ephemeral-highlight-mark bg-fuchsia-300 dark:bg-fuchsia-500/40 text-inherit px-1 py-0.5 rounded cursor-pointer transition-colors hover:bg-fuchsia-400 dark:hover:bg-fuchsia-500/60"
+                    onClick={remove}
+                    title="Click to remove highlight"
+                  >
+                    {seg}
+                  </mark>
+                );
+              }
+              lastIndex = match.end;
+            }
+            if (lastIndex < text.length) parts.push(text.slice(lastIndex));
+            if (parts.length > 0) return parts;
+          }
+        }
+      }
+
+      // Priority 3: Grade quotes (LLM grader)
       if (gradeQuotes.length > 0) {
         const quotesForThisMessage = gradeQuotes.filter(q => q.message_index === index);
         if (quotesForThisMessage.length > 0) {
-          // Find all quote text matches in the current text
-          const matches: { start: number; end: number; text: string }[] = [];
-          
+          const matches: { start: number; end: number }[] = [];
           for (const quote of quotesForThisMessage) {
-            if (!quote.text) continue;
-            
-            // Search for the quote text in the current text
-            let searchIndex = 0;
-            let matchIndex = text.indexOf(quote.text, searchIndex);
-            
-            while (matchIndex !== -1) {
-              matches.push({
-                start: matchIndex,
-                end: matchIndex + quote.text.length,
-                text: quote.text,
-              });
-              searchIndex = matchIndex + quote.text.length;
-              matchIndex = text.indexOf(quote.text, searchIndex);
+            for (const m of findAllMatches(text, quote.text)) {
+              matches.push({ start: m.start, end: m.end });
             }
           }
-          
           if (matches.length > 0) {
-            // Sort by position and remove overlaps
             matches.sort((a, b) => a.start - b.start);
-            
             const parts: React.ReactNode[] = [];
             let lastIndex = 0;
-            
             for (const match of matches) {
-              if (match.start < lastIndex) continue; // Skip overlapping
-              
-              if (match.start > lastIndex) {
-                parts.push(text.slice(lastIndex, match.start));
-              }
-              
+              if (match.start < lastIndex) continue;
+              if (match.start > lastIndex) parts.push(text.slice(lastIndex, match.start));
               parts.push(
                 <mark
                   key={`quote-${match.start}`}
-                  className="bg-purple-200 dark:bg-purple-900/50 text-purple-900 dark:text-purple-200 px-0.5 rounded border-b-2 border-purple-400"
+                  className="grade-quote-mark bg-purple-200 dark:bg-purple-900/50 text-purple-900 dark:text-purple-200 px-0.5 rounded border-b-2 border-purple-400"
                   title="Quoted by LLM grader"
                 >
-                  {match.text}
+                  {text.slice(match.start, match.end)}
                 </mark>
               );
               lastIndex = match.end;
             }
-            
-            if (lastIndex < text.length) {
-              parts.push(text.slice(lastIndex));
-            }
-            
-            if (parts.length > 0) {
-              return parts;
-            }
+            if (lastIndex < text.length) parts.push(text.slice(lastIndex));
+            if (parts.length > 0) return parts;
           }
         }
       }
 
-      // Priority 3: Local search (within this chat) - green highlight
+      // Priority 4: Local Ctrl+F search
       if (localSearchTerm && localSearchTerm.trim() !== '') {
-        const term = localSearchTerm.toLowerCase();
-        const parts: React.ReactNode[] = [];
-        let lastIndex = 0;
-        const textLower = text.toLowerCase();
-        let matchIndex = textLower.indexOf(term, lastIndex);
-
-        while (matchIndex !== -1) {
-          if (matchIndex > lastIndex) {
-            parts.push(text.slice(lastIndex, matchIndex));
+        const localMatches = findAllMatchesCI(text, localSearchTerm);
+        if (localMatches.length > 0) {
+          const parts: React.ReactNode[] = [];
+          let lastIndex = 0;
+          for (const m of localMatches) {
+            if (m.start > lastIndex) parts.push(text.slice(lastIndex, m.start));
+            parts.push(
+              <mark
+                key={`local-${m.start}`}
+                className={`local-search-mark px-0.5 rounded ${isCurrentLocalMatch ? 'bg-green-400 text-green-900' : 'bg-green-200 text-green-800'}`}
+              >
+                {text.slice(m.start, m.end)}
+              </mark>
+            );
+            lastIndex = m.end;
           }
-          parts.push(
-            <mark
-              key={`local-${matchIndex}`}
-              className={`px-0.5 rounded ${isCurrentLocalMatch ? 'bg-green-400 text-green-900' : 'bg-green-200 text-green-800'}`}
-            >
-              {text.slice(matchIndex, matchIndex + localSearchTerm.length)}
-            </mark>
-          );
-          lastIndex = matchIndex + localSearchTerm.length;
-          matchIndex = textLower.indexOf(term, lastIndex);
+          if (lastIndex < text.length) parts.push(text.slice(lastIndex));
+          return parts;
         }
-
-        if (lastIndex < text.length) {
-          parts.push(text.slice(lastIndex));
-        }
-
-        return parts.length > 0 ? parts : text;
       }
 
-      // Priority 4: Global search terms (from left panel) - yellow highlight, current = orange
+      // Priority 5: Global filter-bar search
       const applicableTerms = getApplicableSearchTerms(isReasoning);
-      if (applicableTerms.length === 0) {
-        return text;
-      }
-
-      // Build a list of all match positions
-      const matches: { start: number; end: number; term: string }[] = [];
-      const textLower = text.toLowerCase();
-      
-      applicableTerms.forEach(term => {
-        const termLower = term.toLowerCase();
-        let searchIndex = 0;
-        let matchIndex = textLower.indexOf(termLower, searchIndex);
-        
-        while (matchIndex !== -1) {
-          matches.push({
-            start: matchIndex,
-            end: matchIndex + term.length,
-            term: text.slice(matchIndex, matchIndex + term.length)
-          });
-          searchIndex = matchIndex + term.length;
-          matchIndex = textLower.indexOf(termLower, searchIndex);
+      if (applicableTerms.length === 0) return text;
+      const matches: { start: number; end: number }[] = [];
+      for (const term of applicableTerms) {
+        for (const m of findAllMatchesCI(text, term)) {
+          matches.push({ start: m.start, end: m.end });
         }
-      });
-
-      if (matches.length === 0) {
-        return text;
       }
-
-      // Sort matches by position and merge overlapping
+      if (matches.length === 0) return text;
       matches.sort((a, b) => a.start - b.start);
-      
       const parts: React.ReactNode[] = [];
       let lastIndex = 0;
-      let occurrenceIdx = 0; // Track occurrence within this message
-
-      matches.forEach((match) => {
-        if (match.start < lastIndex) return; // Skip overlapping
-        
-        if (match.start > lastIndex) {
-          parts.push(text.slice(lastIndex, match.start));
-        }
-        
-        // Calculate global occurrence index for this match
+      let occurrenceIdx = 0;
+      for (const match of matches) {
+        if (match.start < lastIndex) continue;
+        if (match.start > lastIndex) parts.push(text.slice(lastIndex, match.start));
         const globalIdx = messageOccurrenceStart + occurrenceIdx;
         const isCurrent = globalIdx === currentOccurrenceIndex;
-        
         parts.push(
           <mark
             key={`global-${occurrenceIdx}-${match.start}`}
             className={`px-0.5 rounded global-search-highlight ${
-              isCurrent 
-                ? 'bg-orange-400 text-orange-950 ring-2 ring-orange-500 ring-offset-1' 
+              isCurrent
+                ? 'bg-orange-400 text-orange-950 ring-2 ring-orange-500 ring-offset-1'
                 : 'bg-yellow-300 text-yellow-900'
             }`}
           >
-            {match.term}
+            {text.slice(match.start, match.end)}
           </mark>
         );
         lastIndex = match.end;
         occurrenceIdx++;
-      });
-
-      if (lastIndex < text.length) {
-        parts.push(text.slice(lastIndex));
       }
-
-      return parts.length > 0 ? parts : text;
+      if (lastIndex < text.length) parts.push(text.slice(lastIndex));
+      return parts;
     };
-  }, [searchConditions, getApplicableSearchTerms, localSearchTerm, isCurrentLocalMatch, highlightedText, onClearHighlight, messageOccurrenceStart, currentOccurrenceIndex, gradeQuotes, index]);
+  }, [
+    getApplicableSearchTerms, localSearchTerm, isCurrentLocalMatch,
+    highlightedText, onClearHighlight, messageOccurrenceStart, currentOccurrenceIndex,
+    gradeQuotes, index, ephemeralHighlights, onRemoveEphemeralHighlight,
+  ]);
 
-  const { reasoning, mainContent, toolCallText } = useMemo(() =>
-    normalizeAssistantMessage(message),
-    [message.role, message.content, message.content_parts]
+  // True when an entire section's text is collapsed by a single region —
+  // lets the section drop its card chrome (header + border) and render as
+  // just the `[...]` pill.
+  const isSectionCollapsed = (sectionText: string): boolean =>
+    isPresentationMode &&
+    collapsedRegions.some((r) => r.messageIndex === index && r.text === sectionText);
+
+  // True when this message has any collapsed region — gates the per-message
+  // "expand all" button, the recovery path for hidden ellipses.
+  const messageHasCollapses = collapsedRegions.some((r) => r.messageIndex === index);
+
+  // Outer pass: replace collapsed spans with `<ElisionPill>`, recursing the
+  // rest of the text through the highlight cascade. Active only in
+  // Presentation Mode; the cascade is otherwise untouched.
+  //
+  // Pills are joined to the surrounding text on both sides by default — a
+  // collapsed span sits inline with the line before and the line after.
+  // Each pill's right-click menu can override a side; an explicit `false`
+  // breaks the pill onto its own line.
+  const renderWithCollapse = (
+    text: string,
+    isReasoning: boolean,
+    blockKind: 'reasoning' | 'content' | 'tool',
+    blockIndex = -1,
+  ): React.ReactNode => {
+    if (!isPresentationMode || collapsedRegions.length === 0) {
+      return highlightSearchAndUrl(text, isReasoning, blockKind, blockIndex);
+    }
+    const regionsForThis = collapsedRegions.filter(r => r.messageIndex === index);
+    if (regionsForThis.length === 0) return highlightSearchAndUrl(text, isReasoning, blockKind, blockIndex);
+
+    const found: { start: number; end: number; region: CollapsedRegion }[] = [];
+    for (const region of regionsForThis) {
+      const ms = findAllMatches(text, region.text);
+      const loc = region.locator;
+      if (loc) {
+        // Scoped to one occurrence in one block — the same string elsewhere
+        // in the message is left alone.
+        if (loc.blockKind !== blockKind) continue;
+        if (loc.blockKind === 'tool' && loc.blockIndex !== blockIndex) continue;
+        const m = ms[loc.occurrence];
+        if (m) found.push({ start: m.start, end: m.end, region });
+      } else {
+        // Unlocated (whole-section / isolate collapse) — its text is unique.
+        for (const m of ms) found.push({ start: m.start, end: m.end, region });
+      }
+    }
+    if (found.length === 0) return highlightSearchAndUrl(text, isReasoning, blockKind, blockIndex);
+    found.sort((a, b) => a.start - b.start);
+
+    // Drop overlapping matches → a clean, ordered list of pills.
+    const pills: { start: number; end: number; region: CollapsedRegion }[] = [];
+    let cursor = 0;
+    for (const m of found) {
+      if (m.start < cursor) continue;
+      pills.push(m);
+      cursor = m.end;
+    }
+
+    // Text segments around the pills: gaps[i] precedes pills[i],
+    // gaps[pills.length] is the trailing text.
+    const gaps: string[] = [];
+    for (let i = 0; i <= pills.length; i++) {
+      const s = i === 0 ? 0 : pills[i - 1].end;
+      const e = i === pills.length ? text.length : pills[i].start;
+      gaps.push(text.slice(s, e));
+    }
+
+    // Normalize the whitespace where a gap meets a pill, per the pill's
+    // explicit join overrides. undefined → leave the source verbatim;
+    // true → drop the boundary newline (pill shares the line); false →
+    // force exactly one boundary newline (pill on its own line).
+    const joinGap = (g: string, leftAfter: boolean | undefined, rightBefore: boolean | undefined): string => {
+      let out = g;
+      if (rightBefore === true) out = out.replace(/\s*\n\s*$/, ' ');
+      else if (rightBefore === false) out = out.replace(/\s*$/, '\n');
+      if (leftAfter === true) out = out.replace(/^\s*\n\s*/, ' ');
+      else if (leftAfter === false) out = out.replace(/^\s*/, '\n');
+      return out;
+    };
+
+    const parts: React.ReactNode[] = [];
+    for (let i = 0; i <= pills.length; i++) {
+      // A pill defaults to joined (inline) on each side; `undefined` here
+      // means there's simply no pill on that side (a document end), which
+      // joinGap leaves verbatim.
+      const leftAfter = i === 0 ? undefined : (pills[i - 1].region.joinAfter ?? true);
+      const rightBefore = i === pills.length ? undefined : (pills[i].region.joinBefore ?? true);
+      const gap = joinGap(gaps[i], leftAfter, rightBefore);
+      if (gap) {
+        parts.push(
+          <Fragment key={`vis-${i}`}>{highlightSearchAndUrl(gap, isReasoning, blockKind, blockIndex)}</Fragment>
+        );
+      }
+      if (i < pills.length) {
+        const p = pills[i];
+        if (!p.region.hidden) {
+          // Effective join state for the menu ticks — joined unless the
+          // user explicitly broke that side.
+          const effJoinBefore = p.region.joinBefore ?? true;
+          const effJoinAfter = p.region.joinAfter ?? true;
+          parts.push(
+            <ElisionPill
+              key={`pill-${p.region.id}-${p.start}`}
+              text={p.region.text}
+              label={p.region.label}
+              isDarkMode={isDarkMode}
+              joinBefore={effJoinBefore}
+              joinAfter={effJoinAfter}
+              onChangeLabel={(label) => onUpdateCollapsedRegionLabel?.(p.region.id, label)}
+              onRemove={() => onRemoveCollapsedRegion?.(p.region.id)}
+              onHide={() => onHideCollapsedRegion?.(p.region.id)}
+              onToggleJoinBefore={() => onUpdateCollapsedRegionJoin?.(p.region.id, 'before', !effJoinBefore)}
+              onToggleJoinAfter={() => onUpdateCollapsedRegionJoin?.(p.region.id, 'after', !effJoinAfter)}
+            />
+          );
+        }
+      }
+    }
+    return parts;
+  };
+
+  // Use the *normalized* tool calls (Kimi/Harmony parsers extract them
+  // into this field) so structured rendering works even when the producer
+  // wrote inline tool tags rather than message.tool_calls.
+  const { reasoning, mainContent, toolCallText, toolCalls } = useMemo(
+    () => normalizeAssistantMessage(message),
+    // normalizeAssistantMessage reads only these four fields of `message`;
+    // listing them (not `message`) avoids recompute on unrelated identity changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [message.role, message.content, message.content_parts, message.tool_calls],
   );
+
+  // Copy a plain-text rendition of this message's body (reasoning labeled,
+  // tool calls labeled, ChatML markers stripped) for pasting into docs /
+  // chat. Distinct from the "Copy link" button (which copies a URL) and
+  // from the chat-level "Copy conversation" (which copies all messages).
+  const copyMessageText = () => {
+    const text = formatMessageText(message);
+    if (!text) return;
+    navigator.clipboard.writeText(text);
+    setCopiedText(true);
+    setTimeout(() => setCopiedText(false), 2000);
+  };
 
   const copyMessageLink = () => {
     const link = generateLink({
       file: filePath,
       rollout: rolloutN,
       step,
+      index: selectedIndexInFile,
       message: index,
     });
     navigator.clipboard.writeText(link);
@@ -386,6 +785,7 @@ function MessageCardInner({
       file: filePath,
       rollout: rolloutN,
       step,
+      index: selectedIndexInFile,
       message: index,
       highlight: selectionPopup.text,
     });
@@ -397,34 +797,75 @@ function MessageCardInner({
     }, 1500);
   };
 
+  // Mint a share token (or reuse one in scope) and copy a token-based URL
+  // to this specific message. Recipient doesn't need to log in.
+  const shareMessage = async () => {
+    try {
+      let token = shareToken;
+      if (!token) {
+        const res = await fetch('/api/share/create', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            file: filePath,
+            rollout: rolloutN,
+            step,
+            // Authoritative disambiguator — without it, two samples sharing
+            // (rollout, step) would point the recipient at whichever one
+            // came first in the file rather than the one we shared from.
+            index: selectedIndexInFile,
+          }),
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        token = data.token;
+      }
+      if (token) {
+        const params = new URLSearchParams({ share: token, message: index.toString() });
+        const url = `${PUBLIC_BASE_URL}/?${params.toString()}`;
+        navigator.clipboard.writeText(url);
+        setSharedMsg(true);
+        setTimeout(() => setSharedMsg(false), 2000);
+      }
+    } catch { /* ignore */ }
+  };
+
   const textPrimary = isDarkMode ? 'text-gray-200' : 'text-gray-900';
   const textSecondary = isDarkMode ? 'text-gray-300' : 'text-gray-800';
   const textMuted = isDarkMode ? 'text-gray-400' : 'text-gray-600';
+  const actionBtn = `rounded-md w-6 h-6 focus:outline-none focus:ring-4 flex justify-center items-center ${config.buttonClassName} shadow-md shadow-black/20`;
 
   return (
-    <div 
-      ref={cardRef} 
+    <div
+      ref={cardRef}
       className={`transition-all duration-200 relative ${isHighlighted ? 'ring-2 ring-blue-500 ring-offset-2 rounded-lg' : ''}`}
+      onMouseEnter={() => setIsHovered(true)}
+      onMouseLeave={() => setIsHovered(false)}
+      onMouseDown={() => { if (isPresentationMode) onPreviewSelect?.(index); }}
     >
       <div className="relative">
         <div className={`rounded-lg border-l-4 overflow-hidden transition-all duration-200 ${config.className} shadow-md`}>
           {/* Header */}
           <div className={`shadow-xs ${config.headerClassName}`}>
-            <div 
+            <div
               className={`flex items-center justify-between pl-2 pr-1 py-1 cursor-pointer transition-colors duration-150 ${isDarkMode ? 'hover:bg-white/5' : 'hover:bg-gray-50/50'}`}
               onClick={() => setIsExpanded(!isExpanded)}
             >
               <div className="flex items-center gap-2">
-                <button>
-                  <span 
-                    className={`material-symbols-outlined ${textMuted} transition-transform duration-200 p-2 -m-2 ${isExpanded ? '' : '-rotate-90'}`} 
+                <button className="presentation-chrome">
+                  <span
+                    className={`material-symbols-outlined ${textMuted} transition-transform duration-200 p-2 -m-2 ${isExpanded ? '' : '-rotate-90'}`}
                     style={{ fontSize: 17 }}
                   >
                     expand_less
                   </span>
                 </button>
                 <span className={`font-medium text-sm ${textSecondary}`}>
-                  <span className="flex items-center h-5 gap-1">
+                  {/* min-h (not fixed h) so in the scaled-up capture the
+                      header grows with the enlarged icon/label instead of
+                      staying cramped. On screen the content is 20px tall, so
+                      min-h-5 renders identically to the old h-5. */}
+                  <span className="flex items-center min-h-5 gap-1">
                     <span className="material-symbols-outlined" style={{ fontSize: 20 }}>
                       {config.icon}
                     </span>
@@ -432,67 +873,143 @@ function MessageCardInner({
                   </span>
                 </span>
               </div>
-              <div className="flex items-center gap-2">
-                <div className="flex items-center gap-1">
-                  <button 
-                    className={`rounded-md w-6 h-6 focus:outline-none focus:ring-4 flex justify-center items-center ${config.buttonClassName} shadow-md shadow-black/20 relative`}
-                    title="Copy link to this message"
-                    onClick={(e) => { e.stopPropagation(); copyMessageLink(); }}
+              {/* Action buttons — entirely presentation-chrome (excluded
+                  from a captured image). */}
+              <div className="flex items-center gap-1 presentation-chrome">
+                {isPresentationMode && messageHasCollapses && (
+                  <button
+                    data-testid="expand-message-btn"
+                    className={actionBtn}
+                    title="Expand all collapsed spans in this message"
+                    onClick={(e) => { e.stopPropagation(); onExpandMessageCollapses?.(index); }}
                   >
-                    <span className="material-symbols-outlined" style={{ fontSize: 17 }}>
-                      {copiedLink ? 'check' : 'link'}
-                    </span>
+                    <span className="material-symbols-outlined" style={{ fontSize: 17 }}>unfold_more</span>
                   </button>
-                  <button 
-                    className={`rounded-md w-6 h-6 focus:outline-none focus:ring-4 flex justify-center items-center ${config.buttonClassName} shadow-md shadow-black/20`}
-                    title="Remove this and all subsequent messages"
-                    onClick={(e) => e.stopPropagation()}
+                )}
+                {isPresentationMode && (
+                  <button
+                    data-testid="preview-message-btn"
+                    className={`${actionBtn} transition-opacity ${isHovered ? 'opacity-100' : 'opacity-0'}`}
+                    title="Preview the capture image"
+                    onClick={(e) => { e.stopPropagation(); previewThisCard(); }}
                   >
-                    <span className="material-symbols-outlined" style={{ fontSize: 17 }}>cut</span>
+                    <span className="material-symbols-outlined" style={{ fontSize: 17 }}>preview</span>
                   </button>
-                  <button 
-                    className={`rounded-md w-6 h-6 focus:outline-none focus:ring-4 flex justify-center items-center ${config.buttonClassName} shadow-md shadow-black/20`}
-                    title="Edit message"
-                    onClick={(e) => e.stopPropagation()}
+                )}
+                {isPresentationMode && (
+                  <button
+                    data-testid="capture-message-btn"
+                    className={`${actionBtn} transition-opacity ${isHovered ? 'opacity-100' : 'opacity-0'}`}
+                    title="Capture this message as an image (or press P)"
+                    onClick={(e) => { e.stopPropagation(); captureThisCard(); }}
                   >
-                    <span className="material-symbols-outlined" style={{ fontSize: 17 }}>edit</span>
+                    <span className="material-symbols-outlined" style={{ fontSize: 17 }}>photo_camera</span>
                   </button>
-                </div>
+                )}
+                <button
+                  className={`${actionBtn} relative`}
+                  title="Copy link to this message"
+                  onClick={(e) => { e.stopPropagation(); copyMessageLink(); }}
+                >
+                  <span className="material-symbols-outlined" style={{ fontSize: 17 }}>
+                    {copiedLink ? 'check' : 'link'}
+                  </span>
+                </button>
+                <button
+                  className={`rounded-md w-6 h-6 focus:outline-none focus:ring-4 flex justify-center items-center ${
+                    sharedMsg
+                      ? 'bg-green-600 text-white'
+                      : isDarkMode ? 'text-emerald-400 bg-emerald-900/60' : 'text-emerald-700 bg-emerald-100'
+                  } shadow-md shadow-black/20`}
+                  title="Share this message (no password needed)"
+                  onClick={(e) => { e.stopPropagation(); shareMessage(); }}
+                >
+                  <span className="material-symbols-outlined" style={{ fontSize: 17 }}>
+                    {sharedMsg ? 'check' : 'share'}
+                  </span>
+                </button>
+                <button
+                  className={`rounded-md w-6 h-6 focus:outline-none focus:ring-4 flex justify-center items-center ${
+                    copiedText ? 'bg-green-600 text-white' : config.buttonClassName
+                  } shadow-md shadow-black/20`}
+                  title="Copy message text (reasoning, content, tool calls)"
+                  onClick={(e) => { e.stopPropagation(); copyMessageText(); }}
+                >
+                  <span className="material-symbols-outlined" style={{ fontSize: 17 }}>
+                    {copiedText ? 'check' : 'content_copy'}
+                  </span>
+                </button>
+                <button
+                  className={actionBtn}
+                  title="Remove this and all subsequent messages"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <span className="material-symbols-outlined" style={{ fontSize: 17 }}>cut</span>
+                </button>
+                <button
+                  className={actionBtn}
+                  title="Edit message"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <span className="material-symbols-outlined" style={{ fontSize: 17 }}>edit</span>
+                </button>
               </div>
             </div>
           </div>
 
           {/* Content */}
-          <div 
+          <div
             className={`grid transition-all duration-300 ease-in-out ${isExpanded ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]'}`}
             style={{ overflowWrap: 'anywhere' }}
           >
             <div className="overflow-hidden">
-              <div 
+              <div
                 ref={contentRef}
                 className="space-y-3 py-3"
-                onMouseUp={handleMouseUp}
               >
-                {/* Reasoning block */}
-                {reasoning && (
+                {/* Reasoning block. When collapsed whole, it is NOT drawn
+                    here — a standalone block would strand the [...] on its
+                    own line; instead the [...] leads the main content below
+                    inline (see the content block). */}
+                {reasoning && !isSectionCollapsed(reasoning) && (
                   <div className="mx-3 rounded-md border-l-4 shadow-xs overflow-hidden reasoning">
-                    <div className={`px-2 py-1 flex items-center gap-1 text-sm font-medium ${textSecondary} shadow-2xs reasoning-header`}>
-                      <span className="material-symbols-outlined" style={{ fontSize: 20 }}>lightbulb</span>
-                      reasoning
+                    <div className={`px-2 py-1 flex items-center justify-between gap-1 text-sm font-medium ${textSecondary} shadow-2xs reasoning-header`}>
+                      <span className="flex items-center gap-1">
+                        <span className="material-symbols-outlined" style={{ fontSize: 20 }}>lightbulb</span>
+                        reasoning
+                      </span>
+                      {isPresentationMode && (
+                        <button
+                          type="button"
+                          data-testid="collapse-reasoning-btn"
+                          className={`presentation-chrome shrink-0 rounded p-0.5 ${isDarkMode ? 'text-gray-300 hover:bg-white/10' : 'text-gray-600 hover:bg-black/10'}`}
+                          title="Collapse the whole reasoning section to [...]"
+                          onClick={(e) => { e.stopPropagation(); onAddCollapsedRegion?.(index, reasoning); }}
+                        >
+                          <span className="material-symbols-outlined" style={{ fontSize: 16 }}>unfold_less</span>
+                        </button>
+                      )}
                     </div>
-                    <div className={`px-2 py-1 text-sm ${textPrimary} whitespace-pre-wrap`}>
-                      {highlightSearchAndUrl(reasoning, true)}
+                    <div data-msg-block data-block-kind="reasoning" className={`px-2 py-1 text-sm ${textPrimary} whitespace-pre-wrap`}>
+                      {renderWithCollapse(reasoning, true, 'reasoning')}
                     </div>
                   </div>
                 )}
 
-                {/* Main content */}
-                <div className={`mx-3 whitespace-pre-wrap text-sm ${textPrimary}`}>
-                  {highlightSearchAndUrl(mainContent, false)}
+                {/* Main content. A collapsed-whole reasoning section leads
+                    here as an inline [...] so it shares the first line
+                    (its right-click "same line" toggle then works). */}
+                <div data-msg-block data-block-kind="content" className={`mx-3 whitespace-pre-wrap text-sm ${textPrimary}`}>
+                  {reasoning && isSectionCollapsed(reasoning) && (
+                    <>{renderWithCollapse(reasoning, true, 'reasoning')}{' '}</>
+                  )}
+                  {renderWithCollapse(mainContent, false, 'content')}
                 </div>
 
-                {/* Inline tool-call text (from Kimi/ChatML traces) */}
-                {toolCallText && (
+                {/* Inline tool-call text — only when no structured tool calls
+                    were extracted (older Kimi rows the parser didn't fully
+                    recover). Today the parser always populates `toolCalls`. */}
+                {toolCallText && toolCalls.length === 0 && (
                   <div className={`mx-3 rounded-md border overflow-hidden ${isDarkMode ? 'border-gray-600 bg-gray-800/50' : 'border-gray-200 bg-gray-50'}`}>
                     <div className={`px-2 py-1 flex items-center gap-1 text-xs font-medium ${isDarkMode ? 'bg-gray-700/50 text-gray-300' : 'bg-gray-100 text-gray-600'}`}>
                       <span className="material-symbols-outlined" style={{ fontSize: 14 }}>terminal</span>
@@ -502,22 +1019,67 @@ function MessageCardInner({
                   </div>
                 )}
 
-                {/* Structured tool calls */}
-                {message.tool_calls && message.tool_calls.length > 0 && (
+                {/* Structured tool calls (covers structured + Kimi/Harmony
+                    extracted by the parser into the unified `toolCalls`). */}
+                {toolCalls.length > 0 && (
                   <div className="mx-3 space-y-2">
-                    {message.tool_calls.map((tc, tcIdx) => {
-                      const args = typeof tc.function.arguments === 'string'
-                        ? tc.function.arguments
-                        : tc.function.arguments?.command != null
-                          ? String(tc.function.arguments.command)
-                          : JSON.stringify(tc.function.arguments, null, 2);
-                      return (
+                    {toolCalls.map((tc, tcIdx) => {
+                      const args = toolCallArgsText(tc);
+                      const isWrapped = wrappedToolCalls.has(`${index}:${tcIdx}`);
+                      return isSectionCollapsed(args) ? (
+                        // Inline span (not a block) so consecutive collapsed
+                        // tool calls share a line instead of stacking.
+                        <span key={tcIdx} className="text-xs whitespace-pre-wrap">{renderWithCollapse(args, false, 'tool', tcIdx)}</span>
+                      ) : (
                         <div key={tcIdx} className={`rounded-md border overflow-hidden ${isDarkMode ? 'border-gray-600 bg-gray-800/50' : 'border-gray-200 bg-gray-50'}`}>
-                          <div className={`px-2 py-1 flex items-center gap-1 text-xs font-medium ${isDarkMode ? 'bg-gray-700/50 text-gray-300' : 'bg-gray-100 text-gray-600'}`}>
-                            <span className="material-symbols-outlined" style={{ fontSize: 14 }}>terminal</span>
-                            {tc.function.name}
+                          <div className={`px-2 py-1 flex items-center justify-between text-xs font-medium ${isDarkMode ? 'bg-gray-700/50 text-gray-300' : 'bg-gray-100 text-gray-600'}`}>
+                            <div className="flex items-center gap-1 min-w-0">
+                              <span className="material-symbols-outlined" style={{ fontSize: 14 }}>terminal</span>
+                              <span className="truncate">{highlightSearchAndUrl(tc.function.name, false)}</span>
+                            </div>
+                            <div className="flex items-center gap-0.5 shrink-0">
+                              {isPresentationMode && (
+                                <button
+                                  type="button"
+                                  data-testid={`collapse-toolcall-btn-${tcIdx}`}
+                                  onClick={(e) => { e.stopPropagation(); onAddCollapsedRegion?.(index, args); }}
+                                  title="Collapse this whole tool call to [...]"
+                                  className={`presentation-chrome rounded p-0.5 transition-colors ${
+                                    isDarkMode ? 'text-gray-400 hover:bg-gray-700' : 'text-gray-500 hover:bg-gray-200'
+                                  }`}
+                                >
+                                  <span className="material-symbols-outlined" style={{ fontSize: 14 }}>unfold_less</span>
+                                </button>
+                              )}
+                              {/* Wrap toggle — opt-in soft-wrap for long heredocs / pasted output. */}
+                              <button
+                                type="button"
+                                onClick={(e) => { e.stopPropagation(); onToggleToolCallWrap?.(index, tcIdx); }}
+                                title={isWrapped ? 'Disable wrapping (horizontal scroll)' : 'Wrap text to fit width'}
+                                aria-label={isWrapped ? 'Disable wrapping' : 'Wrap text'}
+                                aria-pressed={isWrapped}
+                                data-testid={`tool-call-wrap-toggle-${tcIdx}`}
+                                className={`presentation-chrome shrink-0 rounded p-0.5 transition-colors ${
+                                  isWrapped
+                                    ? (isDarkMode ? 'bg-blue-900/60 text-blue-200' : 'bg-blue-100 text-blue-700')
+                                    : (isDarkMode ? 'text-gray-400 hover:bg-gray-700' : 'text-gray-500 hover:bg-gray-200')
+                                }`}
+                              >
+                                <span className="material-symbols-outlined" style={{ fontSize: 14 }}>wrap_text</span>
+                              </button>
+                            </div>
                           </div>
-                          <pre className={`px-2 py-1 text-xs overflow-x-auto ${isDarkMode ? 'text-green-400' : 'text-gray-800'}`}>{args}</pre>
+                          <pre
+                            data-msg-block
+                            data-block-kind="tool"
+                            data-block-index={tcIdx}
+                            data-testid={`tool-call-pre-${tcIdx}`}
+                            className={`px-2 py-1 text-xs ${
+                              isWrapped ? 'whitespace-pre-wrap break-words' : 'overflow-x-auto'
+                            } ${isDarkMode ? 'text-green-400' : 'text-gray-800'}`}
+                          >
+                            {renderWithCollapse(args, false, 'tool', tcIdx)}
+                          </pre>
                         </div>
                       );
                     })}
@@ -528,22 +1090,69 @@ function MessageCardInner({
           </div>
         </div>
 
-        {/* Selection popup for copying link with highlight */}
+        {/* Selection popup — highlight / collapse / copy-link / share-quote.
+            Carries presentation-chrome so it never lands in a capture. */}
         {selectionPopup.show && (
-          <div 
-            className={`selection-popup absolute z-50 transform -translate-x-1/2 -translate-y-full flex items-center gap-1 px-2 py-1 rounded-lg shadow-lg ${
+          <div
+            ref={popupRef}
+            className={`selection-popup presentation-chrome absolute z-50 transform -translate-x-1/2 -translate-y-full flex items-center gap-1 px-2 py-1 rounded-lg shadow-lg ${
               isDarkMode ? 'bg-gray-800 border border-gray-600' : 'bg-white border border-gray-300'
             }`}
-            style={{ 
-              left: selectionPopup.x, 
-              top: selectionPopup.y,
-            }}
+            style={{ top: selectionPopup.y }}
           >
+            {/* Collapse — Presentation Mode only. Plain click collapses the
+                selection; Alt-click isolates (collapses everything else). */}
+            {isPresentationMode && (
+              <>
+                <button
+                  data-testid="collapse-selection-btn"
+                  onClick={(e) => { e.stopPropagation(); if (e.altKey) doIsolate(); else doCollapse(); }}
+                  className={`flex items-center gap-1 px-2 py-1 rounded text-xs font-medium transition-colors ${
+                    isDarkMode ? 'text-gray-200 hover:bg-gray-700' : 'text-gray-700 hover:bg-gray-100'
+                  }`}
+                  title="Collapse selection — C  (O or Alt-click to isolate)"
+                >
+                  <span className="material-symbols-outlined" style={{ fontSize: 14 }}>unfold_less</span>
+                  Collapse
+                </button>
+                <div className={`w-px h-4 ${isDarkMode ? 'bg-gray-600' : 'bg-gray-300'}`} />
+              </>
+            )}
+            {/* Ephemeral text styles — session-only, not shared, click the
+                styled span to remove. */}
+            <button
+              onClick={() => applyFormat('highlight')}
+              className={`flex items-center justify-center w-7 h-7 rounded transition-colors ${
+                isDarkMode ? 'text-fuchsia-300 hover:bg-gray-700' : 'text-fuchsia-700 hover:bg-fuchsia-50'
+              }`}
+              title="Highlight selection — H  (session only)"
+            >
+              <span className="material-symbols-outlined" style={{ fontSize: 16 }}>ink_highlighter</span>
+            </button>
+            <button
+              onClick={() => applyFormat('bold')}
+              className={`flex items-center justify-center w-7 h-7 rounded transition-colors ${
+                isDarkMode ? 'text-gray-200 hover:bg-gray-700' : 'text-gray-700 hover:bg-gray-100'
+              }`}
+              title="Bold selection — B"
+            >
+              <span className="material-symbols-outlined" style={{ fontSize: 16 }}>format_bold</span>
+            </button>
+            <button
+              onClick={() => applyFormat('italic')}
+              className={`flex items-center justify-center w-7 h-7 rounded transition-colors ${
+                isDarkMode ? 'text-gray-200 hover:bg-gray-700' : 'text-gray-700 hover:bg-gray-100'
+              }`}
+              title="Italic selection — I"
+            >
+              <span className="material-symbols-outlined" style={{ fontSize: 16 }}>format_italic</span>
+            </button>
+            <div className={`w-px h-4 ${isDarkMode ? 'bg-gray-600' : 'bg-gray-300'}`} />
             <button
               onClick={copySelectionLink}
               className={`flex items-center gap-1 px-2 py-1 rounded text-xs font-medium transition-colors ${
-                isDarkMode 
-                  ? 'text-blue-400 hover:bg-gray-700' 
+                isDarkMode
+                  ? 'text-blue-400 hover:bg-gray-700'
                   : 'text-blue-600 hover:bg-blue-50'
               }`}
               title="Copy link with highlighted text"
@@ -555,10 +1164,55 @@ function MessageCardInner({
             </button>
             <div className={`w-px h-4 ${isDarkMode ? 'bg-gray-600' : 'bg-gray-300'}`} />
             <button
+              onClick={async () => {
+                try {
+                  let token = shareToken;
+                  if (!token) {
+                    const res = await fetch('/api/share/create', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        file: filePath,
+                        rollout: rolloutN,
+                        step,
+                        index: selectedIndexInFile,
+                      }),
+                    });
+                    if (!res.ok) return;
+                    const data = await res.json();
+                    token = data.token;
+                  }
+                  if (token) {
+                    const params = new URLSearchParams({
+                      share: token,
+                      message: index.toString(),
+                      highlight: selectionPopup.text,
+                    });
+                    navigator.clipboard.writeText(`${PUBLIC_BASE_URL}/?${params.toString()}`);
+                    setCopiedSelection(true);
+                    setTimeout(() => {
+                      setCopiedSelection(false);
+                      setSelectionPopup(prev => ({ ...prev, show: false }));
+                    }, 1500);
+                  }
+                } catch { /* ignore */ }
+              }}
+              className={`flex items-center gap-1 px-2 py-1 rounded text-xs font-medium transition-colors ${
+                isDarkMode
+                  ? 'text-emerald-400 hover:bg-gray-700'
+                  : 'text-emerald-600 hover:bg-emerald-50'
+              }`}
+              title="Share this quote (no password needed)"
+            >
+              <span className="material-symbols-outlined" style={{ fontSize: 14 }}>share</span>
+              Share quote
+            </button>
+            <div className={`w-px h-4 ${isDarkMode ? 'bg-gray-600' : 'bg-gray-300'}`} />
+            <button
               onClick={() => setSelectionPopup(prev => ({ ...prev, show: false }))}
               className={`p-1 rounded transition-colors ${
-                isDarkMode 
-                  ? 'text-gray-400 hover:bg-gray-700' 
+                isDarkMode
+                  ? 'text-gray-400 hover:bg-gray-700'
                   : 'text-gray-500 hover:bg-gray-100'
               }`}
               title="Close"
@@ -566,10 +1220,10 @@ function MessageCardInner({
               <span className="material-symbols-outlined" style={{ fontSize: 14 }}>close</span>
             </button>
             {/* Arrow */}
-            <div 
+            <div
               className={`absolute left-1/2 -translate-x-1/2 top-full w-0 h-0 border-l-4 border-r-4 border-t-4 ${
-                isDarkMode 
-                  ? 'border-l-transparent border-r-transparent border-t-gray-800' 
+                isDarkMode
+                  ? 'border-l-transparent border-r-transparent border-t-gray-800'
                   : 'border-l-transparent border-r-transparent border-t-white'
               }`}
             />
@@ -579,5 +1233,10 @@ function MessageCardInner({
     </div>
   );
 }
+
+// SearchField is referenced via the props interface only as part of
+// SearchCondition; suppress the unused-import lint without dropping the
+// type re-export for clarity.
+void (null as unknown as SearchField);
 
 export const MessageCard = memo(MessageCardInner);

@@ -30,6 +30,18 @@ export default defineConfig({
           });
         },
       },
+      // SSE streaming endpoint for the rollout-discussion chat
+      '/api/rollout-chat-stream': {
+        target: 'http://localhost:8000',
+        changeOrigin: true,
+        selfHandleResponse: false,
+        configure: (proxy) => {
+          proxy.on('proxyRes', (proxyRes) => {
+            proxyRes.headers['cache-control'] = 'no-cache';
+            proxyRes.headers['x-accel-buffering'] = 'no';
+          });
+        },
+      },
       // Regular API endpoints
       '/api': {
         target: 'http://localhost:8000',

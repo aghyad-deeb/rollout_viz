@@ -101,7 +101,7 @@ describe('useUrlState', () => {
     it('builds full URL with params', () => {
       const { result } = renderHook(() => useUrlState());
       const link = result.current.generateLink({ file: 'test.jsonl', rollout: 3 });
-      expect(link).toContain('http://localhost:3000');
+      expect(link).toContain('https://rollout-viz.com');
       expect(link).toContain('file=test.jsonl');
       expect(link).toContain('rollout=3');
     });

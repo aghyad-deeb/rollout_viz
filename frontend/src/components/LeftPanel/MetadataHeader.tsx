@@ -7,6 +7,7 @@ interface MetadataHeaderProps {
   totalSamples: number;
   filteredCount: number;
   isDarkMode: boolean;
+  isSharedMode?: boolean;
 }
 
 export function MetadataHeader({
@@ -16,6 +17,7 @@ export function MetadataHeader({
   totalSamples,
   filteredCount,
   isDarkMode,
+  isSharedMode = false,
 }: MetadataHeaderProps) {
   const [isEditing, setIsEditing] = useState(false);
   const [editPath, setEditPath] = useState(filePaths[0] || '');
@@ -72,8 +74,9 @@ export function MetadataHeader({
               ) : (
                 <div className="flex flex-col gap-1">
                   <div 
-                    className={`text-sm cursor-pointer ${isDarkMode ? 'text-gray-400 hover:text-gray-200' : 'text-gray-600 hover:text-gray-800'}`}
+                    className={`text-sm ${isSharedMode ? '' : 'cursor-pointer'} ${isDarkMode ? 'text-gray-400 hover:text-gray-200' : 'text-gray-600 hover:text-gray-800'}`}
                     onClick={() => {
+                      if (isSharedMode) return;
                       if (filePaths.length === 1) {
                         setEditPath(filePaths[0]);
                         setIsEditing(true);
@@ -81,7 +84,7 @@ export function MetadataHeader({
                         setShowAllFiles(!showAllFiles);
                       }
                     }}
-                    title={filePaths.length === 1 ? "Click to edit file path" : "Click to show/hide files"}
+                    title={isSharedMode ? undefined : filePaths.length === 1 ? "Click to edit file path" : "Click to show/hide files"}
                   >
                     {displayPath}
                   </div>
@@ -100,15 +103,17 @@ export function MetadataHeader({
           </div>
           <div className={`flex-1 text-right text-xs truncate flex flex-col gap-1 ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>
             <div>{new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}</div>
-            <div className="flex justify-end gap-2">
-              <button
-                onClick={copyToClipboard}
-                className={`text-xs flex items-center gap-1 cursor-pointer border-b ${isDarkMode ? 'text-gray-400 hover:text-gray-200 border-gray-600 hover:border-gray-400' : 'text-gray-500 hover:text-gray-700 border-gray-300 hover:border-gray-500'}`}
-              >
-                <span className="material-symbols-outlined" style={{ fontSize: 14 }}>content_copy</span>
-                Log path{filePaths.length > 1 ? 's' : ''}
-              </button>
-            </div>
+            {!isSharedMode && (
+              <div className="flex justify-end gap-2">
+                <button
+                  onClick={copyToClipboard}
+                  className={`text-xs flex items-center gap-1 cursor-pointer border-b ${isDarkMode ? 'text-gray-400 hover:text-gray-200 border-gray-600 hover:border-gray-400' : 'text-gray-500 hover:text-gray-700 border-gray-300 hover:border-gray-500'}`}
+                >
+                  <span className="material-symbols-outlined" style={{ fontSize: 14 }}>content_copy</span>
+                  Log path{filePaths.length > 1 ? 's' : ''}
+                </button>
+              </div>
+            )}
           </div>
         </div>
         

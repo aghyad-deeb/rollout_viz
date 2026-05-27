@@ -5,22 +5,75 @@
 //   3. GPT-OSS Harmony format: <|channel|>analysis/commentary/final with <|message|>
 //   4. Kimi/ChatML format: <|im_assistant|>...<|im_middle|>...<|im_end|> with inline tool calls
 
-import type { Message, SearchCondition, SearchField } from '../types';
+import type { Message, SearchCondition, SearchField, ToolCall } from '../types';
 
 // --- Harmony regexes ---
 
 const H = '(?:[^<]*(?:<(?!\\|message\\|>)[^<]*)*)';
 
 const HARMONY_ANALYSIS_RE = new RegExp(
-  `<\\|channel\\|>analysis${H}<\\|message\\|>([\\s\\S]*?)(?:<\\|end\\|>|<\\|call\\|>)`, 'g'
+  `<\\|channel\\|>analysis(?!\\s+to=functions\\.)${H}<\\|message\\|>([\\s\\S]*?)(?:<\\|end\\|>|<\\|call\\|>)`, 'g'
 );
 const HARMONY_FINAL_RE = new RegExp(
   `<\\|channel\\|>final${H}<\\|message\\|>([\\s\\S]*?)(?:<\\|return\\|>|<\\|end\\|>|$)`
 );
-const HARMONY_COMMENTARY_RE = new RegExp(
-  `<\\|channel\\|>commentary\\s+to=(\\S+)${H}<\\|message\\|>([\\s\\S]*?)(?:<\\|call\\|>|<\\|end\\|>)`, 'g'
+const HARMONY_TOOL_RE = new RegExp(
+  `<\\|channel\\|>(analysis|commentary)\\s+to=functions\\.(\\w+)${H}<\\|message\\|>([\\s\\S]*?)(?:<\\|call\\|>|<\\|end\\|>)`, 'g'
 );
 const HARMONY_STRIP_RE = /<\|(?:start|end|return|call|message|channel|constrain)\|>[^<]*/g;
+
+// --- Compact Harmony format (tags already stripped of <|channel|>/<|message|> markers) ---
+// Matches patterns like: "analysisReasoning text.assistantfinalMain content"
+// or "analysisThinking.assistantcommentary to=functions.bash json{...}"
+function parseCompactHarmony(content: string): { reasoning: string | null; mainContent: string; toolCalls: ToolCall[] } | null {
+  if (!content.startsWith('analysis') && !content.startsWith('final') && !content.startsWith('commentary')) {
+    return null;
+  }
+
+  const reasoningParts: string[] = [];
+  let mainContent = '';
+  const toolCalls: ToolCall[] = [];
+
+  // "assistantfinal" and "assistantcommentary" are unambiguous (never appear in natural text).
+  // "analysis" only at start-of-string. Bare "final"/"commentary" only at start-of-string.
+  // We first extract tool calls and final content via the "assistant" prefixed tags,
+  // then handle start-of-string bare tags.
+
+  // Extract analysis (reasoning) — always at the start, ends at next "assistant*" or "final"/"commentary" tag or end
+  const analysisMatch = content.match(/^analysis([\s\S]*?)(?=assistantfinal|assistantcommentary\s+to=functions\.|$)/);
+  if (analysisMatch) {
+    const text = analysisMatch[1].trim();
+    if (text) reasoningParts.push(text);
+  }
+
+  // Extract main content from "assistantfinal" or start-of-string "final"
+  const finalMatch = content.match(/(?:^|assistant)final([\s\S]*?)(?=assistantcommentary\s+to=functions\.|$)/);
+  if (finalMatch) {
+    mainContent = finalMatch[1].trim();
+  }
+
+  // Extract tool calls from "assistantcommentary to=functions.X json{...}" or start-of-string "commentary"
+  const toolRe = /(?:^|assistant)commentary\s+to=functions\.(\w+)\s*json?([\s\S]*?)(?=analysis|assistantfinal|assistantcommentary\s+to=functions\.|$)/g;
+  let toolMatch;
+  while ((toolMatch = toolRe.exec(content)) !== null) {
+    const fnName = toolMatch[1];
+    const args = toolMatch[2].trim();
+    toolCalls.push({
+      type: 'function',
+      function: { name: fnName, arguments: parseToolArguments(args) },
+    });
+  }
+
+  if (!mainContent && reasoningParts.length === 0 && toolCalls.length === 0) {
+    return null;
+  }
+
+  return {
+    reasoning: reasoningParts.length > 0 ? reasoningParts.join('\n\n') : null,
+    mainContent,
+    toolCalls,
+  };
+}
 
 // --- CoT tag variants ---
 
@@ -41,6 +94,7 @@ export interface ParsedContent {
   reasoning: string | null;
   mainContent: string;
   toolCallText: string | null;
+  toolCalls: ToolCall[];
 }
 
 /** Remove ChatML / special-token noise from a text segment. */
@@ -58,8 +112,32 @@ function sanitizeSegment(fragment: string): string {
   return s.trim();
 }
 
+function formatToolCallText(toolCalls: ToolCall[]): string | null {
+  if (toolCalls.length === 0) return null;
+  return toolCalls
+    .map((toolCall) => {
+      const args = typeof toolCall.function.arguments === 'string'
+        ? toolCall.function.arguments
+        : JSON.stringify(toolCall.function.arguments);
+      return `[tool call: ${toolCall.function.name}]\n${args}`;
+    })
+    .join('\n\n');
+}
+
+function parseToolArguments(rawArguments: string): ToolCall['function']['arguments'] {
+  try {
+    const parsed = JSON.parse(rawArguments) as unknown;
+    if (parsed && typeof parsed === 'object') {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    // Fall back to the raw payload when traces contain malformed JSON.
+  }
+  return rawArguments;
+}
+
 /** Strip ChatML/Kimi wrapper tokens and extract inline tool-call sections. */
-function preprocessChatML(content: string): { cleaned: string; toolCallText: string | null } {
+function preprocessChatML(content: string): { cleaned: string; toolCalls: ToolCall[] } {
   let cleaned = content;
 
   // Strip prefix wrappers
@@ -72,18 +150,31 @@ function preprocessChatML(content: string): { cleaned: string; toolCallText: str
   cleaned = cleaned.replace(/<\|endoftext\|>\s*$/gi, '');
 
   // Extract inline Kimi tool calls
-  const toolCalls: string[] = [];
+  const toolCalls: ToolCall[] = [];
   KIMI_TOOL_SECTION_RE.lastIndex = 0;
   let match;
   while ((match = KIMI_TOOL_SECTION_RE.exec(cleaned)) !== null) {
     const tcContent = match[1];
     const cmdMatch = tcContent.match(KIMI_TOOL_CMD_RE);
     if (cmdMatch) {
-      const cmd = cmdMatch[2].replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-      toolCalls.push(`[tool call: ${cmdMatch[1]}]\n${cmd}`);
+      toolCalls.push({
+        type: 'function',
+        function: {
+          name: cmdMatch[1],
+          arguments: { command: cmdMatch[2].replace(/\\"/g, '"').replace(/\\\\/g, '\\') },
+        },
+      });
     } else {
       const raw = tcContent.replace(/<\|[^|]+\|>/g, '').trim();
-      if (raw) toolCalls.push(raw);
+      if (raw) {
+        toolCalls.push({
+          type: 'function',
+          function: {
+            name: 'unknown',
+            arguments: raw,
+          },
+        });
+      }
     }
   }
 
@@ -92,19 +183,19 @@ function preprocessChatML(content: string): { cleaned: string; toolCallText: str
 
   return {
     cleaned: cleaned.trim(),
-    toolCallText: toolCalls.length > 0 ? toolCalls.join('\n\n') : null,
+    toolCalls,
   };
 }
 
 export function parseContent(content: string): ParsedContent {
   // --- Pre-process: strip ChatML/Kimi wrapper tokens ---
-  let toolCallText: string | null = null;
   let processedContent = content;
+  let toolCalls: ToolCall[] = [];
 
   if (CHATML_DETECT_RE.test(content)) {
     const result = preprocessChatML(content);
     processedContent = result.cleaned;
-    toolCallText = result.toolCallText;
+    toolCalls = result.toolCalls;
   }
 
   // --- GPT-OSS Harmony format ---
@@ -124,21 +215,37 @@ export function parseContent(content: string): ParsedContent {
       mainContent = finalMatch[1].trim();
     }
 
-    HARMONY_COMMENTARY_RE.lastIndex = 0;
-    while ((match = HARMONY_COMMENTARY_RE.exec(processedContent)) !== null) {
-      const toolName = match[1].replace('functions.', '');
-      const args = match[2].trim();
-      reasoningParts.push(`[tool call: ${toolName}]\n${args}`);
+    HARMONY_TOOL_RE.lastIndex = 0;
+    while ((match = HARMONY_TOOL_RE.exec(processedContent)) !== null) {
+      toolCalls.push({
+        type: 'function',
+        function: {
+          name: match[2],
+          arguments: parseToolArguments(match[3].trim()),
+        },
+      });
     }
 
-    if (!mainContent && reasoningParts.length === 0) {
+    if (!mainContent && reasoningParts.length === 0 && toolCalls.length === 0) {
       mainContent = processedContent.replace(HARMONY_STRIP_RE, '').trim();
     }
 
     return {
       reasoning: reasoningParts.length > 0 ? reasoningParts.join('\n\n') : null,
       mainContent,
-      toolCallText,
+      toolCallText: formatToolCallText(toolCalls),
+      toolCalls,
+    };
+  }
+
+  // --- Compact Harmony format (tags already stripped) ---
+  const compactResult = parseCompactHarmony(processedContent);
+  if (compactResult) {
+    return {
+      reasoning: compactResult.reasoning,
+      mainContent: compactResult.mainContent,
+      toolCallText: formatToolCallText(compactResult.toolCalls),
+      toolCalls: compactResult.toolCalls,
     };
   }
 
@@ -165,7 +272,7 @@ export function parseContent(content: string): ParsedContent {
 
   mainContent = sanitizeSegment(mainContent);
 
-  return { reasoning, mainContent, toolCallText };
+  return { reasoning, mainContent, toolCallText: formatToolCallText(toolCalls), toolCalls };
 }
 
 // ---------------------------------------------------------------------------
@@ -176,7 +283,12 @@ export function parseContent(content: string): ParsedContent {
  *  Prefers structured content_parts when present, then falls back to parseContent. */
 export function normalizeAssistantMessage(message: Message): ParsedContent {
   if (message.role !== 'assistant') {
-    return { reasoning: null, mainContent: message.content, toolCallText: null };
+    return {
+      reasoning: null,
+      mainContent: message.content,
+      toolCallText: null,
+      toolCalls: message.tool_calls ?? [],
+    };
   }
 
   if (message.content_parts && message.content_parts.length > 0) {
@@ -189,11 +301,20 @@ export function normalizeAssistantMessage(message: Message): ParsedContent {
     return {
       reasoning: thinkingParts.length > 0 ? thinkingParts.join('\n\n') : null,
       mainContent: textParts.join('\n'),
-      toolCallText: null,
+      toolCallText: formatToolCallText(message.tool_calls ?? []),
+      toolCalls: message.tool_calls ?? [],
     };
   }
 
-  return parseContent(message.content);
+  const parsed = parseContent(message.content);
+  if (message.tool_calls && message.tool_calls.length > 0) {
+    return {
+      ...parsed,
+      toolCallText: formatToolCallText(message.tool_calls),
+      toolCalls: message.tool_calls,
+    };
+  }
+  return parsed;
 }
 
 // ---------------------------------------------------------------------------
@@ -270,4 +391,90 @@ export function countMessageOccurrences(message: Message, searchConditions: Sear
   }
 
   return count;
+}
+
+// ---------------------------------------------------------------------------
+// In-chat search corpus
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the searchable string for a single message — what the in-chat
+ * Ctrl+F search reads.
+ *
+ * Why this exists: the previous implementation searched `message.content`
+ * directly, which created two symmetric bugs:
+ *
+ *   1. Displayed-but-not-searchable. Reasoning and main text from
+ *      `content_parts[]` (harmony format), and structured tool calls
+ *      (`tool_calls[].function.name` / `arguments`), do not appear in
+ *      `message.content` and were silently invisible to the search.
+ *   2. Searchable-but-not-displayed. ChatML / harmony marker tokens
+ *      (`<|im_assistant|>`, `<|channel|>`, `<think>`, the compact-harmony
+ *      `analysis` / `assistantfinal` keywords, …) do appear in raw
+ *      `message.content` but the renderer strips them, so search
+ *      matches landed in invisible text.
+ *
+ * Routing the search through `normalizeAssistantMessage` solves both:
+ * the parser already strips the marker tokens for display, and the
+ * structured tool-call list it returns is the same one the card renders.
+ *
+ * Excluded by design: role label, sample metadata footer, and the grades
+ * panel — those are chrome, not message body. Use the global filter-bar
+ * search if you need to find them.
+ */
+/**
+ * Format a single message as plain text for clipboard copy. Mirrors what
+ * the user sees in the rendered card: reasoning prefixed with a label,
+ * main content unwrapped, structured tool calls listed with their
+ * function name and (when possible) the parsed `command` field rather
+ * than the raw JSON args.
+ *
+ * Distinct from `buildSearchCorpus`:
+ *   - Includes `[Reasoning]` / `[Tool: <name>]` section labels so the
+ *     paste destination has context.
+ *   - Sections separated by blank lines for readability.
+ *   - Strips surrounding whitespace at the edges.
+ */
+export function formatMessageText(message: Message): string {
+  const { reasoning, mainContent, toolCalls } = normalizeAssistantMessage(message);
+  const sections: string[] = [];
+  if (reasoning && reasoning.trim()) sections.push(`[Reasoning]\n${reasoning}`);
+  if (mainContent && mainContent.trim()) sections.push(mainContent);
+  for (const tc of toolCalls) {
+    // Mirror MessageCard's display rule: when args is a `{command: "..."}`
+    // object, show the bare command. Otherwise stringify the full args.
+    let args: string;
+    try {
+      const parsed = typeof tc.function.arguments === 'string'
+        ? JSON.parse(tc.function.arguments) as Record<string, unknown>
+        : tc.function.arguments;
+      if (parsed && typeof parsed === 'object' && parsed.command != null) {
+        args = String(parsed.command);
+      } else {
+        args = typeof tc.function.arguments === 'string'
+          ? tc.function.arguments
+          : JSON.stringify(tc.function.arguments, null, 2);
+      }
+    } catch {
+      args = typeof tc.function.arguments === 'string'
+        ? tc.function.arguments
+        : JSON.stringify(tc.function.arguments, null, 2);
+    }
+    sections.push(`[Tool: ${tc.function.name}]\n${args}`);
+  }
+  return sections.join('\n\n').trim();
+}
+
+export function buildSearchCorpus(message: Message): string {
+  const { reasoning, mainContent, toolCalls } = normalizeAssistantMessage(message);
+  const parts: string[] = [];
+  if (reasoning) parts.push(reasoning);
+  if (mainContent) parts.push(mainContent);
+  for (const tc of toolCalls) {
+    const args = typeof tc.function.arguments === 'string'
+      ? tc.function.arguments
+      : JSON.stringify(tc.function.arguments);
+    parts.push(`${tc.function.name}\n${args}`);
+  }
+  return parts.join('\n');
 }

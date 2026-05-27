@@ -1,13 +1,29 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, fireEvent } from '@testing-library/react';
 import { ChatView } from './ChatView';
 import type { Sample, SampleGrades } from '../../types';
 
-// Mock MessageCard to render a simple representation of each message
+// Mock MessageCard to render a simple representation of each message.
+// Exposes an `add-highlight-<index>` button so tests can simulate the
+// selection-popup "Highlight" click without wiring the real selection API.
 vi.mock('./MessageCard', () => ({
-  MessageCard: ({ message, index }: { message: { role: string; content: string }; index: number }) => (
+  MessageCard: ({
+    message,
+    index,
+    onAddEphemeralHighlight,
+  }: {
+    message: { role: string; content: string };
+    index: number;
+    onAddEphemeralHighlight?: (messageIndex: number, text: string) => void;
+  }) => (
     <div data-testid={`message-${index}`}>
       <span data-testid={`role-${index}`}>{message.role}</span>
       <span data-testid={`content-${index}`}>{message.content}</span>
+      <button
+        data-testid={`add-highlight-${index}`}
+        onClick={() => onAddEphemeralHighlight?.(index, `hl-${index}`)}
+      >
+        add-highlight
+      </button>
     </div>
   ),
 }));
@@ -187,6 +203,36 @@ describe('ChatView', () => {
     expect(screen.getByText('Search chat')).toBeInTheDocument();
   });
 
+  it('shows no highlight count + clear button when there are no ephemeral highlights', () => {
+    render(<ChatView {...defaultProps} />);
+    expect(screen.queryByTitle(/Clear all highlights/)).not.toBeInTheDocument();
+  });
+
+  it('shows count + clear button after adding an ephemeral highlight', () => {
+    render(<ChatView {...defaultProps} />);
+    fireEvent.click(screen.getByTestId('add-highlight-0'));
+    expect(screen.getByTitle(/Clear all highlights/)).toBeInTheDocument();
+  });
+
+  it('Clear button removes all ephemeral highlights', () => {
+    render(<ChatView {...defaultProps} />);
+    fireEvent.click(screen.getByTestId('add-highlight-0'));
+    fireEvent.click(screen.getByTestId('add-highlight-1'));
+    expect(screen.getByTitle(/Clear all highlights/)).toBeInTheDocument();
+    fireEvent.click(screen.getByTitle(/Clear all highlights/));
+    expect(screen.queryByTitle(/Clear all highlights/)).not.toBeInTheDocument();
+  });
+
+  it('clears ephemeral highlights when the user navigates to a different sample', () => {
+    const { rerender } = render(<ChatView {...defaultProps} />);
+    fireEvent.click(screen.getByTestId('add-highlight-0'));
+    expect(screen.getByTitle(/Clear all highlights/)).toBeInTheDocument();
+
+    // Swap in a different sample — ephemeral highlights are sample-scoped.
+    rerender(<ChatView {...defaultProps} sample={makeSample({ id: 999 })} />);
+    expect(screen.queryByTitle(/Clear all highlights/)).not.toBeInTheDocument();
+  });
+
   it('colors positive reward green and negative reward red', () => {
     const positiveSample = makeSample({
       attributes: {
@@ -217,5 +263,143 @@ describe('ChatView', () => {
     rerender(<ChatView {...defaultProps} sample={negativeSample} />);
     const negativeReward = screen.getByText('-0.5');
     expect(negativeReward.className).toContain('text-red-600');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Local Ctrl+F search — corpus-based behavior
+// ---------------------------------------------------------------------------
+//
+// These tests drive the search input directly and assert the count
+// indicator that ChatView renders next to it (`N/M` or `No matches`).
+// Since the count comes from `localMatches`, which is fed by
+// `buildSearchCorpus(message)`, asserting on the count proves the
+// corpus is the source of truth for the search.
+
+describe('ChatView local search corpus', () => {
+  function openSearch() {
+    // jsdom doesn't bubble synthetic KeyboardEvents through the window-level
+    // listener consistently, so we click the visible "Search chat" button —
+    // it triggers the same setIsSearchOpen(true) as the Ctrl+F binding.
+    fireEvent.click(screen.getByText('Search chat'));
+  }
+  function typeSearch(term: string) {
+    const input = screen.getByPlaceholderText('Search in this chat...') as HTMLInputElement;
+    fireEvent.change(input, { target: { value: term } });
+  }
+
+  it('finds text inside content_parts.thinking when message.content is empty', () => {
+    // The previous searcher read message.content directly and missed
+    // anything that lived only in content_parts.
+    const sample = makeSample({
+      messages: [
+        {
+          role: 'assistant',
+          content: '',
+          content_parts: [
+            { type: 'thinking', thinking: 'XYZ-only-in-thinking-parts' },
+            { type: 'text', text: 'visible answer' },
+          ],
+        },
+      ],
+    });
+    render(<ChatView {...defaultProps} sample={sample} />);
+    openSearch();
+    typeSearch('XYZ-only-in-thinking-parts');
+    expect(screen.getByText('1/1')).toBeInTheDocument();
+  });
+
+  it('finds text inside structured tool_calls function name', () => {
+    const sample = makeSample({
+      messages: [
+        {
+          role: 'assistant',
+          content: 'running shell',
+          tool_calls: [{ type: 'function', function: { name: 'find_file_xyz', arguments: '{}' } }],
+        },
+      ],
+    });
+    render(<ChatView {...defaultProps} sample={sample} />);
+    openSearch();
+    typeSearch('find_file_xyz');
+    expect(screen.getByText('1/1')).toBeInTheDocument();
+  });
+
+  it('finds text inside structured tool_calls arguments', () => {
+    const sample = makeSample({
+      messages: [
+        {
+          role: 'assistant',
+          content: 'running shell',
+          tool_calls: [
+            {
+              type: 'function',
+              function: { name: 'bash', arguments: '{"command":"grep XYZ-target /etc/hosts"}' },
+            },
+          ],
+        },
+      ],
+    });
+    render(<ChatView {...defaultProps} sample={sample} />);
+    openSearch();
+    typeSearch('XYZ-target');
+    expect(screen.getByText('1/1')).toBeInTheDocument();
+  });
+
+  it('does NOT match ChatML marker tokens the renderer strips', () => {
+    // Inverse-miss prevention: searches for invisible-to-the-user marker
+    // text should report no matches.
+    const sample = makeSample({
+      messages: [
+        {
+          role: 'assistant',
+          content: '<|im_assistant|>assistant<|im_middle|>The answer is 42.<|im_end|>',
+        },
+      ],
+    });
+    render(<ChatView {...defaultProps} sample={sample} />);
+    openSearch();
+    typeSearch('im_assistant');
+    expect(screen.getByText('No matches')).toBeInTheDocument();
+  });
+
+  it('matches across U+202F vs U+0020 whitespace mismatch', () => {
+    // Corpus retains U+202F; query uses ASCII space; findAllMatchesCI
+    // normalizes both before comparing.
+    const sample = makeSample({
+      messages: [
+        { role: 'user', content: 'meeting at 7 am in office' },
+      ],
+    });
+    render(<ChatView {...defaultProps} sample={sample} />);
+    openSearch();
+    typeSearch('7 am');
+    expect(screen.getByText('1/1')).toBeInTheDocument();
+  });
+
+  it('matches text that lives in main content (regression)', () => {
+    // Sanity: the original happy path still works.
+    render(<ChatView {...defaultProps} />);
+    openSearch();
+    typeSearch('how are you');
+    expect(screen.getByText('1/1')).toBeInTheDocument();
+  });
+
+  it('counts a term that occurs once in content and once in tool_calls', () => {
+    const sample = makeSample({
+      messages: [
+        {
+          role: 'assistant',
+          content: 'use grep for this',
+          tool_calls: [
+            { type: 'function', function: { name: 'bash', arguments: '{"command":"grep foo"}' } },
+          ],
+        },
+      ],
+    });
+    render(<ChatView {...defaultProps} sample={sample} />);
+    openSearch();
+    typeSearch('grep');
+    expect(screen.getByText('1/2')).toBeInTheDocument();
   });
 });

@@ -1,5 +1,64 @@
 @import "tailwindcss";
 
+/* Make Tailwind's `dark:` variant follow the `.dark` class on <html>
+   (toggled by useDarkMode) instead of the OS `prefers-color-scheme`.
+   Without this, `dark:` utilities and the in-app dark toggle disagree
+   whenever the OS theme differs from the user's choice — and Presentation
+   Mode's image-theme override (which flips `.dark`) wouldn't reach them. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* Elements that exist only for live interaction (action buttons, the
+   collapse pill's edit affordances, the selection popup). The image-capture
+   step drops every `.presentation-chrome` node from the snapshot. */
+.presentation-chrome { /* marker class — no styles; used as a capture filter */ }
+
+/* Applied to the cloned card just before rasterizing an export image.
+   Strips on-screen-only affordances and normalizes highlights so a
+   figure isn't carrying five debugging colors. */
+.capture-export,
+.capture-export * {
+  box-shadow: none !important;
+}
+.capture-export .presentation-chrome { display: none !important; }
+/* Suppress transient/tooling highlights — search, URL-share, grade quotes —
+   so the exported figure shows only the user's deliberate emphasis. */
+.capture-export .global-search-highlight,
+.capture-export mark.url-highlight-mark,
+.capture-export mark.grade-quote-mark,
+.capture-export mark.local-search-mark {
+  background: transparent !important;
+  color: inherit !important;
+  border: none !important;
+  text-decoration: none !important;
+  box-shadow: none !important;
+  padding: 0 !important;
+}
+/* The user's ephemeral highlight survives — flattened to one clean,
+   colorblind-safe amber fill instead of the on-screen fuchsia. */
+.capture-export mark.ephemeral-highlight-mark {
+  background: #fde68a !important;   /* amber-200 */
+  color: #1f2937 !important;
+  border: none !important;
+  border-radius: 2px !important;
+}
+/* Ephemeral bold / italic are font emphasis, not a debugging color — they
+   survive the export verbatim. */
+.capture-export .ephemeral-bold-mark { font-weight: 700 !important; }
+.capture-export .ephemeral-italic-mark { font-style: italic !important; }
+/* The elision pill is a screen-only editing affordance. In the exported
+   figure it flattens to a plain, slightly-muted inline [...] so it reads
+   as a typographic ellipsis, not a boxed widget. */
+.capture-export .elision-pill {
+  display: inline !important;
+  border: none !important;
+  background: transparent !important;
+  padding: 0 !important;
+  font-size: inherit !important;
+  text-decoration: none !important;
+  white-space: nowrap !important;
+  opacity: 0.7;
+}
+
 /* Base styles */
 :root {
   --bg-primary: #ffffff;

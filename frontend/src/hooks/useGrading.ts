@@ -28,7 +28,7 @@ const API_KEYS_STORAGE_KEY = 'rollout_viz_api_keys';
 const PROVIDER_STORAGE_KEY = 'rollout_viz_last_provider';
 const MODEL_STORAGE_KEY = 'rollout_viz_last_model';
 
-export function useGrading() {
+export function useGrading(enabled = true) {
   const [progress, setProgress] = useState<GradingProgress>({
     total: 0,
     completed: 0,
@@ -44,10 +44,10 @@ export function useGrading() {
   // Server-side API keys availability (from .env)
   const [serverApiKeys, setServerApiKeys] = useState<Record<string, boolean>>({});
   
-  // Load API keys from localStorage
+  // Load API keys from sessionStorage (tab-scoped, cleared on tab close)
   const [apiKeys, setApiKeys] = useState<StoredAPIKeys>(() => {
     try {
-      const stored = localStorage.getItem(API_KEYS_STORAGE_KEY);
+      const stored = sessionStorage.getItem(API_KEYS_STORAGE_KEY);
       return stored ? JSON.parse(stored) : {};
     } catch {
       return {};
@@ -56,11 +56,11 @@ export function useGrading() {
 
   // Load last used provider/model
   const [lastProvider, setLastProvider] = useState<LLMProvider>(() => {
-    return (localStorage.getItem(PROVIDER_STORAGE_KEY) as LLMProvider) || 'openai';
+    return (sessionStorage.getItem(PROVIDER_STORAGE_KEY) as LLMProvider) || 'openai';
   });
   
   const [lastModel, setLastModel] = useState<string>(() => {
-    return localStorage.getItem(MODEL_STORAGE_KEY) || 'gpt-4o';
+    return sessionStorage.getItem(MODEL_STORAGE_KEY) || 'gpt-4o';
   });
 
   // Abort controller for cancellation
@@ -81,11 +81,11 @@ export function useGrading() {
     }));
   }, []);
 
-  // Save API keys to localStorage
+  // Save API keys to sessionStorage (tab-scoped)
   const saveApiKey = useCallback((provider: LLMProvider, key: string) => {
     setApiKeys(prev => {
       const updated = { ...prev, [provider]: key };
-      localStorage.setItem(API_KEYS_STORAGE_KEY, JSON.stringify(updated));
+      sessionStorage.setItem(API_KEYS_STORAGE_KEY, JSON.stringify(updated));
       return updated;
     });
   }, []);
@@ -108,27 +108,28 @@ export function useGrading() {
   // Save last used provider
   const saveLastProvider = useCallback((provider: LLMProvider) => {
     setLastProvider(provider);
-    localStorage.setItem(PROVIDER_STORAGE_KEY, provider);
+    sessionStorage.setItem(PROVIDER_STORAGE_KEY, provider);
   }, []);
 
   // Save last used model
   const saveLastModel = useCallback((model: string) => {
     setLastModel(model);
-    localStorage.setItem(MODEL_STORAGE_KEY, model);
+    sessionStorage.setItem(MODEL_STORAGE_KEY, model);
   }, []);
 
-  // Fetch preset metrics and server API key availability on mount
+  // Fetch preset metrics and server API key availability once authenticated
   useEffect(() => {
+    if (!enabled) return;
     fetch('/api/preset-metrics')
-      .then(res => res.json())
+      .then(res => { if (!res.ok) throw new Error(`${res.status}`); return res.json(); })
       .then(data => setPresetMetrics(data))
       .catch(err => console.error('Failed to load preset metrics:', err));
-    
+
     fetch('/api/available-api-keys')
-      .then(res => res.json())
+      .then(res => { if (!res.ok) throw new Error(`${res.status}`); return res.json(); })
       .then(data => setServerApiKeys(data))
       .catch(err => console.error('Failed to check server API keys:', err));
-  }, []);
+  }, [enabled]);
 
   // Grade samples using SSE for real-time progress
   const gradeSamples = useCallback(async (
@@ -136,7 +137,7 @@ export function useGrading() {
     sampleIds: number[],
     metricName: string,
     metricPrompt: string,
-    gradeType: 'float' | 'int' | 'bool',
+    gradeType: 'float' | 'int' | 'bool' | 'freeform',
     provider: LLMProvider,
     model: string,
     parallelSize: number = 100,
@@ -439,7 +440,7 @@ export function useGrading() {
     sampleIds: number[],
     metricName: string,
     metricPrompt: string,
-    gradeType: 'float' | 'int' | 'bool',
+    gradeType: 'float' | 'int' | 'bool' | 'freeform',
     provider: LLMProvider,
     model: string,
     parallelSize: number = 100,
@@ -527,7 +528,7 @@ export function useGrading() {
   const saveCustomMetric = useCallback(async (
     name: string,
     description: string,
-    gradeType: 'float' | 'int' | 'bool',
+    gradeType: 'float' | 'int' | 'bool' | 'freeform',
     prompt: string,
   ): Promise<boolean> => {
     try {

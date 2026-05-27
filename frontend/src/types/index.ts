@@ -1,15 +1,20 @@
 export interface ToolCall {
   type: string;
+  id?: string | null;
   function: {
     name: string;
     arguments: Record<string, unknown> | string;
+    [key: string]: unknown;
   };
+  [key: string]: unknown;
 }
 
 export interface ContentPart {
-  type: 'thinking' | 'text';
+  type: 'thinking' | 'text' | string;
   thinking?: string;
   text?: string;
+  channel?: string;
+  [key: string]: unknown;
 }
 
 export interface Message {
@@ -18,6 +23,13 @@ export interface Message {
   reasoning?: string;
   content_parts?: ContentPart[];
   tool_calls?: ToolCall[];
+  tool_call_id?: string;
+  name?: string;
+  raw_content?: string;
+  tokens?: number[];
+  prompt_tokens?: number[];
+  openai_response_items?: unknown[];
+  [key: string]: unknown;
 }
 
 export interface SampleAttributes {
@@ -81,6 +93,9 @@ export interface Sample {
   attributes: SampleAttributes;
   timestamp: string;
   grades?: SampleGrades;
+  raw_messages?: unknown[];
+  raw_jsonl_entry?: unknown;
+  [key: string]: unknown;
 }
 
 // Grading request/response types
@@ -252,8 +267,62 @@ export type SearchLogic = 'AND' | 'OR';
 // clicking "Highlight" in the selection popup. Cleared automatically when the
 // user navigates to a different sample. Never persisted (no URL, no storage,
 // no backend).
+// Pins a collapse / highlight to one specific occurrence of its text, so the
+// same string appearing elsewhere in the message isn't affected too.
+// `blockKind` identifies the renderable block; `occurrence` is the match
+// index within that block. A region/highlight with no locator matches its
+// text everywhere (used for whole-section collapses, whose text is unique).
+export interface RegionLocator {
+  blockKind: 'reasoning' | 'content' | 'tool';
+  blockIndex?: number;  // tool-call index when blockKind === 'tool'
+  occurrence: number;
+}
+
 export interface EphemeralHighlight {
   id: string;
   messageIndex: number;
   text: string;
+  /**
+   * Visual treatment of the span. 'highlight' (the default) is the fuchsia
+   * marker; 'bold' / 'italic' apply font emphasis instead. All three are
+   * session-only and removed by clicking the styled span.
+   */
+  style?: 'highlight' | 'bold' | 'italic';
+  /** Pins the highlight to one occurrence of `text` (see RegionLocator). */
+  locator?: RegionLocator;
 }
+
+// A span of message text the user has collapsed in Presentation Mode. The
+// span renders as an editable `[...]` elision pill instead of the text.
+// Session-only — same lifecycle as EphemeralHighlight (cleared on sample
+// change, never persisted). `label` is the user-edited elision text;
+// undefined means show the default (`[...]` or `[N lines]`).
+export interface CollapsedRegion {
+  id: string;
+  messageIndex: number;
+  text: string;
+  label?: string;
+  /** Hidden regions stay collapsed but render nothing (no `[...]` marker). */
+  hidden?: boolean;
+  /**
+   * Explicit line-placement overrides for the pill, each tri-state:
+   * undefined keeps the source text's own line breaks (the natural
+   * default); true pulls the pill onto the same line as the adjacent text;
+   * false forces a line break so the pill sits on its own line. Toggled
+   * from the pill's right-click menu.
+   */
+  joinBefore?: boolean;
+  joinAfter?: boolean;
+  /** Pins the collapse to one occurrence of `text` (see RegionLocator). */
+  locator?: RegionLocator;
+}
+
+// Export-width presets for Presentation Mode image capture. Controls the
+// off-screen render width so text reflows (not scales) to the target.
+// Ordered narrow → wide; label + pixel width live in EXPORT_WIDTH_PRESETS
+// (utils/captureImage.ts).
+export type ExportWidth = 'narrow' | 'paper2' | 'paper1' | 'half' | 'slide' | 'slidewide';
+
+// Capture font-size presets. The multiplier (`scale`) + label live in
+// FONT_SIZE_PRESETS (utils/captureImage.ts).
+export type FontSize = 'sm' | 'md' | 'lg' | 'xl';

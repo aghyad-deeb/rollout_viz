@@ -7,7 +7,13 @@ orjson>=3.9.0
 uvicorn[standard]>=0.27.0
 pydantic>=2.0.0
 boto3>=1.34.0
-python-dotenv>=1.0.0
+python-dotenv>=1.2.2
+
+# Security floors for runtime/transitive deps flagged by OSV in May 2026.
+cryptography>=48.0.0
+pyasn1>=0.6.3
+requests>=2.34.1
+urllib3>=2.7.0
 
 # Authentication
 itsdangerous>=2.0.0

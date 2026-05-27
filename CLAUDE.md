@@ -139,7 +139,7 @@ FastAPI auto-docs available at `http://localhost:8000/docs`.
 
 ## Configuration
 
-All config is read from `~/.env` (home directory). The backend parses this file directly into a private `_env_config` dict — it does NOT use `os.getenv()` or shell environment variables. Exception: AWS credentials are injected into `os.environ` because boto3 requires it.
+All config is read from `~/.env` (home directory). The backend parses this file directly into a private `_env_config` dict — it does NOT use `os.getenv()` or shell environment variables. AWS credentials are passed directly to `boto3.Session()` from `_env_config`, not via `os.environ`.
 
 ```
 VIZ_PASSWORD=...           # Enables password auth (optional)

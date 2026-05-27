@@ -41,7 +41,7 @@ export function GradingPanel({
   const [customMetricName, setCustomMetricName] = useState('');
   const [customPrompt, setCustomPrompt] = useState('');
   const [savingMetric, setSavingMetric] = useState(false);
-  const [gradeType, setGradeType] = useState<'float' | 'int' | 'bool'>('float');
+  const [gradeType, setGradeType] = useState<'float' | 'int' | 'bool' | 'freeform'>('float');
   const [provider, setProvider] = useState<LLMProvider>(lastProvider);
   const [model, setModel] = useState<string>(lastModel);
   const [apiKeyInput, setApiKeyInput] = useState('');
@@ -120,7 +120,7 @@ export function GradingPanel({
       filteredSampleIds,
       selectedMetric === 'custom' ? customMetricName : selectedMetric,
       currentMetric.prompt,
-      currentMetric.grade_type as 'float' | 'int' | 'bool',
+      currentMetric.grade_type as 'float' | 'int' | 'bool' | 'freeform',
       provider,
       model,
       parallelSize,
@@ -241,12 +241,13 @@ export function GradingPanel({
               <label className={`text-xs ${mutedClass}`}>Grade type:</label>
               <select
                 value={gradeType}
-                onChange={(e) => setGradeType(e.target.value as 'float' | 'int' | 'bool')}
+                onChange={(e) => setGradeType(e.target.value as 'float' | 'int' | 'bool' | 'freeform')}
                 className={`px-2 py-1 rounded border text-xs ${inputClass}`}
               >
                 <option value="float">Float (0-1)</option>
                 <option value="int">Integer</option>
                 <option value="bool">Boolean</option>
+                <option value="freeform">Free form (text)</option>
               </select>
             </div>
             {/* Optional: Save as preset */}

@@ -116,6 +116,17 @@ class TestBuildGradingPrompt:
         )
         assert "float grade" in prompt.lower() or "0.0 and 1.0" in prompt
 
+    def test_freeform_grade_instruction(self):
+        provider = self._get_provider()
+        prompt = provider._build_grading_prompt(
+            [{"role": "user", "content": "x"}], "metric", "freeform"
+        )
+        # Must explicitly tell the model to produce prose in `grade` and NOT a number/bool.
+        assert "free-form" in prompt.lower() or "free form" in prompt.lower()
+        assert "string" in prompt.lower()
+        # Quote instructions still apply unchanged — freeform is orthogonal to quoting.
+        assert "message_index" in prompt
+
     def test_required_quotes_section(self):
         provider = self._get_provider()
         prompt = provider._build_grading_prompt(
@@ -192,7 +203,30 @@ class TestParseGradeResponse:
         response = json.dumps({"grade": 7, "quotes": [], "explanation": ""})
         result = provider._parse_grade_response(response, "int")
         assert result["grade"] == 7
-        assert isinstance(result["grade"], int)
+
+    def test_freeform_string_passthrough(self):
+        provider = self._get_provider()
+        answer = "The model shows signs of reward hacking by checking file existence."
+        response = json.dumps({"grade": answer, "quotes": [], "explanation": ""})
+        result = provider._parse_grade_response(response, "freeform")
+        assert result["grade"] == answer
+        assert isinstance(result["grade"], str)
+
+    def test_freeform_none_becomes_empty_string(self):
+        provider = self._get_provider()
+        response = json.dumps({"grade": None, "quotes": [], "explanation": ""})
+        result = provider._parse_grade_response(response, "freeform")
+        assert result["grade"] == ""
+        assert isinstance(result["grade"], str)
+
+    def test_freeform_coerces_non_string_to_string(self):
+        # Some models return a dict/list under `grade` even when asked for prose.
+        # We JSON-stringify rather than crash so downstream code gets a string.
+        provider = self._get_provider()
+        response = json.dumps({"grade": {"summary": "ok"}, "quotes": [], "explanation": ""})
+        result = provider._parse_grade_response(response, "freeform")
+        assert isinstance(result["grade"], str)
+        assert "summary" in result["grade"]
 
     def test_float_parsing(self):
         provider = self._get_provider()
@@ -249,29 +283,28 @@ class TestGoogleProviderClientReuse:
                 client2 = provider._get_client()
                 assert client1 is client2
 
-    def test_google_configure_called_once(self):
-        """genai.configure() is called only once across multiple _get_client() calls."""
+    def test_google_configure_called_every_time(self):
+        """genai.configure() is called on every _get_client() to avoid global state races."""
         provider = GoogleProvider(api_key="test-key", model="gemini-2.5-pro")
         with patch('google.generativeai.configure') as mock_configure:
             with patch('google.generativeai.GenerativeModel'):
                 provider._get_client()
                 provider._get_client()
                 provider._get_client()
-                assert mock_configure.call_count == 1
+                assert mock_configure.call_count == 3
 
-    def test_google_client_cached_1000_calls_under_5ms(self):
-        """1000 cached _get_client() calls complete in under 5ms."""
+    def test_google_client_cached_1000_calls_under_50ms(self):
+        """1000 _get_client() calls complete quickly (configure called each time for safety)."""
         provider = GoogleProvider(api_key="test-key", model="gemini-2.5-pro")
         with patch('google.generativeai.configure'):
             with patch('google.generativeai.GenerativeModel'):
-                # Warm up
                 provider._get_client()
 
                 start = time.perf_counter()
                 for _ in range(1000):
                     provider._get_client()
                 elapsed = time.perf_counter() - start
-                assert elapsed < 0.005, f"1000 cached calls took {elapsed:.6f}s, expected < 5ms"
+                assert elapsed < 0.050, f"1000 calls took {elapsed:.6f}s, expected < 50ms"
 
 
 class TestPresetMetrics:

@@ -1,4 +1,5 @@
 import { useCallback } from 'react';
+import { PUBLIC_BASE_URL } from '../config';
 
 interface UrlState {
   file?: string;
@@ -72,7 +73,7 @@ export function useUrlState() {
     if (options.message !== undefined) params.set('message', options.message.toString());
     if (options.highlight) params.set('highlight', options.highlight);
     
-    return `${window.location.origin}${window.location.pathname}?${params.toString()}`;
+    return `${PUBLIC_BASE_URL}/?${params.toString()}`;
   }, []);
 
   return { getUrlState, setUrlState, generateLink };

@@ -5,5 +5,12 @@
     "grade_type": "bool",
     "prompt": "Is the model output messed up, as in it's incoherent and not usual LLM output?",
     "is_custom": true
+  },
+  "test": {
+    "name": "Test",
+    "description": "d",
+    "grade_type": "float",
+    "prompt": "p",
+    "is_custom": true
   }
 }

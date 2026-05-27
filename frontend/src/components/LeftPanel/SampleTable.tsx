@@ -11,33 +11,38 @@ interface SampleTableProps {
   isDarkMode: boolean;
 }
 
+// Freeform answers can be long; truncate heavily for the table column.
+const FREEFORM_CELL_PREVIEW_LEN = 18;
+
 // Helper to format a grade value
-function formatGrade(grade: number | boolean, gradeType: string): string {
+function formatGrade(grade: number | boolean | string, gradeType: string): string {
   if (gradeType === 'bool') return grade ? '✓' : '✗';
   if (gradeType === 'float') return (grade as number).toFixed(2);
+  if (gradeType === 'freeform') {
+    const text = String(grade ?? '').trim().replace(/\s+/g, ' ');
+    if (!text) return '—';
+    if (text.length <= FREEFORM_CELL_PREVIEW_LEN) return text;
+    return text.slice(0, FREEFORM_CELL_PREVIEW_LEN).trimEnd() + '…';
+  }
   return String(grade);
 }
 
 // Helper to get grade color
-function getGradeColor(grade: number | boolean, gradeType: string, isDarkMode: boolean): string {
+function getGradeColor(grade: number | boolean | string, gradeType: string, isDarkMode: boolean): string {
   if (gradeType === 'bool') {
-    return grade 
+    return grade
       ? (isDarkMode ? 'text-green-400' : 'text-green-600')
       : (isDarkMode ? 'text-red-400' : 'text-red-600');
+  }
+  if (gradeType === 'freeform') {
+    // No intrinsic ordering — render neutral.
+    return isDarkMode ? 'text-gray-300' : 'text-gray-700';
   }
   // For numeric grades, use a gradient
   const value = grade as number;
   if (value >= 0.7) return isDarkMode ? 'text-green-400' : 'text-green-600';
   if (value >= 0.4) return isDarkMode ? 'text-yellow-400' : 'text-yellow-600';
   return isDarkMode ? 'text-red-400' : 'text-red-600';
-}
-
-// Get the latest grade value for a sample and metric
-function getGradeValue(sample: Sample, metricName: string): number | boolean | null {
-  if (!sample.grades || !sample.grades[metricName]) return null;
-  const grades = sample.grades[metricName];
-  if (grades.length === 0) return null;
-  return grades[grades.length - 1].grade;
 }
 
 // Get the latest grade entry for a sample and metric

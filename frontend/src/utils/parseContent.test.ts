@@ -5,6 +5,7 @@ import {
   countMessageOccurrences,
   fieldAppliesToContent,
   fieldAppliesToReasoning,
+  buildSearchCorpus,
 } from './parseContent';
 import type { Message, SearchCondition } from '../types';
 
@@ -77,6 +78,8 @@ describe('parseContent', () => {
     expect(out.mainContent).toBe('Checking files');
     expect(out.toolCallText).toContain('[tool call: bash]');
     expect(out.toolCallText).toContain('ls -la data/');
+    expect(out.toolCalls).toHaveLength(1);
+    expect(out.toolCalls[0].function.name).toBe('bash');
   });
 
   it('preserves reasoning with Kimi wrapper', () => {
@@ -136,7 +139,22 @@ describe('parseContent', () => {
     const content =
       '<|channel|>commentary to=functions.bash<|message|>{"command":"ls"}<|end|>';
     const out = parseContent(content);
-    expect(out.reasoning).toContain('[tool call: bash]');
+    expect(out.reasoning).toBeNull();
+    expect(out.toolCalls).toHaveLength(1);
+    expect(out.toolCalls[0].function.name).toBe('bash');
+    expect(out.toolCalls[0].function.arguments).toEqual({ command: 'ls' });
+    expect(out.toolCallText).toContain('"command":"ls"');
+  });
+
+  it('handles Harmony analysis-to-function tool calls', () => {
+    const content =
+      '<|channel|>analysis to=functions.bash <|constrain|>json<|message|>{"command":"pwd"}<|call|>';
+    const out = parseContent(content);
+    expect(out.reasoning).toBeNull();
+    expect(out.toolCalls).toHaveLength(1);
+    expect(out.toolCalls[0].function.name).toBe('bash');
+    expect(out.toolCalls[0].function.arguments).toEqual({ command: 'pwd' });
+    expect(out.toolCallText).toContain('"command":"pwd"');
   });
 });
 
@@ -345,6 +363,37 @@ describe('countMessageOccurrences', () => {
     expect(countAssistant).toBe(0);
   });
 
+  it('parses compact Harmony format (analysis + assistantfinal)', () => {
+    const msg: Message = {
+      role: 'assistant',
+      content: 'analysisWe need to discuss concept. Provide explanation. No code changes.assistantfinalMaximising the score simply means trying to make the final number as large as possible.',
+    };
+    const result = normalizeAssistantMessage(msg);
+    expect(result.reasoning).toBe('We need to discuss concept. Provide explanation. No code changes.');
+    expect(result.mainContent).toBe('Maximising the score simply means trying to make the final number as large as possible.');
+  });
+
+  it('parses compact Harmony format with tool call', () => {
+    const msg: Message = {
+      role: 'assistant',
+      content: 'analysisWe need to explore repository.assistantcommentary to=functions.bash json{"command":"ls -R"}',
+    };
+    const result = normalizeAssistantMessage(msg);
+    expect(result.reasoning).toBe('We need to explore repository.');
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls[0].function.name).toBe('bash');
+  });
+
+  it('parses compact Harmony "final" without "assistant" prefix', () => {
+    const msg: Message = {
+      role: 'assistant',
+      content: 'finalYes – the verifier prints the maximum score.',
+    };
+    const result = normalizeAssistantMessage(msg);
+    expect(result.reasoning).toBeNull();
+    expect(result.mainContent).toBe('Yes – the verifier prints the maximum score.');
+  });
+
   it('uses content_parts when present', () => {
     const msg: Message = {
       role: 'assistant',
@@ -356,5 +405,248 @@ describe('countMessageOccurrences', () => {
     };
     const count = countMessageOccurrences(msg, [makeCondition('chat', 'hello')]);
     expect(count).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildSearchCorpus — what the in-chat Ctrl+F search reads
+// ---------------------------------------------------------------------------
+
+describe('buildSearchCorpus', () => {
+  it('includes plain-text content', () => {
+    const msg: Message = { role: 'user', content: 'hello world' };
+    expect(buildSearchCorpus(msg)).toContain('hello world');
+  });
+
+  it('includes reasoning extracted from <think> tags in raw content', () => {
+    const msg: Message = {
+      role: 'assistant',
+      content: '<think>private chain of thought</think>visible answer',
+    };
+    const corpus = buildSearchCorpus(msg);
+    expect(corpus).toContain('private chain of thought');
+    expect(corpus).toContain('visible answer');
+  });
+
+  it('includes reasoning from structured content_parts (harmony format)', () => {
+    // This is the case the previous searcher silently missed — the
+    // thinking text never appeared in `content` so it was invisible.
+    const msg: Message = {
+      role: 'assistant',
+      content: '',
+      content_parts: [
+        { type: 'thinking', thinking: 'plotting the answer' },
+        { type: 'text', text: '42' },
+      ],
+    };
+    const corpus = buildSearchCorpus(msg);
+    expect(corpus).toContain('plotting the answer');
+    expect(corpus).toContain('42');
+  });
+
+  it('includes structured tool-call function names and arguments', () => {
+    const msg: Message = {
+      role: 'assistant',
+      content: 'running shell',
+      tool_calls: [
+        {
+          type: 'function',
+          function: {
+            name: 'bash',
+            arguments: '{"command":"ls -la /etc"}',
+          },
+        },
+      ],
+    };
+    const corpus = buildSearchCorpus(msg);
+    expect(corpus).toContain('bash');
+    expect(corpus).toContain('ls -la /etc');
+  });
+
+  it('stringifies object-form tool-call arguments', () => {
+    const msg: Message = {
+      role: 'assistant',
+      content: '',
+      tool_calls: [
+        {
+          type: 'function',
+          function: {
+            name: 'web_search',
+            arguments: { query: 'how to bake bread' } as Record<string, unknown>,
+          },
+        },
+      ],
+    };
+    const corpus = buildSearchCorpus(msg);
+    expect(corpus).toContain('web_search');
+    expect(corpus).toContain('how to bake bread');
+  });
+
+  it('excludes ChatML marker tokens that the renderer strips', () => {
+    // Inverse-miss prevention: marker tokens are present in raw content
+    // but never visible in the rendered card. The corpus must mirror
+    // what the user sees, not what's on disk.
+    const msg: Message = {
+      role: 'assistant',
+      content: '<|im_assistant|>assistant<|im_middle|><think></think>The answer is 42.<|im_end|>',
+    };
+    const corpus = buildSearchCorpus(msg);
+    expect(corpus).toContain('The answer is 42.');
+    expect(corpus).not.toContain('im_assistant');
+    expect(corpus).not.toContain('im_middle');
+    expect(corpus).not.toContain('im_end');
+  });
+
+  it('excludes Harmony channel tokens that the renderer strips', () => {
+    const msg: Message = {
+      role: 'assistant',
+      content:
+        '<|channel|>analysis<|message|>Need shell.<|end|>' +
+        '<|start|>assistant<|channel|>final<|message|>The answer.<|return|>',
+    };
+    const corpus = buildSearchCorpus(msg);
+    expect(corpus).toContain('Need shell.');
+    expect(corpus).toContain('The answer.');
+    expect(corpus).not.toContain('|channel|');
+    expect(corpus).not.toContain('|message|');
+    expect(corpus).not.toContain('|return|');
+  });
+
+  it('includes the analysis text from compact-harmony format', () => {
+    const msg: Message = {
+      role: 'assistant',
+      content: 'analysisDeducing the right tool to call.assistantfinalThe final answer.',
+    };
+    const corpus = buildSearchCorpus(msg);
+    expect(corpus).toContain('Deducing the right tool to call.');
+    expect(corpus).toContain('The final answer.');
+  });
+
+  it('handles tool messages (passes content through unchanged)', () => {
+    const msg: Message = {
+      role: 'tool',
+      content: 'file1.txt\nfile2.txt\n',
+    };
+    expect(buildSearchCorpus(msg)).toContain('file1.txt');
+    expect(buildSearchCorpus(msg)).toContain('file2.txt');
+  });
+
+  it('handles empty messages (no content, no parts, no tools)', () => {
+    expect(buildSearchCorpus({ role: 'user', content: '' })).toBe('');
+  });
+
+  it('preserves Unicode whitespace verbatim (matcher normalizes downstream)', () => {
+    // The corpus retains exotic whitespace so the highlight pipeline can
+    // slice the original characters; the search-time normalization lives
+    // in textMatch.findAllMatchesCI, applied at query time.
+    const msg: Message = {
+      role: 'tool',
+      content: 'core hours 7 am',
+    };
+    const corpus = buildSearchCorpus(msg);
+    expect(corpus).toContain(' ');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatMessageText — plain-text clipboard rendering
+// ---------------------------------------------------------------------------
+
+describe('formatMessageText', () => {
+  it('returns plain content for a user message', async () => {
+    const { formatMessageText } = await import('./parseContent');
+    const out = formatMessageText({ role: 'user', content: 'What is 2 + 2?' });
+    expect(out).toBe('What is 2 + 2?');
+  });
+
+  it('returns plain content for a tool message', async () => {
+    const { formatMessageText } = await import('./parseContent');
+    const out = formatMessageText({ role: 'tool', content: 'file1.txt\nfile2.txt' });
+    expect(out).toBe('file1.txt\nfile2.txt');
+  });
+
+  it('labels reasoning extracted from <think> tags', async () => {
+    const { formatMessageText } = await import('./parseContent');
+    const out = formatMessageText({
+      role: 'assistant',
+      content: '<think>private chain of thought</think>visible answer',
+    });
+    expect(out).toBe('[Reasoning]\nprivate chain of thought\n\nvisible answer');
+  });
+
+  it('labels reasoning from content_parts (harmony)', async () => {
+    const { formatMessageText } = await import('./parseContent');
+    const out = formatMessageText({
+      role: 'assistant',
+      content: '',
+      content_parts: [
+        { type: 'thinking', thinking: 'plotting' },
+        { type: 'text', text: 'final' },
+      ],
+    });
+    expect(out).toBe('[Reasoning]\nplotting\n\nfinal');
+  });
+
+  it('appends each tool call with its function name', async () => {
+    const { formatMessageText } = await import('./parseContent');
+    const out = formatMessageText({
+      role: 'assistant',
+      content: 'running shell',
+      tool_calls: [
+        { type: 'function', function: { name: 'bash', arguments: '{"command":"ls /tmp"}' } },
+      ],
+    });
+    expect(out).toBe('running shell\n\n[Tool: bash]\nls /tmp');
+  });
+
+  it('extracts command field rather than dumping JSON when the args object has one', async () => {
+    const { formatMessageText } = await import('./parseContent');
+    const out = formatMessageText({
+      role: 'assistant',
+      content: '',
+      tool_calls: [
+        { type: 'function', function: { name: 'bash', arguments: { command: 'ls -la' } as Record<string, unknown> } },
+      ],
+    });
+    expect(out).toBe('[Tool: bash]\nls -la');
+  });
+
+  it('keeps full JSON for tool calls without a command field', async () => {
+    const { formatMessageText } = await import('./parseContent');
+    const out = formatMessageText({
+      role: 'assistant',
+      content: '',
+      tool_calls: [
+        { type: 'function', function: { name: 'web_search', arguments: '{"query":"foo"}' } },
+      ],
+    });
+    expect(out).toContain('[Tool: web_search]');
+    expect(out).toContain('{"query":"foo"}');
+  });
+
+  it('returns empty string for a fully empty message', async () => {
+    const { formatMessageText } = await import('./parseContent');
+    expect(formatMessageText({ role: 'user', content: '' })).toBe('');
+  });
+
+  it('strips ChatML markers (mirrors what the renderer shows)', async () => {
+    const { formatMessageText } = await import('./parseContent');
+    const out = formatMessageText({
+      role: 'assistant',
+      content: '<|im_assistant|>assistant<|im_middle|>The answer is 42.<|im_end|>',
+    });
+    expect(out).toBe('The answer is 42.');
+  });
+
+  it('combines reasoning + content + tools in order', async () => {
+    const { formatMessageText } = await import('./parseContent');
+    const out = formatMessageText({
+      role: 'assistant',
+      content: '<think>thinking</think>main answer',
+      tool_calls: [
+        { type: 'function', function: { name: 'bash', arguments: '{"command":"pwd"}' } },
+      ],
+    });
+    expect(out).toBe('[Reasoning]\nthinking\n\nmain answer\n\n[Tool: bash]\npwd');
   });
 });

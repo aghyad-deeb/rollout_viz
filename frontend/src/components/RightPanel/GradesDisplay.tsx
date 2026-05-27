@@ -1,20 +1,28 @@
-import { useState, useEffect, useMemo } from 'react';
-import type { SampleGrades, Quote } from '../../types';
+import { useState, useMemo } from 'react';
+import type { SampleGrades } from '../../types';
 
-// Component for truncated explanations
-function ExplanationText({ explanation, isDarkMode }: { explanation: string; isDarkMode: boolean }) {
+// Component for truncated text blocks (shared by explanations and freeform answers).
+function ExplanationText({
+  explanation,
+  isDarkMode,
+  label = 'Explanation:',
+}: {
+  explanation: string;
+  isDarkMode: boolean;
+  label?: string;
+}) {
   const [isExpanded, setIsExpanded] = useState(false);
   const maxLength = 150;
   const shouldTruncate = explanation.length > maxLength;
-  
-  const displayText = shouldTruncate && !isExpanded 
-    ? explanation.slice(0, maxLength) + '...' 
+
+  const displayText = shouldTruncate && !isExpanded
+    ? explanation.slice(0, maxLength) + '...'
     : explanation;
 
   return (
     <div className={`text-sm ${isDarkMode ? 'text-gray-300' : 'text-gray-600'}`}>
       <div className={`text-xs font-medium mb-1 ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>
-        Explanation:
+        {label}
       </div>
       <p className="whitespace-pre-wrap text-xs leading-relaxed">
         {displayText}
@@ -35,23 +43,39 @@ interface GradesDisplayProps {
   grades: SampleGrades | undefined;
   selectedMetric: string | undefined;
   onSelectMetric: (metric: string | undefined) => void;
-  onScrollToQuote?: (messageIndex: number) => void;
+  // `quoteIdx` is the position of the quote in `selectedQuotes` (sorted by
+  // message_index then start). Consumers use it to target the Nth rendered
+  // purple mark rather than just the message it lives in.
+  onScrollToQuote?: (messageIndex: number, quoteIdx: number) => void;
   isDarkMode: boolean;
   currentQuoteIndex?: number;
   onQuoteIndexChange?: (index: number) => void;
 }
 
-function formatGrade(grade: number | boolean, gradeType: string): string {
+// Short label for the header pill; freeform grades get truncated since a
+// grade can be an entire paragraph of prose.
+const FREEFORM_PREVIEW_LEN = 24;
+
+function formatGrade(grade: number | boolean | string, gradeType: string): string {
   if (gradeType === 'bool') return grade ? '✓ Yes' : '✗ No';
   if (gradeType === 'float') return (grade as number).toFixed(2);
+  if (gradeType === 'freeform') {
+    const text = String(grade ?? '').trim();
+    if (text.length <= FREEFORM_PREVIEW_LEN) return text || '(empty)';
+    return text.slice(0, FREEFORM_PREVIEW_LEN).trimEnd() + '…';
+  }
   return String(grade);
 }
 
-function getGradeColor(grade: number | boolean, gradeType: string, isDarkMode: boolean): string {
+function getGradeColor(grade: number | boolean | string, gradeType: string, isDarkMode: boolean): string {
   if (gradeType === 'bool') {
-    return grade 
+    return grade
       ? (isDarkMode ? 'text-green-400' : 'text-green-600')
       : (isDarkMode ? 'text-red-400' : 'text-red-600');
+  }
+  if (gradeType === 'freeform') {
+    // Freeform grades aren't good/bad — neutral color.
+    return isDarkMode ? 'text-gray-200' : 'text-gray-700';
   }
   const value = grade as number;
   if (value >= 0.7) return isDarkMode ? 'text-green-400' : 'text-green-600';
@@ -110,6 +134,22 @@ export function GradesDisplay({
             {metrics.slice(0, 3).map(([metric, gradeList]) => {
               const latest = gradeList[gradeList.length - 1];
               if (!latest) return null;
+              // For freeform the `grade` is a full paragraph — truncating to
+              // the header pill would be misleading. Show a small icon badge
+              // instead; the full answer is visible when the card is expanded.
+              if (latest.grade_type === 'freeform') {
+                return (
+                  <span
+                    key={metric}
+                    className={`inline-flex items-center gap-0.5 text-xs px-1.5 py-0.5 rounded ${
+                      isDarkMode ? 'bg-gray-700 text-gray-300' : 'bg-gray-100 text-gray-600'
+                    }`}
+                    title="Freeform grade — click to expand"
+                  >
+                    <span className="material-symbols-outlined" style={{ fontSize: 12 }}>notes</span>
+                  </span>
+                );
+              }
               return (
                 <span
                   key={metric}
@@ -151,15 +191,24 @@ export function GradesDisplay({
                     : (isDarkMode ? 'border-gray-700 bg-gray-800/50' : 'border-gray-200 bg-white')
                 }`}
               >
-                {/* Metric header */}
+                {/* Metric header — for freeform grades the `grade` text
+                    would dominate this row, so we just show the metric name
+                    and render the full prose separately below. */}
                 <div className="flex items-center justify-between mb-1">
                   <div className="flex items-center gap-2">
                     <span className={`text-sm font-medium ${isDarkMode ? 'text-gray-200' : 'text-gray-700'}`}>
                       {metric}
                     </span>
-                    <span className={`text-sm font-bold ${getGradeColor(latest.grade, latest.grade_type, isDarkMode)}`}>
-                      {formatGrade(latest.grade, latest.grade_type)}
-                    </span>
+                    {latest.grade_type !== 'freeform' && (
+                      <span className={`text-sm font-bold ${getGradeColor(latest.grade, latest.grade_type, isDarkMode)}`}>
+                        {formatGrade(latest.grade, latest.grade_type)}
+                      </span>
+                    )}
+                    {latest.grade_type === 'freeform' && (
+                      <span className={`text-xs px-1.5 py-0.5 rounded ${isDarkMode ? 'bg-gray-700 text-gray-300' : 'bg-gray-100 text-gray-600'}`}>
+                        freeform
+                      </span>
+                    )}
                   </div>
                   <button
                     onClick={() => {
@@ -168,11 +217,16 @@ export function GradesDisplay({
                       } else {
                         onSelectMetric(metric);
                         onQuoteIndexChange?.(0); // Reset to first quote
-                        // Scroll to first quote
+                        // Scroll to first quote. Use the sort that matches
+                        // `selectedQuotes` (by message_index, then start) so
+                        // index 0 in the scroll callback points to the same
+                        // mark the prev/next buttons will navigate around.
                         if (latest.quotes && latest.quotes.length > 0 && onScrollToQuote) {
-                          const firstQuote = latest.quotes.reduce((min, q) => 
-                            q.message_index < min.message_index ? q : min, latest.quotes[0]);
-                          onScrollToQuote(firstQuote.message_index);
+                          const sorted = [...latest.quotes].sort((a, b) => {
+                            if (a.message_index !== b.message_index) return a.message_index - b.message_index;
+                            return a.start - b.start;
+                          });
+                          onScrollToQuote(sorted[0].message_index, 0);
                         }
                       }
                     }}
@@ -190,11 +244,23 @@ export function GradesDisplay({
                   </button>
                 </div>
 
+                {/* Freeform answer — primary content for this grade type.
+                    Reuses the truncating/expanding ExplanationText component. */}
+                {latest.grade_type === 'freeform' && (
+                  <div className={`rounded p-2 mb-1 border ${isDarkMode ? 'bg-gray-900/40 border-gray-700' : 'bg-white border-gray-200'}`}>
+                    <ExplanationText
+                      explanation={String(latest.grade ?? '') || '(empty)'}
+                      isDarkMode={isDarkMode}
+                      label="Answer:"
+                    />
+                  </div>
+                )}
+
                 {/* Explanation - truncated with expand option */}
                 {latest.explanation && (
-                  <ExplanationText 
-                    explanation={latest.explanation} 
-                    isDarkMode={isDarkMode} 
+                  <ExplanationText
+                    explanation={latest.explanation}
+                    isDarkMode={isDarkMode}
                   />
                 )}
 
@@ -222,7 +288,7 @@ export function GradesDisplay({
                           const newIndex = currentQuoteIndex <= 0 ? selectedQuotes.length - 1 : currentQuoteIndex - 1;
                           onQuoteIndexChange?.(newIndex);
                           if (onScrollToQuote && selectedQuotes[newIndex]) {
-                            onScrollToQuote(selectedQuotes[newIndex].message_index);
+                            onScrollToQuote(selectedQuotes[newIndex].message_index, newIndex);
                           }
                         }}
                         className={`p-0.5 rounded transition-colors ${
@@ -241,7 +307,7 @@ export function GradesDisplay({
                           const newIndex = currentQuoteIndex >= selectedQuotes.length - 1 ? 0 : currentQuoteIndex + 1;
                           onQuoteIndexChange?.(newIndex);
                           if (onScrollToQuote && selectedQuotes[newIndex]) {
-                            onScrollToQuote(selectedQuotes[newIndex].message_index);
+                            onScrollToQuote(selectedQuotes[newIndex].message_index, newIndex);
                           }
                         }}
                         className={`p-0.5 rounded transition-colors ${

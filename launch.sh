@@ -1,85 +1,41 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# launch.sh — thin shim over supervisor.sh.
+#
+# The previous launch.sh ran the three services in a foreground bash that
+# trapped SIGHUP and forwarded it to its children, so terminal disconnects
+# (tmux detach gone wrong, SSH drop, logout) tore down the entire stack.
+# It also relied on watchdog.sh, which only logged deaths and never
+# restarted anything.
+#
+# Both problems are gone in supervisor.sh — see that script's docstring
+# for the design. This file is kept so existing muscle memory and any
+# `./launch.sh start|stop` automation still works.
+#
+#   ./launch.sh           → ./supervisor.sh start
+#   ./launch.sh start     → ./supervisor.sh start
+#   ./launch.sh stop      → ./supervisor.sh stop
+#   ./launch.sh status    → ./supervisor.sh status
+#   ./launch.sh logs ...  → ./supervisor.sh logs ...
+#   ./launch.sh --legacy  → invoke the old foreground launcher
+#                            (./launch.legacy.sh) — useful for debugging
+#                            startup issues, NOT for running in production.
 
-# Rollout Visualizer Launch Script
-# Starts both the FastAPI backend and React frontend
-
-set -e
-
+set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
-
-echo -e "${GREEN}Starting Rollout Visualizer...${NC}"
-
-# Check if node_modules exists
-if [ ! -d "frontend/node_modules" ]; then
-    echo -e "${YELLOW}Installing frontend dependencies...${NC}"
-    cd frontend && npm install && cd ..
+# Default to `start` when invoked bare (`bash launch.sh`). Without this the
+# `"${1:-start}"` only affects the case match — `"$@"` would still be empty,
+# and supervisor.sh would print its usage banner instead of starting.
+if [[ $# -eq 0 ]]; then
+  set -- start
 fi
 
-# Function to cleanup background processes on exit
-cleanup() {
-    echo -e "\n${YELLOW}Shutting down...${NC}"
-    kill $BACKEND_PID 2>/dev/null || true
-    kill $FRONTEND_PID 2>/dev/null || true
-    [ -n "$TUNNEL_PID" ] && kill $TUNNEL_PID 2>/dev/null || true
-    exit 0
-}
-
-trap cleanup SIGINT SIGTERM
-
-# Start backend (run from project root so relative paths work)
-echo -e "${GREEN}Starting backend on port 8000...${NC}"
-source venv/bin/activate
-
-# Backend reads all config (API keys, VIZ_PASSWORD) directly from ~/.env
-python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload &
-BACKEND_PID=$!
-
-# Wait for backend to be ready (poll health endpoint)
-echo -e "${YELLOW}Waiting for backend to be ready...${NC}"
-for i in $(seq 1 30); do
-    if curl -sf http://127.0.0.1:8000/api/health > /dev/null 2>&1; then
-        echo -e "${GREEN}Backend is ready!${NC}"
-        break
-    fi
-    if [ $i -eq 30 ]; then
-        echo -e "${RED}Backend failed to start within 30 seconds${NC}"
-        cleanup
-    fi
-    sleep 1
-done
-
-# Start frontend
-echo -e "${GREEN}Starting frontend on port 3000...${NC}"
-cd frontend
-npm run dev &
-FRONTEND_PID=$!
-cd ..
-
-# Start Cloudflare tunnel if available and tunnel exists
-TUNNEL_PID=""
-if command -v cloudflared &> /dev/null && cloudflared tunnel list 2>/dev/null | grep -q "rollout-viz"; then
-    echo -e "${GREEN}Starting Cloudflare tunnel...${NC}"
-    cloudflared tunnel run --url http://localhost:3000 rollout-viz &
-    TUNNEL_PID=$!
-fi
-
-echo -e "${GREEN}========================================${NC}"
-echo -e "${GREEN}Rollout Visualizer is running!${NC}"
-echo -e "${GREEN}Frontend: http://localhost:3000${NC}"
-echo -e "${GREEN}Backend:  http://localhost:8000${NC}"
-echo -e "${GREEN}API Docs: http://localhost:8000/docs${NC}"
-if [ -n "$TUNNEL_PID" ]; then
-echo -e "${GREEN}Tunnel:   https://rollout-viz.com${NC}"
-fi
-echo -e "${GREEN}========================================${NC}"
-echo -e "${YELLOW}Press Ctrl+C to stop${NC}"
-
-# Wait for all processes
-wait
+case "$1" in
+  --legacy|legacy)
+    shift
+    exec "$SCRIPT_DIR/launch.legacy.sh" "$@"
+    ;;
+  *)
+    exec "$SCRIPT_DIR/supervisor.sh" "$@"
+    ;;
+esac

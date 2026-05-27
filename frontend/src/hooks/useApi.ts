@@ -3,16 +3,19 @@ import type { Sample, FileInfo } from '../types';
 
 const FETCH_TIMEOUT = 30_000; // 30 seconds
 
-function fetchWithTimeout(url: string, signal?: AbortSignal, timeoutMs = FETCH_TIMEOUT): Promise<Response> {
+function fetchWithTimeout(
+  url: string,
+  options?: { signal?: AbortSignal; headers?: Record<string, string> },
+  timeoutMs = FETCH_TIMEOUT,
+): Promise<Response> {
   const timeoutController = new AbortController();
   const timer = setTimeout(() => timeoutController.abort(), timeoutMs);
 
-  // Combine external signal (cross-call cancellation) with timeout signal
-  const combinedSignal = signal
-    ? AbortSignal.any([signal, timeoutController.signal])
+  const signal = options?.signal
+    ? AbortSignal.any([options.signal, timeoutController.signal])
     : timeoutController.signal;
 
-  return fetch(url, { signal: combinedSignal }).finally(() => clearTimeout(timer));
+  return fetch(url, { signal, headers: options?.headers }).finally(() => clearTimeout(timer));
 }
 
 interface SamplesResponse {
@@ -29,13 +32,20 @@ interface MultiFileSamplesResponse {
   file_paths: string[];
 }
 
-export function useApi() {
+export function useApi(shareToken?: string | null) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [messagesLoaded, setMessagesLoaded] = useState(false);
   const [messagesLoading, setMessagesLoading] = useState(false);
   const samplesAbortRef = useRef<AbortController | null>(null);
   const backgroundAbortRef = useRef<AbortController | null>(null);
+  const shareTokenRef = useRef(shareToken);
+  shareTokenRef.current = shareToken;
+
+  const shareHeaders = useCallback((): Record<string, string> => {
+    if (shareTokenRef.current) return { 'X-Share-Token': shareTokenRef.current };
+    return {};
+  }, []);
 
   const loadSamples = useCallback(async (filePath: string): Promise<SamplesResponse | null> => {
     // Abort any in-flight samples request
@@ -49,7 +59,7 @@ export function useApi() {
     try {
       const response = await fetchWithTimeout(
         `/api/samples?file=${encodeURIComponent(filePath)}`,
-        controller.signal,
+        { signal: controller.signal, headers: shareHeaders() },
       );
       if (!response.ok) {
         let detail = `Failed to load samples: ${response.status} ${response.statusText}`;
@@ -100,7 +110,7 @@ export function useApi() {
 
       const response = await fetch('/api/samples/batch', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...shareHeaders() },
         body: JSON.stringify({ files: filePaths }),
         signal: combinedSignal,
       });
@@ -182,7 +192,7 @@ export function useApi() {
 
         const response = await fetch('/api/samples/batch', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...shareHeaders() },
           body: JSON.stringify({ files: [filePath], metadata_only: true }),
           signal: combinedSignal,
         });
@@ -258,7 +268,7 @@ export function useApi() {
 
       const response = await fetch('/api/samples/batch', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...shareHeaders() },
         body: JSON.stringify({ files: filePaths }),
         signal: combinedSignal,
       });
@@ -307,6 +317,7 @@ export function useApi() {
     try {
       const response = await fetchWithTimeout(
         `/api/sample/${sampleId}?file=${encodeURIComponent(filePath)}`,
+        { headers: shareHeaders() },
       );
       if (!response.ok) {
         return null;
@@ -322,7 +333,7 @@ export function useApi() {
     setError(null);
 
     try {
-      const response = await fetchWithTimeout(`/api/files/local?directory=${encodeURIComponent(directory)}`);
+      const response = await fetchWithTimeout(`/api/files/local?directory=${encodeURIComponent(directory)}`, { headers: shareHeaders() });
       if (!response.ok) {
         const errorData = await response.json();
         throw new Error(errorData.detail || 'Failed to list files');
@@ -344,7 +355,7 @@ export function useApi() {
     setError(null);
 
     try {
-      const response = await fetchWithTimeout(`/api/files/s3?bucket=${encodeURIComponent(bucket)}&prefix=${encodeURIComponent(prefix)}`);
+      const response = await fetchWithTimeout(`/api/files/s3?bucket=${encodeURIComponent(bucket)}&prefix=${encodeURIComponent(prefix)}`, { headers: shareHeaders() });
       if (!response.ok) {
         const errorData = await response.json();
         throw new Error(errorData.detail || 'Failed to list S3 files');

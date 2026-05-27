@@ -25,6 +25,7 @@ interface LeftPanelProps {
   onFilteredSamplesChange?: (samples: Sample[]) => void;
   onCurrentOccurrenceIndexChange?: (index: number) => void;
   messagesLoaded?: boolean;
+  isSharedMode?: boolean;
 }
 
 export function LeftPanel({
@@ -46,6 +47,7 @@ export function LeftPanel({
   onFilteredSamplesChange,
   onCurrentOccurrenceIndexChange,
   messagesLoaded = true,
+  isSharedMode = false,
 }: LeftPanelProps) {
   const [sortColumn, setSortColumn] = useState<SortColumn>('sample_index');
   const [sortOrder, setSortOrder] = useState<SortOrder>('asc');
@@ -270,21 +272,25 @@ export function LeftPanel({
       // Handle grade:metricName columns
       if (sortColumn.startsWith('grade:')) {
         const metricName = sortColumn.slice(6); // Remove 'grade:' prefix
-        const getGradeValue = (sample: Sample): number | null => {
+        const getGradeValue = (sample: Sample): number | string | null => {
           if (!sample.grades || !sample.grades[metricName]) return null;
           const grades = sample.grades[metricName];
           if (grades.length === 0) return null;
           const grade = grades[grades.length - 1].grade;
           // Convert bool to number for sorting
           if (typeof grade === 'boolean') return grade ? 1 : 0;
+          // Freeform grades sort alphabetically (case-insensitive).
+          if (typeof grade === 'string') return grade.toLowerCase();
           return grade as number;
         };
-        aVal = getGradeValue(a);
-        bVal = getGradeValue(b);
+        const aG = getGradeValue(a);
+        const bG = getGradeValue(b);
         // Handle null values - put them at the end
-        if (aVal === null && bVal === null) return 0;
-        if (aVal === null) return sortOrder === 'asc' ? 1 : -1;
-        if (bVal === null) return sortOrder === 'asc' ? -1 : 1;
+        if (aG === null && bG === null) return 0;
+        if (aG === null) return sortOrder === 'asc' ? 1 : -1;
+        if (bG === null) return sortOrder === 'asc' ? -1 : 1;
+        aVal = aG;
+        bVal = bG;
       } else {
         switch (sortColumn) {
           case 'sample_index':
@@ -436,13 +442,15 @@ export function LeftPanel({
           </span>
         </a>
         <div className={`flex overflow-hidden flex-1 ${isDarkMode ? 'bg-[#1a1a2e]' : 'bg-white'}`}>
-          <button
-            onClick={onOpenFileBrowser}
-            className={`flex items-center px-3 py-2 border-b-2 border-transparent ${isDarkMode ? 'text-gray-400 hover:text-gray-200 hover:bg-gray-800' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-50'}`}
-            title="Browse files"
-          >
-            <span className="material-symbols-outlined" style={{ fontSize: 24 }}>folder</span>
-          </button>
+          {!isSharedMode && (
+            <button
+              onClick={onOpenFileBrowser}
+              className={`flex items-center px-3 py-2 border-b-2 border-transparent ${isDarkMode ? 'text-gray-400 hover:text-gray-200 hover:bg-gray-800' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-50'}`}
+              title="Browse files"
+            >
+              <span className="material-symbols-outlined" style={{ fontSize: 24 }}>folder</span>
+            </button>
+          )}
           <button className={`flex items-center px-3 py-2 border-b-2 border-transparent ${isDarkMode ? 'text-gray-400 hover:text-gray-200 hover:bg-gray-800' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-50'}`}>
             <span className="material-symbols-outlined" style={{ fontSize: 24 }}>description</span>
           </button>
@@ -474,6 +482,7 @@ export function LeftPanel({
           totalSamples={samples.length}
           filteredCount={filteredSamples.length}
           isDarkMode={isDarkMode}
+          isSharedMode={isSharedMode}
         />
 
         <FilterBar
