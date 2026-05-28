@@ -6,6 +6,7 @@
 //   4. Kimi/ChatML format: <|im_assistant|>...<|im_middle|>...<|im_end|> with inline tool calls
 
 import type { Message, SearchCondition, SearchField, ToolCall } from '../types';
+import { findAllMatchesCI } from './textMatch';
 
 // --- Harmony regexes ---
 
@@ -359,14 +360,22 @@ export function fieldAppliesToReasoning(field: SearchField, role: string): boole
 // Occurrence counting (matches exactly what MessageCard highlights)
 // ---------------------------------------------------------------------------
 
-function countSubstring(text: string, term: string): number {
-  let count = 0;
-  let idx = 0;
-  while ((idx = text.indexOf(term, idx)) !== -1) {
-    count++;
-    idx += term.length;
+function displayToolArguments(args: ToolCall['function']['arguments']): string {
+  if (typeof args === 'string') {
+    try {
+      const parsed = JSON.parse(args) as Record<string, unknown>;
+      return parsed?.command != null ? String(parsed.command) : args;
+    } catch {
+      return args;
+    }
   }
-  return count;
+  return args?.command != null
+    ? String(args.command)
+    : JSON.stringify(args, null, 2);
+}
+
+function countSubstring(text: string, term: string): number {
+  return findAllMatchesCI(text, term).length;
 }
 
 /** Count highlight occurrences for a single message, matching the field scoping
@@ -375,18 +384,24 @@ export function countMessageOccurrences(message: Message, searchConditions: Sear
   const activeConditions = searchConditions.filter(c => c.operator === 'contains' && c.term.trim());
   if (activeConditions.length === 0) return 0;
 
-  const { reasoning, mainContent } = normalizeAssistantMessage(message);
+  const { reasoning, mainContent, toolCalls } = normalizeAssistantMessage(message);
   let count = 0;
 
   for (const condition of activeConditions) {
-    const termLower = condition.term.trim().toLowerCase();
+    const term = condition.term.trim();
 
-    if (fieldAppliesToContent(condition.field, message.role)) {
-      count += countSubstring(mainContent.toLowerCase(), termLower);
+    // Match DOM order in MessageCard: reasoning, visible content, then each
+    // structured tool-call name and displayed argument payload.
+    if (reasoning && fieldAppliesToReasoning(condition.field, message.role)) {
+      count += countSubstring(reasoning, term);
     }
 
-    if (reasoning && fieldAppliesToReasoning(condition.field, message.role)) {
-      count += countSubstring(reasoning.toLowerCase(), termLower);
+    if (fieldAppliesToContent(condition.field, message.role)) {
+      count += countSubstring(mainContent, term);
+      for (const tc of toolCalls) {
+        count += countSubstring(tc.function.name, term);
+        count += countSubstring(displayToolArguments(tc.function.arguments), term);
+      }
     }
   }
 
@@ -471,10 +486,7 @@ export function buildSearchCorpus(message: Message): string {
   if (reasoning) parts.push(reasoning);
   if (mainContent) parts.push(mainContent);
   for (const tc of toolCalls) {
-    const args = typeof tc.function.arguments === 'string'
-      ? tc.function.arguments
-      : JSON.stringify(tc.function.arguments);
-    parts.push(`${tc.function.name}\n${args}`);
+    parts.push(`${tc.function.name}\n${displayToolArguments(tc.function.arguments)}`);
   }
   return parts.join('\n');
 }

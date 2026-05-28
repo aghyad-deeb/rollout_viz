@@ -204,17 +204,102 @@ describe('MessageCard', () => {
     expect(candidate.tagName).not.toBe('MARK');
   });
 
-  it('URL-share highlight outranks ephemeral when both match the same text', () => {
+  it('composes URL-share and ephemeral highlights on the same text', () => {
+    const onClear = vi.fn();
+    const onRemove = vi.fn();
     render(<MessageCard {...defaultProps}
       message={{ role: 'user', content: 'the shared passage lives here' }}
       isHighlighted={true}
       highlightedText="shared passage"
+      onClearHighlight={onClear}
       ephemeralHighlights={[{ id: 'h1', messageIndex: 0, text: 'shared passage' }]}
+      onRemoveEphemeralHighlight={onRemove}
     />);
     const mark = screen.getByText('shared passage');
-    // Priority 1 (URL blue) must win — verifies ephemeral is priority 2, not 1.
-    expect(mark.className).toContain('blue');
-    expect(mark.className).not.toContain('fuchsia');
+    expect(mark.tagName).toBe('MARK');
+    expect(mark.className).toContain('url-highlight-mark');
+    expect(mark.className).toContain('ephemeral-highlight-mark');
+
+    fireEvent.click(mark);
+
+    expect(onClear).toHaveBeenCalledTimes(1);
+    expect(onRemove).toHaveBeenCalledWith('h1');
+  });
+
+  it('composes bold, grade quote, local search, and global search when ranges overlap', () => {
+    const { container } = render(<MessageCard {...defaultProps}
+      message={{ role: 'user', content: 'alpha target phrase omega' }}
+      gradeQuotes={[{ message_index: 0, start: 6, end: 12, text: 'target' }]}
+      ephemeralHighlights={[{ id: 'b1', messageIndex: 0, text: 'target phrase', style: 'bold' }]}
+      localSearchTerm="target phrase"
+      searchConditions={[{ id: 's1', field: 'chat', operator: 'contains', term: 'target phrase' }]}
+    />);
+
+    const firstSegment = container.querySelector('mark.grade-quote-mark');
+    expect(firstSegment).not.toBeNull();
+    expect(firstSegment!.textContent).toBe('target');
+    expect(firstSegment!.className).toContain('local-search-mark');
+    expect(firstSegment!.className).toContain('global-search-highlight');
+    expect(firstSegment!.querySelector('strong.ephemeral-bold-mark')).not.toBeNull();
+
+    const secondSegment = container.querySelector('mark.local-search-fragment.global-search-highlight-fragment');
+    expect(secondSegment).not.toBeNull();
+    expect(secondSegment!.textContent).toBe(' phrase');
+    expect(secondSegment!.querySelector('strong.ephemeral-bold-mark')).not.toBeNull();
+  });
+
+  it('composes reasoning highlights and keeps thinking quotes in the reasoning block', () => {
+    const { container } = render(<MessageCard {...defaultProps}
+      message={{ role: 'assistant', content: '<think>internal reasoning phrase</think>Visible answer' }}
+      gradeQuotes={[{ message_index: 0, channel: 'thinking', start: 9, end: 25, text: 'reasoning phrase' }]}
+      ephemeralHighlights={[{
+        id: 'h1',
+        messageIndex: 0,
+        text: 'reasoning phrase',
+        locator: { blockKind: 'reasoning', occurrence: 0 },
+      }]}
+      localSearchTerm="reasoning phrase"
+      searchConditions={[{ id: 's1', field: 'reasoning', operator: 'contains', term: 'reasoning phrase' }]}
+    />);
+
+    const reasoningBlock = container.querySelector('[data-block-kind="reasoning"]');
+    const mark = reasoningBlock?.querySelector('mark.grade-quote-mark');
+    expect(mark).not.toBeNull();
+    expect(mark!.textContent).toBe('reasoning phrase');
+    expect(mark!.className).toContain('ephemeral-highlight-mark');
+    expect(mark!.className).toContain('local-search-mark');
+    expect(mark!.className).toContain('global-search-highlight');
+    expect(container.querySelector('[data-block-kind="content"] mark.grade-quote-mark')).toBeNull();
+  });
+
+  it('applies tool_call quote channels to structured tool-call text', () => {
+    const { container } = render(<MessageCard {...defaultProps}
+      message={{
+        role: 'assistant',
+        content: '',
+        tool_calls: [
+          { type: 'function', function: { name: 'bash', arguments: '{"command":"cat results.txt"}' } },
+        ],
+      }}
+      gradeQuotes={[{ message_index: 0, channel: 'tool_call', start: 0, end: 15, text: 'cat results.txt' }]}
+    />);
+
+    const toolBlock = container.querySelector('[data-block-kind="tool"]');
+    const mark = toolBlock?.querySelector('mark.grade-quote-mark');
+    expect(mark).not.toBeNull();
+    expect(mark!.textContent).toBe('cat results.txt');
+  });
+
+  it('applies tool_result quote channels to tool-role content', () => {
+    const { container } = render(<MessageCard {...defaultProps}
+      message={{ role: 'tool', content: 'tool output line' }}
+      gradeQuotes={[{ message_index: 0, channel: 'tool_result', start: 0, end: 11, text: 'tool output' }]}
+    />);
+
+    const contentBlock = container.querySelector('[data-block-kind="content"]');
+    const mark = contentBlock?.querySelector('mark.grade-quote-mark');
+    expect(mark).not.toBeNull();
+    expect(mark!.textContent).toBe('tool output');
   });
 
   it('collapses and expands on header click', () => {

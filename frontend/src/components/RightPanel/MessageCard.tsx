@@ -135,6 +135,25 @@ interface SelectionPopup {
   blockIndex: number;
 }
 
+type RenderBlockKind = 'reasoning' | 'content' | 'tool';
+
+type TextMarkKind =
+  | 'url'
+  | 'ephemeral-highlight'
+  | 'ephemeral-bold'
+  | 'ephemeral-italic'
+  | 'grade-quote'
+  | 'local-search'
+  | 'global-search';
+
+interface TextMarkRange {
+  start: number;
+  end: number;
+  kind: TextMarkKind;
+  sourceId?: string;
+  isCurrent?: boolean;
+}
+
 function MessageCardInner({
   message,
   index,
@@ -420,212 +439,290 @@ function MessageCardInner({
     };
   }, [searchConditions, message.role]);
 
-  // Highlight cascade. Priorities (highest wins, exclusive):
-  //   1. URL share (blue fill + underline; click to clear; carries
-  //      `url-highlight-mark` so ChatView can target it for scroll)
-  //   2. Ephemeral session highlights (fuchsia fill; click to remove)
-  //   3. Grade quotes (purple fill + bottom border; carries
-  //      `grade-quote-mark` so ChatView's prev/next can find them)
-  //   4. Local Ctrl+F search (green; orange when current match)
-  //   5. Global filter-bar search (yellow; orange ring when current)
-  // All matchers go through findAllMatches[CI] from utils/textMatch.ts so
-  // a U+202F vs U+0020 mismatch between source and query doesn't cause
-  // false negatives. The rendered <mark> always slices the *original*
-  // text so visible whitespace is preserved verbatim.
+  // Use the *normalized* tool calls (Kimi/Harmony parsers extract them
+  // into this field) so structured rendering works even when the producer
+  // wrote inline tool tags rather than message.tool_calls.
+  const { reasoning, mainContent, toolCallText, toolCalls } = useMemo(
+    () => normalizeAssistantMessage(message),
+    // normalizeAssistantMessage reads only these four fields of `message`;
+    // listing them (not `message`) avoids recompute on unrelated identity changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [message.role, message.content, message.content_parts, message.tool_calls],
+  );
+
+  const countGlobalSearchMatches = (text: string, isReasoning: boolean): number => {
+    let count = 0;
+    for (const term of getApplicableSearchTerms(isReasoning)) {
+      count += findAllMatchesCI(text, term).length;
+    }
+    return count;
+  };
+
+  const globalOccurrenceStarts = useMemo(() => {
+    const toolNameStarts: number[] = [];
+    const toolArgStarts: number[] = [];
+    let cursor = messageOccurrenceStart;
+    const reasoningStart = cursor;
+    if (reasoning) cursor += countGlobalSearchMatches(reasoning, true);
+    const contentStart = cursor;
+    cursor += countGlobalSearchMatches(mainContent, false);
+    toolCalls.forEach((tc) => {
+      toolNameStarts.push(cursor);
+      cursor += countGlobalSearchMatches(tc.function.name, false);
+      toolArgStarts.push(cursor);
+      cursor += countGlobalSearchMatches(toolCallArgsText(tc), false);
+    });
+    return { reasoningStart, contentStart, toolNameStarts, toolArgStarts };
+    // countGlobalSearchMatches depends on getApplicableSearchTerms, which is
+    // already covered here.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [messageOccurrenceStart, reasoning, mainContent, toolCalls, getApplicableSearchTerms]);
+
+  // Highlight compositor. Every strategy contributes ranges, then one
+  // renderer splits the original text at all range boundaries and applies
+  // every active mark to each segment. Target classes are attached only to
+  // the first segment of a logical range so scroll-to-quote/search still sees
+  // one target per match even when another mark cuts across it.
   const highlightSearchAndUrl = useMemo(() => {
+    const quoteAppliesToRenderedBlock = (
+      quote: Quote,
+      isReasoningBlock: boolean,
+      blockKind?: RenderBlockKind,
+    ): boolean => {
+      const channel = quote.channel ?? 'text';
+      if (channel === 'thinking' || channel === 'reasoning_summary') {
+        return isReasoningBlock || blockKind === 'reasoning';
+      }
+      if (channel === 'tool_call') return blockKind === 'tool';
+      if (channel === 'tool_result') {
+        return message.role === 'tool' && blockKind === 'content';
+      }
+      return !isReasoningBlock && blockKind !== 'tool';
+    };
+
     return (
       text: string,
       isReasoning: boolean = false,
-      blockKind?: 'reasoning' | 'content' | 'tool',
+      blockKind?: RenderBlockKind,
       blockIndex = -1,
+      occurrenceStart = messageOccurrenceStart,
     ): React.ReactNode => {
-      // Priority 1: URL highlight
+      if (!text) return text;
+
+      const ranges: TextMarkRange[] = [];
+      const addRange = (
+        kind: TextMarkKind,
+        start: number,
+        end: number,
+        options: Pick<TextMarkRange, 'sourceId' | 'isCurrent'> = {},
+      ) => {
+        const boundedStart = Math.max(0, Math.min(text.length, start));
+        const boundedEnd = Math.max(0, Math.min(text.length, end));
+        if (boundedStart >= boundedEnd) return;
+        ranges.push({
+          start: boundedStart,
+          end: boundedEnd,
+          kind,
+          ...options,
+        });
+      };
+
       if (highlightedText) {
-        const urlMatches = findAllMatches(text, highlightedText);
-        if (urlMatches.length > 0) {
-          const parts: React.ReactNode[] = [];
-          let lastIndex = 0;
-          for (const m of urlMatches) {
-            if (m.start > lastIndex) parts.push(text.slice(lastIndex, m.start));
-            parts.push(
-              <mark
-                key={`url-${m.start}`}
-                className="url-highlight-mark bg-blue-100 dark:bg-blue-500/25 text-inherit px-1 py-0.5 rounded underline decoration-blue-500 dark:decoration-blue-400 decoration-2 underline-offset-2"
-                onClick={onClearHighlight}
-                title="Click to clear highlight"
-                style={{ cursor: 'pointer' }}
-              >
-                {text.slice(m.start, m.end)}
-              </mark>
-            );
-            lastIndex = m.end;
-          }
-          if (lastIndex < text.length) parts.push(text.slice(lastIndex));
-          return parts;
+        for (const m of findAllMatches(text, highlightedText)) {
+          addRange('url', m.start, m.end);
         }
       }
 
-      // Priority 2: Ephemeral user formatting — highlight / bold / italic
-      if (ephemeralHighlights.length > 0) {
-        const forThisMessage = ephemeralHighlights.filter(h => h.messageIndex === index);
-        if (forThisMessage.length > 0) {
-          const matches: { start: number; end: number; id: string; style: 'highlight' | 'bold' | 'italic' }[] = [];
-          for (const h of forThisMessage) {
-            const ms = findAllMatches(text, h.text);
-            const loc = h.locator;
-            if (loc) {
-              // Scoped to one occurrence in one block — same string
-              // elsewhere in the message is left un-styled.
-              if (!blockKind || loc.blockKind !== blockKind) continue;
-              if (loc.blockKind === 'tool' && loc.blockIndex !== blockIndex) continue;
-              const m = ms[loc.occurrence];
-              if (m) matches.push({ start: m.start, end: m.end, id: h.id, style: h.style ?? 'highlight' });
-            } else {
-              for (const m of ms) {
-                matches.push({ start: m.start, end: m.end, id: h.id, style: h.style ?? 'highlight' });
-              }
-            }
-          }
-          if (matches.length > 0) {
-            matches.sort((a, b) => a.start - b.start);
-            const parts: React.ReactNode[] = [];
-            let lastIndex = 0;
-            for (const match of matches) {
-              if (match.start < lastIndex) continue;
-              if (match.start > lastIndex) parts.push(text.slice(lastIndex, match.start));
-              const seg = text.slice(match.start, match.end);
-              const key = `ephemeral-${match.id}-${match.start}`;
-              const remove = (e: React.MouseEvent) => { e.stopPropagation(); onRemoveEphemeralHighlight?.(match.id); };
-              if (match.style === 'bold') {
-                parts.push(
-                  <strong key={key} className="ephemeral-bold-mark font-bold cursor-pointer" onClick={remove} title="Click to remove bold">
-                    {seg}
-                  </strong>
-                );
-              } else if (match.style === 'italic') {
-                parts.push(
-                  <em key={key} className="ephemeral-italic-mark italic cursor-pointer" onClick={remove} title="Click to remove italic">
-                    {seg}
-                  </em>
-                );
-              } else {
-                parts.push(
-                  <mark
-                    key={key}
-                    className="ephemeral-highlight-mark bg-fuchsia-300 dark:bg-fuchsia-500/40 text-inherit px-1 py-0.5 rounded cursor-pointer transition-colors hover:bg-fuchsia-400 dark:hover:bg-fuchsia-500/60"
-                    onClick={remove}
-                    title="Click to remove highlight"
-                  >
-                    {seg}
-                  </mark>
-                );
-              }
-              lastIndex = match.end;
-            }
-            if (lastIndex < text.length) parts.push(text.slice(lastIndex));
-            if (parts.length > 0) return parts;
+      const forThisMessage = ephemeralHighlights.filter(h => h.messageIndex === index);
+      for (const h of forThisMessage) {
+        const matches = findAllMatches(text, h.text);
+        const loc = h.locator;
+        const style = h.style ?? 'highlight';
+        const kind: TextMarkKind = style === 'bold'
+          ? 'ephemeral-bold'
+          : style === 'italic'
+            ? 'ephemeral-italic'
+            : 'ephemeral-highlight';
+        if (loc) {
+          if (!blockKind || loc.blockKind !== blockKind) continue;
+          if (loc.blockKind === 'tool' && loc.blockIndex !== blockIndex) continue;
+          const m = matches[loc.occurrence];
+          if (m) addRange(kind, m.start, m.end, { sourceId: h.id });
+        } else {
+          for (const m of matches) {
+            addRange(kind, m.start, m.end, { sourceId: h.id });
           }
         }
       }
 
-      // Priority 3: Grade quotes (LLM grader)
-      if (gradeQuotes.length > 0) {
-        const quotesForThisMessage = gradeQuotes.filter(q => q.message_index === index);
-        if (quotesForThisMessage.length > 0) {
-          const matches: { start: number; end: number }[] = [];
-          for (const quote of quotesForThisMessage) {
-            for (const m of findAllMatches(text, quote.text)) {
-              matches.push({ start: m.start, end: m.end });
-            }
-          }
-          if (matches.length > 0) {
-            matches.sort((a, b) => a.start - b.start);
-            const parts: React.ReactNode[] = [];
-            let lastIndex = 0;
-            for (const match of matches) {
-              if (match.start < lastIndex) continue;
-              if (match.start > lastIndex) parts.push(text.slice(lastIndex, match.start));
-              parts.push(
-                <mark
-                  key={`quote-${match.start}`}
-                  className="grade-quote-mark bg-purple-200 dark:bg-purple-900/50 text-purple-900 dark:text-purple-200 px-0.5 rounded border-b-2 border-purple-400"
-                  title="Quoted by LLM grader"
-                >
-                  {text.slice(match.start, match.end)}
-                </mark>
-              );
-              lastIndex = match.end;
-            }
-            if (lastIndex < text.length) parts.push(text.slice(lastIndex));
-            if (parts.length > 0) return parts;
-          }
+      const quotesForThisMessage = gradeQuotes.filter(q =>
+        q.message_index === index && quoteAppliesToRenderedBlock(q, isReasoning, blockKind)
+      );
+      for (const quote of quotesForThisMessage) {
+        for (const m of findAllMatches(text, quote.text)) {
+          addRange('grade-quote', m.start, m.end);
         }
       }
 
-      // Priority 4: Local Ctrl+F search
-      if (localSearchTerm && localSearchTerm.trim() !== '') {
-        const localMatches = findAllMatchesCI(text, localSearchTerm);
-        if (localMatches.length > 0) {
-          const parts: React.ReactNode[] = [];
-          let lastIndex = 0;
-          for (const m of localMatches) {
-            if (m.start > lastIndex) parts.push(text.slice(lastIndex, m.start));
-            parts.push(
-              <mark
-                key={`local-${m.start}`}
-                className={`local-search-mark px-0.5 rounded ${isCurrentLocalMatch ? 'bg-green-400 text-green-900' : 'bg-green-200 text-green-800'}`}
-              >
-                {text.slice(m.start, m.end)}
-              </mark>
-            );
-            lastIndex = m.end;
-          }
-          if (lastIndex < text.length) parts.push(text.slice(lastIndex));
-          return parts;
+      if (localSearchTerm.trim() !== '') {
+        for (const m of findAllMatchesCI(text, localSearchTerm)) {
+          addRange('local-search', m.start, m.end, { isCurrent: isCurrentLocalMatch });
         }
       }
 
-      // Priority 5: Global filter-bar search
-      const applicableTerms = getApplicableSearchTerms(isReasoning);
-      if (applicableTerms.length === 0) return text;
-      const matches: { start: number; end: number }[] = [];
-      for (const term of applicableTerms) {
+      const globalMatches: Array<{ start: number; end: number }> = [];
+      for (const term of getApplicableSearchTerms(isReasoning)) {
         for (const m of findAllMatchesCI(text, term)) {
-          matches.push({ start: m.start, end: m.end });
+          globalMatches.push({ start: m.start, end: m.end });
         }
       }
-      if (matches.length === 0) return text;
-      matches.sort((a, b) => a.start - b.start);
-      const parts: React.ReactNode[] = [];
-      let lastIndex = 0;
-      let occurrenceIdx = 0;
-      for (const match of matches) {
-        if (match.start < lastIndex) continue;
-        if (match.start > lastIndex) parts.push(text.slice(lastIndex, match.start));
-        const globalIdx = messageOccurrenceStart + occurrenceIdx;
-        const isCurrent = globalIdx === currentOccurrenceIndex;
-        parts.push(
+      globalMatches.sort((a, b) => a.start - b.start || a.end - b.end);
+      globalMatches.forEach((m, occurrenceIdx) => {
+        const globalIdx = occurrenceStart + occurrenceIdx;
+        addRange('global-search', m.start, m.end, { isCurrent: globalIdx === currentOccurrenceIndex });
+      });
+
+      if (ranges.length === 0) return text;
+
+      const renderMarkedSegment = (
+        segment: string,
+        active: TextMarkRange[],
+        segmentStart: number,
+        key: string,
+      ): React.ReactNode => {
+        const hasKind = (kind: TextMarkKind) => active.some(r => r.kind === kind);
+        const startsKind = (kind: TextMarkKind) => active.some(r => r.kind === kind && r.start === segmentStart);
+        const isCurrentKind = (kind: TextMarkKind) => active.some(r => r.kind === kind && r.isCurrent);
+        const ephemeralIds = Array.from(new Set(
+          active
+            .filter(r => r.kind.startsWith('ephemeral-') && r.sourceId)
+            .map(r => r.sourceId as string)
+        ));
+        const hasAction = hasKind('url') || ephemeralIds.length > 0;
+        const onClick = hasAction
+          ? (e: React.MouseEvent) => {
+              e.stopPropagation();
+              if (hasKind('url')) onClearHighlight();
+              ephemeralIds.forEach(id => onRemoveEphemeralHighlight?.(id));
+            }
+          : undefined;
+
+        let node: React.ReactNode = segment;
+        const formatTitle = ephemeralIds.length > 0 ? 'Click to remove formatting' : undefined;
+        const formatCursor = ephemeralIds.length > 0 ? 'cursor-pointer' : '';
+        if (hasKind('ephemeral-bold')) {
+          node = (
+            <strong
+              key={`${key}-bold`}
+              className={`ephemeral-bold-mark font-bold ${formatCursor}`}
+              onClick={onClick}
+              title={formatTitle}
+            >
+              {node}
+            </strong>
+          );
+        }
+        if (hasKind('ephemeral-italic')) {
+          node = (
+            <em
+              key={`${key}-italic`}
+              className={`ephemeral-italic-mark italic ${formatCursor}`}
+              onClick={onClick}
+              title={formatTitle}
+            >
+              {node}
+            </em>
+          );
+        }
+
+        const hasVisual = hasKind('url')
+          || hasKind('ephemeral-highlight')
+          || hasKind('grade-quote')
+          || hasKind('local-search')
+          || hasKind('global-search');
+
+        if (!hasVisual) return node;
+
+        const classes = ['px-0.5', 'rounded'];
+        const titles: string[] = [];
+        if (hasKind('url')) {
+          classes.push(
+            startsKind('url') ? 'url-highlight-mark' : 'url-highlight-fragment',
+            'bg-blue-100', 'dark:bg-blue-500/25', 'text-inherit', 'underline',
+            'decoration-blue-500', 'dark:decoration-blue-400', 'decoration-2', 'underline-offset-2'
+          );
+          titles.push('Click to clear highlight');
+        }
+        if (hasKind('grade-quote')) {
+          classes.push(
+            startsKind('grade-quote') ? 'grade-quote-mark' : 'grade-quote-fragment',
+            'bg-purple-200', 'dark:bg-purple-900/50', 'text-purple-900',
+            'dark:text-purple-200', 'border-b-2', 'border-purple-400'
+          );
+          titles.push('Quoted by LLM grader');
+        }
+        if (hasKind('local-search')) {
+          classes.push(
+            startsKind('local-search') ? 'local-search-mark' : 'local-search-fragment',
+            ...(isCurrentKind('local-search')
+              ? ['bg-green-400', 'text-green-900']
+              : ['bg-green-200', 'text-green-800'])
+          );
+        }
+        if (hasKind('global-search')) {
+          classes.push(
+            startsKind('global-search') ? 'global-search-highlight' : 'global-search-highlight-fragment',
+            ...(isCurrentKind('global-search')
+              ? ['bg-orange-400', 'text-orange-950', 'ring-2', 'ring-orange-500', 'ring-offset-1']
+              : ['bg-yellow-300', 'text-yellow-900'])
+          );
+        }
+        if (hasKind('ephemeral-highlight')) {
+          classes.push(
+            startsKind('ephemeral-highlight') ? 'ephemeral-highlight-mark' : 'ephemeral-highlight-fragment',
+            'bg-fuchsia-300', 'dark:bg-fuchsia-500/40', 'text-inherit',
+            'transition-colors', 'hover:bg-fuchsia-400', 'dark:hover:bg-fuchsia-500/60'
+          );
+          titles.push('Click to remove highlight');
+        }
+        if (hasAction) classes.push('cursor-pointer');
+
+        return (
           <mark
-            key={`global-${occurrenceIdx}-${match.start}`}
-            className={`px-0.5 rounded global-search-highlight ${
-              isCurrent
-                ? 'bg-orange-400 text-orange-950 ring-2 ring-orange-500 ring-offset-1'
-                : 'bg-yellow-300 text-yellow-900'
-            }`}
+            key={key}
+            className={classes.join(' ')}
+            onClick={onClick}
+            title={titles.length > 0 ? Array.from(new Set(titles)).join('; ') : undefined}
           >
-            {text.slice(match.start, match.end)}
+            {node}
           </mark>
         );
-        lastIndex = match.end;
-        occurrenceIdx++;
+      };
+
+      const boundaries = new Set<number>([0, text.length]);
+      for (const range of ranges) {
+        boundaries.add(range.start);
+        boundaries.add(range.end);
       }
-      if (lastIndex < text.length) parts.push(text.slice(lastIndex));
+      const sortedBoundaries = Array.from(boundaries).sort((a, b) => a - b);
+      const parts: React.ReactNode[] = [];
+      for (let i = 0; i < sortedBoundaries.length - 1; i++) {
+        const start = sortedBoundaries[i];
+        const end = sortedBoundaries[i + 1];
+        if (start === end) continue;
+        const segment = text.slice(start, end);
+        const active = ranges.filter(range => range.start < end && range.end > start);
+        parts.push(active.length > 0
+          ? renderMarkedSegment(segment, active, start, `mark-${start}-${end}-${i}`)
+          : segment
+        );
+      }
       return parts;
     };
   }, [
     getApplicableSearchTerms, localSearchTerm, isCurrentLocalMatch,
     highlightedText, onClearHighlight, messageOccurrenceStart, currentOccurrenceIndex,
-    gradeQuotes, index, ephemeralHighlights, onRemoveEphemeralHighlight,
+    gradeQuotes, index, ephemeralHighlights, onRemoveEphemeralHighlight, message.role,
   ]);
 
   // True when an entire section's text is collapsed by a single region —
@@ -650,14 +747,15 @@ function MessageCardInner({
   const renderWithCollapse = (
     text: string,
     isReasoning: boolean,
-    blockKind: 'reasoning' | 'content' | 'tool',
+    blockKind: RenderBlockKind,
     blockIndex = -1,
+    occurrenceStart = messageOccurrenceStart,
   ): React.ReactNode => {
     if (!isPresentationMode || collapsedRegions.length === 0) {
-      return highlightSearchAndUrl(text, isReasoning, blockKind, blockIndex);
+      return highlightSearchAndUrl(text, isReasoning, blockKind, blockIndex, occurrenceStart);
     }
     const regionsForThis = collapsedRegions.filter(r => r.messageIndex === index);
-    if (regionsForThis.length === 0) return highlightSearchAndUrl(text, isReasoning, blockKind, blockIndex);
+    if (regionsForThis.length === 0) return highlightSearchAndUrl(text, isReasoning, blockKind, blockIndex, occurrenceStart);
 
     const found: { start: number; end: number; region: CollapsedRegion }[] = [];
     for (const region of regionsForThis) {
@@ -675,7 +773,7 @@ function MessageCardInner({
         for (const m of ms) found.push({ start: m.start, end: m.end, region });
       }
     }
-    if (found.length === 0) return highlightSearchAndUrl(text, isReasoning, blockKind, blockIndex);
+    if (found.length === 0) return highlightSearchAndUrl(text, isReasoning, blockKind, blockIndex, occurrenceStart);
     found.sort((a, b) => a.start - b.start);
 
     // Drop overlapping matches → a clean, ordered list of pills.
@@ -710,6 +808,7 @@ function MessageCardInner({
     };
 
     const parts: React.ReactNode[] = [];
+    let visibleOccurrenceStart = occurrenceStart;
     for (let i = 0; i <= pills.length; i++) {
       // A pill defaults to joined (inline) on each side; `undefined` here
       // means there's simply no pill on that side (a document end), which
@@ -719,8 +818,9 @@ function MessageCardInner({
       const gap = joinGap(gaps[i], leftAfter, rightBefore);
       if (gap) {
         parts.push(
-          <Fragment key={`vis-${i}`}>{highlightSearchAndUrl(gap, isReasoning, blockKind, blockIndex)}</Fragment>
+          <Fragment key={`vis-${i}`}>{highlightSearchAndUrl(gap, isReasoning, blockKind, blockIndex, visibleOccurrenceStart)}</Fragment>
         );
+        visibleOccurrenceStart += countGlobalSearchMatches(gap, isReasoning);
       }
       if (i < pills.length) {
         const p = pills[i];
@@ -749,17 +849,6 @@ function MessageCardInner({
     }
     return parts;
   };
-
-  // Use the *normalized* tool calls (Kimi/Harmony parsers extract them
-  // into this field) so structured rendering works even when the producer
-  // wrote inline tool tags rather than message.tool_calls.
-  const { reasoning, mainContent, toolCallText, toolCalls } = useMemo(
-    () => normalizeAssistantMessage(message),
-    // normalizeAssistantMessage reads only these four fields of `message`;
-    // listing them (not `message`) avoids recompute on unrelated identity changes.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [message.role, message.content, message.content_parts, message.tool_calls],
-  );
 
   // Copy a plain-text rendition of this message's body (reasoning labeled,
   // tool calls labeled, ChatML markers stripped) for pasting into docs /
@@ -1004,7 +1093,7 @@ function MessageCardInner({
                       )}
                     </div>
                     <div data-msg-block data-block-kind="reasoning" className={`px-2 py-1 text-sm ${textPrimary} whitespace-pre-wrap`}>
-                      {renderWithCollapse(reasoning, true, 'reasoning')}
+                      {renderWithCollapse(reasoning, true, 'reasoning', -1, globalOccurrenceStarts.reasoningStart)}
                     </div>
                   </div>
                 )}
@@ -1014,9 +1103,9 @@ function MessageCardInner({
                     (its right-click "same line" toggle then works). */}
                 <div data-msg-block data-block-kind="content" className={`mx-3 whitespace-pre-wrap text-sm ${textPrimary}`}>
                   {reasoning && isSectionCollapsed(reasoning) && (
-                    <>{renderWithCollapse(reasoning, true, 'reasoning')}{' '}</>
+                    <>{renderWithCollapse(reasoning, true, 'reasoning', -1, globalOccurrenceStarts.reasoningStart)}{' '}</>
                   )}
-                  {renderWithCollapse(mainContent, false, 'content')}
+                  {renderWithCollapse(mainContent, false, 'content', -1, globalOccurrenceStarts.contentStart)}
                 </div>
 
                 {/* Inline tool-call text — only when no structured tool calls
@@ -1042,13 +1131,13 @@ function MessageCardInner({
                       return isSectionCollapsed(args) ? (
                         // Inline span (not a block) so consecutive collapsed
                         // tool calls share a line instead of stacking.
-                        <span key={tcIdx} className="text-xs whitespace-pre-wrap">{renderWithCollapse(args, false, 'tool', tcIdx)}</span>
+                        <span key={tcIdx} className="text-xs whitespace-pre-wrap">{renderWithCollapse(args, false, 'tool', tcIdx, globalOccurrenceStarts.toolArgStarts[tcIdx] ?? messageOccurrenceStart)}</span>
                       ) : (
                         <div key={tcIdx} className={`rounded-md border overflow-hidden ${isDarkMode ? 'border-gray-600 bg-gray-800/50' : 'border-gray-200 bg-gray-50'}`}>
                           <div className={`px-2 py-1 flex items-center justify-between text-xs font-medium ${isDarkMode ? 'bg-gray-700/50 text-gray-300' : 'bg-gray-100 text-gray-600'}`}>
                             <div className="flex items-center gap-1 min-w-0">
                               <span className="material-symbols-outlined" style={{ fontSize: 14 }}>terminal</span>
-                              <span className="truncate">{highlightSearchAndUrl(tc.function.name, false)}</span>
+                              <span className="truncate">{highlightSearchAndUrl(tc.function.name, false, 'tool', tcIdx, globalOccurrenceStarts.toolNameStarts[tcIdx] ?? messageOccurrenceStart)}</span>
                             </div>
                             <div className="flex items-center gap-0.5 shrink-0">
                               {isPresentationMode && (
@@ -1091,7 +1180,7 @@ function MessageCardInner({
                               isWrapped ? 'whitespace-pre-wrap break-words' : 'overflow-x-auto'
                             } ${isDarkMode ? 'text-green-400' : 'text-gray-800'}`}
                           >
-                            {renderWithCollapse(args, false, 'tool', tcIdx)}
+                            {renderWithCollapse(args, false, 'tool', tcIdx, globalOccurrenceStarts.toolArgStarts[tcIdx] ?? messageOccurrenceStart)}
                           </pre>
                         </div>
                       );

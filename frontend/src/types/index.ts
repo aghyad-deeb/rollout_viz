@@ -107,6 +107,8 @@ export interface GradeRequest {
   grade_type: GradeType;
   provider: LLMProvider;
   model: string;
+  router_provider?: 'litellm' | 'rl_late' | 'tinker';
+  max_attempts?: number;
   api_key?: string;  // Optional - server will use .env if not provided
   parallel_size?: number;  // Number of concurrent requests (default: 100)
   require_quotes?: boolean;  // Whether to require quotes from the model (default: true)

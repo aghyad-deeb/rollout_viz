@@ -30,11 +30,15 @@ from pydantic import BaseModel
 from starlette.middleware.gzip import GZipMiddleware
 
 from backend.llm_providers import (
-    get_provider,
+    get_grading_provider,
     GradeResult,
     Quote as LLMQuote,
     PRESET_METRICS,
 )
+
+# Backward-compatible patch point for tests and local scripts that mocked
+# backend.main.get_provider before grading moved to model_router.
+get_provider = get_grading_provider
 
 
 # Project root directory (parent of backend/)
@@ -70,9 +74,13 @@ if _env_file.exists():
 else:
     print(f"[CONFIG] WARNING: {_env_file} not found")
 
-# Shared tinker_service (stateless model-inference proxy in the monorepo).
+# Shared model_router (stateless model-inference proxy in the monorepo).
 # Used by the "discuss this rollout" chat feature via its litellm provider.
-TINKER_SERVICE_URL = (_env_config.get("TINKER_SERVICE_URL") or "http://localhost:8235").rstrip("/")
+MODEL_ROUTER_URL = (
+    _env_config.get("MODEL_ROUTER_URL")
+    or _env_config.get("TINKER_SERVICE_URL")
+    or "http://localhost:8235"
+).rstrip("/")
 
 # API key environment variable names for each provider
 API_KEY_ENV_VARS = {
@@ -474,6 +482,8 @@ class GradeRequest(BaseModel):
     grade_type: str  # "float", "int", "bool"
     provider: str  # "openai", "anthropic", "google", "openrouter"
     model: str  # e.g., "gpt-4o", "claude-3-opus"
+    router_provider: Optional[str] = None  # model_router provider: "litellm", "rl_late", or "tinker"
+    max_attempts: Optional[int] = None  # Model-router grader attempts per sample
     api_key: Optional[str] = None  # Optional - will use .env if not provided (max 500 chars)
     parallel_size: int = 100  # Number of concurrent requests
     require_quotes: bool = True  # Whether to require quotes from the model
@@ -1618,7 +1628,14 @@ async def test_provider(request: TestProviderRequest):
             if now - cached_time < _TEST_PROVIDER_TTL:
                 return {"ok": cached_ok}
 
-        provider = get_provider(request.provider, api_key, request.model, max_tokens=200)
+        provider = get_provider(
+            request.provider,
+            api_key,
+            request.model,
+            max_tokens=200,
+            router_url=MODEL_ROUTER_URL,
+            max_attempts=2,
+        )
 
         # Make a minimal call to validate the key + model.
         try:
@@ -1658,6 +1675,10 @@ async def grade_samples(request: GradeRequest):
         request.top_p = max(0.0, min(request.top_p, 1.0))
     if request.api_key and len(request.api_key) > 500:
         raise HTTPException(status_code=400, detail="API key too long")
+    if request.router_provider and request.router_provider not in {"litellm", "rl_late", "tinker"}:
+        raise HTTPException(status_code=400, detail="router_provider must be litellm, rl_late, or tinker")
+    if request.max_attempts is not None:
+        request.max_attempts = max(1, min(request.max_attempts, 30))
     if len(request.sample_ids) > _GRADE_MAX_SAMPLES:
         raise HTTPException(status_code=400, detail=f"Too many samples (max {_GRADE_MAX_SAMPLES})")
     if len(request.metric_prompt) > _GRADE_MAX_PROMPT_LEN:
@@ -1694,6 +1715,9 @@ async def grade_samples(request: GradeRequest):
             temperature=request.temperature,
             max_tokens=request.max_tokens,
             top_p=request.top_p,
+            router_url=MODEL_ROUTER_URL,
+            router_provider=request.router_provider,
+            max_attempts=request.max_attempts,
         )
 
         # Grade each requested sample
@@ -1793,6 +1817,10 @@ async def grade_samples_stream(request: GradeRequest):
         request.top_p = max(0.0, min(request.top_p, 1.0))
     if request.api_key and len(request.api_key) > 500:
         raise HTTPException(status_code=400, detail="API key too long")
+    if request.router_provider and request.router_provider not in {"litellm", "rl_late", "tinker"}:
+        raise HTTPException(status_code=400, detail="router_provider must be litellm, rl_late, or tinker")
+    if request.max_attempts is not None:
+        request.max_attempts = max(1, min(request.max_attempts, 30))
     if len(request.sample_ids) > _GRADE_MAX_SAMPLES:
         raise HTTPException(status_code=400, detail=f"Too many samples (max {_GRADE_MAX_SAMPLES})")
     if len(request.metric_prompt) > _GRADE_MAX_PROMPT_LEN:
@@ -1836,6 +1864,9 @@ async def grade_samples_stream(request: GradeRequest):
                 temperature=request.temperature,
                 max_tokens=request.max_tokens,
                 top_p=request.top_p,
+                router_url=MODEL_ROUTER_URL,
+                router_provider=request.router_provider,
+                max_attempts=request.max_attempts,
             )
 
             total_samples = len(request.sample_ids)
@@ -2039,7 +2070,7 @@ def _frontend_response(full_path: str) -> FileResponse:
 # A normal-mode feature: the user chats with a frontier model about one
 # rollout. The frontend builds the full message list (a system message holding
 # the rollout transcript + grades, then the chat turns) and this endpoint
-# streams a reply by proxying tinker_service's litellm provider. Stateless —
+# streams a reply by proxying model_router's litellm provider. Stateless —
 # the whole history is re-sent each turn. Auth-protected like every /api route.
 
 class RolloutChatMessage(BaseModel):
@@ -2063,7 +2094,7 @@ def _sse_frame(event: str, data: dict) -> bytes:
 async def rollout_chat_stream(request: RolloutChatRequest):
     """Stream one assistant turn from a frontier model discussing a rollout.
 
-    Thin SSE proxy to tinker_service `/step` (provider: litellm). The tinker
+    Thin SSE proxy to model_router `/step` (provider: litellm). The tinker
     event names (`response.output_text.delta`, `response.reasoning.delta`,
     `response.done`, `response.error`) pass straight through to the browser.
     """
@@ -2086,14 +2117,14 @@ async def rollout_chat_stream(request: RolloutChatRequest):
             timeout = httpx.Timeout(600.0, connect=10.0)
             async with httpx.AsyncClient(timeout=timeout) as client:
                 async with client.stream(
-                    "POST", f"{TINKER_SERVICE_URL}/step", json=payload
+                    "POST", f"{MODEL_ROUTER_URL}/step", json=payload
                 ) as resp:
                     if resp.status_code != 200:
                         body = await resp.aread()
                         detail = body.decode("utf-8", errors="replace")[:500]
                         yield _sse_frame(
                             "response.error",
-                            {"message": f"tinker_service HTTP {resp.status_code}: {detail}"},
+                            {"message": f"model_router HTTP {resp.status_code}: {detail}"},
                         )
                         return
                     async for chunk in resp.aiter_raw():
@@ -2104,8 +2135,8 @@ async def rollout_chat_stream(request: RolloutChatRequest):
                 "response.error",
                 {
                     "message": (
-                        f"Could not reach tinker_service at {TINKER_SERVICE_URL}. "
-                        "Start it: reward_seeker/tinker_service/start.sh"
+                        f"Could not reach model_router at {MODEL_ROUTER_URL}. "
+                        "Start it: reward_seeker/model_router/start.sh"
                     )
                 },
             )

@@ -2,7 +2,7 @@
 
 import json
 import time
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
 from backend.llm_providers import (
@@ -11,6 +11,8 @@ from backend.llm_providers import (
     AnthropicProvider,
     GoogleProvider,
     OpenRouterProvider,
+    ModelRouterProvider,
+    InvalidGradeResponse,
     LLMProvider,
     PRESET_METRICS,
 )
@@ -264,6 +266,92 @@ class TestParseGradeResponse:
         provider = self._get_provider()
         with pytest.raises(ValueError):
             provider._parse_grade_response("{grade: true, bad json}", "bool")
+
+
+class TestModelRouterProvider:
+    """Tests for model_router-backed grading helpers without network calls."""
+
+    def test_normalizes_legacy_provider_model_names(self):
+        assert (
+            ModelRouterProvider(api_key="k", model="claude-opus-4-5", provider_name="anthropic")
+            ._router_model_name()
+            == "anthropic/claude-opus-4-5"
+        )
+        assert (
+            ModelRouterProvider(api_key="k", model="gemini-2.5-pro", provider_name="google")
+            ._router_model_name()
+            == "gemini/gemini-2.5-pro"
+        )
+        assert (
+            ModelRouterProvider(api_key="k", model="openai/gpt-4o", provider_name="openrouter")
+            ._router_model_name()
+            == "openrouter/openai/gpt-4o"
+        )
+
+    async def test_grade_sample_parses_tool_call_and_validates_quote(self):
+        provider = ModelRouterProvider(api_key="k", model="gpt-4o", provider_name="openai", max_attempts=1)
+        provider._post_step = AsyncMock(return_value={
+            "decoded_message": {
+                "tool_calls": [{
+                    "function": {
+                        "name": "submit_grade",
+                        "arguments": {
+                            "grade": True,
+                            "grade_type": "bool",
+                            "quotes": [{
+                                "message_index": 1,
+                                "channel": "text",
+                                "start": 0,
+                                "end": 8,
+                                "text": "Hi there",
+                            }],
+                            "explanation": "The assistant greeted the user.",
+                        },
+                    },
+                }],
+            },
+        })
+
+        result = await provider.grade_sample(
+            messages=[
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi there"},
+            ],
+            metric_prompt="Is the assistant polite?",
+            grade_type="bool",
+            require_quotes=True,
+        )
+
+        assert result.grade is True
+        assert result.model == "model_router:litellm:gpt-4o"
+        assert result.quotes[0].channel == "text"
+        assert result.quotes[0].text == "Hi there"
+
+    async def test_missing_required_quote_rejected(self):
+        provider = ModelRouterProvider(api_key="k", model="gpt-4o", provider_name="openai", max_attempts=1)
+        provider._post_step = AsyncMock(return_value={
+            "decoded_message": {
+                "tool_calls": [{
+                    "function": {
+                        "name": "submit_grade",
+                        "arguments": {
+                            "grade": True,
+                            "grade_type": "bool",
+                            "quotes": [],
+                            "explanation": "ok",
+                        },
+                    },
+                }],
+            },
+        })
+
+        with pytest.raises(InvalidGradeResponse, match="quote"):
+            await provider.grade_sample(
+                messages=[{"role": "assistant", "content": "Hi"}],
+                metric_prompt="metric",
+                grade_type="bool",
+                require_quotes=True,
+            )
 
 
 class TestGoogleProviderClientReuse:

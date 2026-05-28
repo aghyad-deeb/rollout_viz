@@ -23,9 +23,13 @@
 /* Suppress transient/tooling highlights — search, URL-share, grade quotes —
    so the exported figure shows only the user's deliberate emphasis. */
 .capture-export .global-search-highlight,
+.capture-export .global-search-highlight-fragment,
 .capture-export mark.url-highlight-mark,
+.capture-export mark.url-highlight-fragment,
 .capture-export mark.grade-quote-mark,
-.capture-export mark.local-search-mark {
+.capture-export mark.grade-quote-fragment,
+.capture-export mark.local-search-mark,
+.capture-export mark.local-search-fragment {
   background: transparent !important;
   color: inherit !important;
   border: none !important;
@@ -35,7 +39,8 @@
 }
 /* The user's ephemeral highlight survives — flattened to one clean,
    colorblind-safe amber fill instead of the on-screen fuchsia. */
-.capture-export mark.ephemeral-highlight-mark {
+.capture-export mark.ephemeral-highlight-mark,
+.capture-export mark.ephemeral-highlight-fragment {
   background: #fde68a !important;   /* amber-200 */
   color: #1f2937 !important;
   border: none !important;

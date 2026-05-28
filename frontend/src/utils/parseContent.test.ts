@@ -406,6 +406,30 @@ describe('countMessageOccurrences', () => {
     const count = countMessageOccurrences(msg, [makeCondition('chat', 'hello')]);
     expect(count).toBe(2);
   });
+
+  it('counts structured tool-call names and displayed arguments for assistant search', () => {
+    const msg: Message = {
+      role: 'assistant',
+      content: '<think>planning</think>running shell',
+      tool_calls: [
+        {
+          type: 'function',
+          function: {
+            name: 'bash',
+            arguments: '{"command":"pwd"}',
+          },
+        },
+      ],
+    };
+
+    expect(countMessageOccurrences(msg, [makeCondition('assistant', 'bash')])).toBe(1);
+    expect(countMessageOccurrences(msg, [makeCondition('assistant', 'pwd')])).toBe(1);
+  });
+
+  it('normalizes Unicode whitespace when counting global-search occurrences', () => {
+    const msg: Message = { role: 'tool', content: 'core hours 7\u202Fam' };
+    expect(countMessageOccurrences(msg, [makeCondition('chat', '7 am')])).toBe(1);
+  });
 });
 
 // ---------------------------------------------------------------------------
