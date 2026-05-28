@@ -86,6 +86,7 @@ export function PresentationPreviewPanel({
   const [format, setFormat] = useState<DownloadFormat>(loadFormat);
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState<'copied' | 'saved' | null>(null);
+  const [isCardEditOpen, setIsCardEditOpen] = useState(false);
 
   const pickFormat = (f: DownloadFormat) => {
     setFormat(f);
@@ -194,104 +195,135 @@ export function PresentationPreviewPanel({
         </label>
       </div>
 
-      <div className={`px-3 py-2 border-b space-y-2 text-xs ${border}`}>
-        <div className="flex items-center justify-between gap-2">
+      <div className={`border-b text-xs ${border}`}>
+        <button
+          type="button"
+          aria-expanded={isCardEditOpen}
+          onClick={() => setIsCardEditOpen((open) => !open)}
+          className={`w-full px-3 py-2 flex items-center justify-between gap-2 text-left ${
+            isDarkMode ? 'hover:bg-gray-800/70' : 'hover:bg-gray-100'
+          }`}
+        >
           <span className={`inline-flex items-center gap-1.5 font-medium ${isDarkMode ? 'text-gray-200' : 'text-gray-700'}`}>
+            <span className="material-symbols-outlined" style={{ fontSize: 17 }}>
+              {isCardEditOpen ? 'expand_less' : 'expand_more'}
+            </span>
             <span className="material-symbols-outlined" style={{ fontSize: 17 }}>edit_square</span>
             Card edit
+          </span>
+          <span className={`inline-flex items-center gap-2 min-w-0 ${muted}`}>
+            <span className="truncate">
+              {activeMessageIndex === null ? 'No card' : `#${activeMessageIndex + 1}`}
+            </span>
             {activeDraftDirty && <span className={isDarkMode ? 'text-sky-300' : 'text-sky-700'}>Modified</span>}
           </span>
-          <div className="flex items-center gap-1">
-            <button
-              onClick={onResetActiveDraft}
-              disabled={!activeDraft || !activeDraftDirty}
-              className={`px-1.5 py-0.5 rounded disabled:pointer-events-none ${ghostBtn}`}
-            >
-              Reset
-            </button>
-            <button
-              onClick={onClearDrafts}
-              disabled={draftCount === 0}
-              className={`px-1.5 py-0.5 rounded disabled:pointer-events-none ${ghostBtn}`}
-            >
-              Clear all
-            </button>
-          </div>
-        </div>
+        </button>
 
-        <label className="flex items-center gap-1.5">
-          <span className={muted}>Card</span>
-          <select
-            aria-label="Card"
-            value={activeMessageIndex ?? ''}
-            onChange={(e) => onActiveMessageIndexChange(e.target.value === '' ? null : Number(e.target.value))}
-            className={`min-w-0 flex-1 px-1.5 py-0.5 rounded border ${ctrl}`}
-          >
-            <option value="">Select a card</option>
-            {Array.from({ length: messageCount }, (_, index) => (
-              <option key={index} value={index}>#{index + 1}</option>
-            ))}
-          </select>
-        </label>
+        {isCardEditOpen && (
+          <div className="px-3 pb-2 space-y-2">
+            <div className="flex items-center justify-end gap-1">
+              <button
+                onClick={onResetActiveDraft}
+                disabled={!activeDraft || !activeDraftDirty}
+                className={`px-1.5 py-0.5 rounded disabled:pointer-events-none ${ghostBtn}`}
+              >
+                Reset
+              </button>
+              <button
+                onClick={onClearDrafts}
+                disabled={draftCount === 0}
+                className={`px-1.5 py-0.5 rounded disabled:pointer-events-none ${ghostBtn}`}
+              >
+                Clear all
+              </button>
+            </div>
 
-        {activeDraft ? (
-          <div className="space-y-2">
             <label className="flex items-center gap-1.5">
-              <span className={muted}>Role</span>
+              <span className={muted}>Card</span>
               <select
-                aria-label="Role"
-                value={activeDraft.role}
-                onChange={(e) => updateDraft({ role: e.target.value as PresentationMessageDraft['role'] })}
+                aria-label="Card"
+                value={activeMessageIndex ?? ''}
+                onChange={(e) => onActiveMessageIndexChange(e.target.value === '' ? null : Number(e.target.value))}
                 className={`min-w-0 flex-1 px-1.5 py-0.5 rounded border ${ctrl}`}
               >
-                {PRESENTATION_ROLE_OPTIONS.map((role) => (
-                  <option key={role} value={role}>{role}</option>
+                <option value="">Select a card</option>
+                {Array.from({ length: messageCount }, (_, index) => (
+                  <option key={index} value={index}>#{index + 1}</option>
                 ))}
               </select>
             </label>
 
-            <label className="block space-y-1">
-              <span className={muted}>Content</span>
-              <textarea
-                aria-label="Content"
-                value={activeDraft.content}
-                onChange={(e) => updateDraft({ content: e.target.value })}
-                rows={5}
-                className={`w-full resize-y rounded border px-2 py-1 font-mono text-[11px] leading-4 ${ctrl}`}
-              />
-            </label>
+            {activeDraft ? (
+              <div className="space-y-2">
+                <label className="flex items-center gap-1.5">
+                  <span className={muted}>Role</span>
+                  <select
+                    aria-label="Role"
+                    value={activeDraft.role}
+                    onChange={(e) => updateDraft({ role: e.target.value as PresentationMessageDraft['role'] })}
+                    className={`min-w-0 flex-1 px-1.5 py-0.5 rounded border ${ctrl}`}
+                  >
+                    {PRESENTATION_ROLE_OPTIONS.map((role) => (
+                      <option key={role} value={role}>{role}</option>
+                    ))}
+                  </select>
+                </label>
 
-            {activeDraft.role === 'assistant' && (
-              <>
+                <label className="flex items-center gap-1.5">
+                  <span className={muted}>Label</span>
+                  <input
+                    aria-label="Label"
+                    type="text"
+                    value={activeDraft.displayLabel ?? ''}
+                    onChange={(e) => updateDraft({ displayLabel: e.target.value })}
+                    placeholder={activeDraft.role === 'file' ? 'example.py' : activeDraft.role}
+                    className={`min-w-0 flex-1 px-1.5 py-0.5 rounded border ${ctrl}`}
+                  />
+                </label>
                 <label className="block space-y-1">
-                  <span className={muted}>Reasoning</span>
+                  <span className={muted}>Content</span>
                   <textarea
-                    aria-label="Reasoning"
-                    value={activeDraft.reasoning}
-                    onChange={(e) => updateDraft({ reasoning: e.target.value })}
-                    rows={3}
+                    aria-label="Content"
+                    value={activeDraft.content}
+                    onChange={(e) => updateDraft({ content: e.target.value })}
+                    rows={5}
                     className={`w-full resize-y rounded border px-2 py-1 font-mono text-[11px] leading-4 ${ctrl}`}
                   />
                 </label>
 
-                <label className="block space-y-1">
-                  <span className={muted}>Tool calls JSON</span>
-                  <textarea
-                    aria-label="Tool calls JSON"
-                    value={activeDraft.toolCallsJson}
-                    onChange={(e) => updateDraft({ toolCallsJson: e.target.value })}
-                    rows={3}
-                    className={`w-full resize-y rounded border px-2 py-1 font-mono text-[11px] leading-4 ${
-                      toolCallsError ? 'border-red-400 text-red-700 bg-red-50' : ctrl
-                    }`}
-                  />
-                </label>
-                {toolCallsError && <div className="text-red-500">{toolCallsError}</div>}
-              </>
+                {activeDraft.role === 'assistant' && (
+                  <>
+                    <label className="block space-y-1">
+                      <span className={muted}>Reasoning</span>
+                      <textarea
+                        aria-label="Reasoning"
+                        value={activeDraft.reasoning}
+                        onChange={(e) => updateDraft({ reasoning: e.target.value })}
+                        rows={3}
+                        className={`w-full resize-y rounded border px-2 py-1 font-mono text-[11px] leading-4 ${ctrl}`}
+                      />
+                    </label>
+
+                    <label className="block space-y-1">
+                      <span className={muted}>Tool calls JSON</span>
+                      <textarea
+                        aria-label="Tool calls JSON"
+                        value={activeDraft.toolCallsJson}
+                        onChange={(e) => updateDraft({ toolCallsJson: e.target.value })}
+                        rows={3}
+                        className={`w-full resize-y rounded border px-2 py-1 font-mono text-[11px] leading-4 ${
+                          toolCallsError ? 'border-red-400 text-red-700 bg-red-50' : ctrl
+                        }`}
+                      />
+                    </label>
+                    {toolCallsError && <div className="text-red-500">{toolCallsError}</div>}
+                  </>
+                )}
+              </div>
+            ) : (
+              <div className={`py-3 text-center ${muted}`}>Click or select a message card to edit it.</div>
             )}
           </div>
-        ) : (
-          <div className={`py-3 text-center ${muted}`}>Click or select a message card to edit it.</div>
         )}
       </div>
 

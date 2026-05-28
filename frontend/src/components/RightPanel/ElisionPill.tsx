@@ -119,7 +119,7 @@ export function ElisionPill({
   return (
     <>
       <span
-        className={`elision-pill inline-flex items-center align-baseline mx-0.5 px-1 rounded border border-dashed text-xs whitespace-nowrap cursor-pointer transition-colors ${pillClass}`}
+        className={`elision-pill inline align-baseline mx-0.5 px-1 rounded border border-dashed text-xs whitespace-normal break-words [overflow-wrap:anywhere] cursor-pointer transition-colors ${pillClass}`}
         title={`Collapsed: ${preview.slice(0, 120)}${preview.length > 120 ? '...' : ''} (click to expand, right-click for options)`}
         onClick={(e) => {
           e.stopPropagation();

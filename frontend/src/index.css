@@ -55,7 +55,9 @@
   padding: 0 !important;
   font-size: inherit !important;
   text-decoration: none !important;
-  white-space: nowrap !important;
+  white-space: normal !important;
+  overflow-wrap: anywhere !important;
+  word-break: break-word !important;
   opacity: 0.7;
 }
 
@@ -210,6 +212,34 @@
 }
 .dark .message-tool-button {
   background-color: #3d6673;
+  color: #ffffff;
+}
+
+/* File: #607D8B (blue gray) */
+.message-file {
+  border-left-color: #607d8b;
+  background-color: #e8eef1;
+}
+.message-file-header {
+  background-color: #cfd8dc;
+}
+.message-file-button {
+  background-color: #90a4ae;
+  color: #1f343d;
+}
+.message-file-button:hover {
+  background-color: #607d8b;
+  color: #ffffff;
+}
+
+.dark .message-file {
+  background-color: #263238;
+}
+.dark .message-file-header {
+  background-color: #37474f;
+}
+.dark .message-file-button {
+  background-color: #546e7a;
   color: #ffffff;
 }
 

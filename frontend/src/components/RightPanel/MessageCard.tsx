@@ -78,6 +78,12 @@ const ROLE_CONFIG = {
     headerClassName: 'message-tool-header',
     buttonClassName: 'message-tool-button',
   },
+  file: {
+    icon: 'description',
+    className: 'message-file',
+    headerClassName: 'message-file-header',
+    buttonClassName: 'message-file-button',
+  },
   developer: {
     icon: 'code',
     className: 'message-system',
@@ -834,6 +840,13 @@ function MessageCardInner({
   const textSecondary = isDarkMode ? 'text-gray-300' : 'text-gray-800';
   const textMuted = isDarkMode ? 'text-gray-400' : 'text-gray-600';
   const actionBtn = `rounded-md w-6 h-6 focus:outline-none focus:ring-4 flex justify-center items-center ${config.buttonClassName} shadow-md shadow-black/20`;
+  const presentationLabel = typeof message.presentationLabel === 'string'
+    ? message.presentationLabel.trim()
+    : '';
+  const fileLabel = message.role === 'file' && typeof message.name === 'string'
+    ? message.name.trim()
+    : '';
+  const headerLabel = presentationLabel || fileLabel || message.role;
 
   return (
     <div
@@ -869,7 +882,7 @@ function MessageCardInner({
                     <span className="material-symbols-outlined" style={{ fontSize: 20 }}>
                       {config.icon}
                     </span>
-                    {message.role}
+                    {headerLabel}
                   </span>
                 </span>
               </div>

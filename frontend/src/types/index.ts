@@ -18,7 +18,7 @@ export interface ContentPart {
 }
 
 export interface Message {
-  role: 'system' | 'user' | 'assistant' | 'tool';
+  role: 'system' | 'user' | 'assistant' | 'tool' | 'file';
   content: string;
   reasoning?: string;
   content_parts?: ContentPart[];

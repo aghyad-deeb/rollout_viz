@@ -36,6 +36,24 @@ describe('presentationDraft', () => {
     });
   });
 
+  it('applies a temporary display label without mutating the original message', () => {
+    const message: Message = { role: 'user', content: 'original' };
+    const rendered = applyPresentationDraft(message, {
+      role: 'assistant',
+      content: 'edited answer',
+      reasoning: '',
+      toolCallsJson: '',
+      displayLabel: 'GPT-5.1',
+    });
+
+    expect(message).toEqual({ role: 'user', content: 'original' });
+    expect(rendered).toMatchObject({
+      role: 'assistant',
+      content: 'edited answer',
+      presentationLabel: 'GPT-5.1',
+    });
+  });
+
   it('validates tool-call JSON before it is rendered', () => {
     expect(parsePresentationToolCallsJson('[]')).toEqual({ ok: true, toolCalls: [] });
     expect(parsePresentationToolCallsJson('{"bad": true}')).toMatchObject({ ok: false });

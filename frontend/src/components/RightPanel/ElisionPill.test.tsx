@@ -25,6 +25,14 @@ describe('ElisionPill', () => {
     expect(screen.getByText('[setup omitted]')).toBeInTheDocument();
   });
 
+  it('allows long labels to wrap instead of overflowing', () => {
+    render(<ElisionPill {...baseProps} label="reasoning about a test case being inconsistent with expected values" />);
+    const pill = screen.getByText('[reasoning about a test case being inconsistent with expected values]');
+    expect(pill.className).toContain('whitespace-normal');
+    expect(pill.className).toContain('[overflow-wrap:anywhere]');
+    expect(pill.className).not.toContain('whitespace-nowrap');
+  });
+
   it('left click expands (removes) the collapse', () => {
     const onRemove = vi.fn();
     render(<ElisionPill {...baseProps} onRemove={onRemove} />);

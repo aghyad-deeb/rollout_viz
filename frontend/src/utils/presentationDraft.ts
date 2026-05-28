@@ -6,6 +6,7 @@ export interface PresentationMessageDraft {
   content: string;
   reasoning: string;
   toolCallsJson: string;
+  displayLabel?: string;
 }
 
 export type PresentationMessageDrafts = Record<number, PresentationMessageDraft>;
@@ -15,6 +16,7 @@ export const PRESENTATION_ROLE_OPTIONS: readonly Message['role'][] = [
   'user',
   'assistant',
   'tool',
+  'file',
 ];
 
 export function formatToolCallsJson(toolCalls: ToolCall[]): string {
@@ -28,6 +30,7 @@ export function messageToPresentationDraft(message: Message): PresentationMessag
     content: parsed.mainContent,
     reasoning: parsed.reasoning ?? '',
     toolCallsJson: formatToolCallsJson(parsed.toolCalls),
+    displayLabel: message.role === 'file' && typeof message.name === 'string' ? message.name : '',
   };
 }
 
@@ -69,6 +72,14 @@ export function applyPresentationDraft(message: Message, draft?: PresentationMes
     role: draft.role,
     content: draft.content,
   };
+
+  const displayLabel = draft.displayLabel?.trim();
+  if (displayLabel) next.presentationLabel = displayLabel;
+  else delete next.presentationLabel;
+
+  if (draft.role !== 'file' && message.role === 'file') {
+    delete next.name;
+  }
 
   if (draft.role === 'assistant') {
     next.content_parts = [

@@ -70,6 +70,19 @@ describe('MessageCard', () => {
     expect(screen.getByText('tool')).toBeInTheDocument();
   });
 
+  it('renders file role with a file icon and display name', () => {
+    render(<MessageCard {...defaultProps} message={{ role: 'file', content: 'File preview', name: 'slides/input.jsonl' }} />);
+    expect(screen.getByText('description')).toBeInTheDocument();
+    expect(screen.getByText('slides/input.jsonl')).toBeInTheDocument();
+    expect(screen.getByText('File preview')).toBeInTheDocument();
+  });
+
+  it('renders a presentation label in place of the raw role', () => {
+    render(<MessageCard {...defaultProps} message={{ role: 'assistant', content: 'Model answer', presentationLabel: 'GPT-5.1' }} />);
+    expect(screen.getByText('GPT-5.1')).toBeInTheDocument();
+    expect(screen.queryByText('assistant')).not.toBeInTheDocument();
+  });
+
   it('extracts think tags from assistant content', () => {
     const message = { role: 'assistant' as const, content: '<think>internal reasoning</think>Main response' };
     render(<MessageCard {...defaultProps} message={message} />);

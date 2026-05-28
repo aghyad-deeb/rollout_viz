@@ -30,6 +30,10 @@ const baseProps = {
   onClearDrafts: () => {},
 };
 
+function openCardEdit() {
+  fireEvent.click(screen.getByRole('button', { name: /card edit/i }));
+}
+
 describe('PresentationPreviewPanel', () => {
   beforeEach(() => localStorage.clear());
 
@@ -47,9 +51,23 @@ describe('PresentationPreviewPanel', () => {
     expect(screen.getByTitle('Download format')).toHaveValue('png');
   });
 
+  it('keeps the card editor collapsed until the bar is clicked', () => {
+    render(<PresentationPreviewPanel {...baseProps} />);
+
+    const cardEditToggle = screen.getByRole('button', { name: /card edit/i });
+    expect(cardEditToggle).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByLabelText('Content')).not.toBeInTheDocument();
+
+    fireEvent.click(cardEditToggle);
+
+    expect(cardEditToggle).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByLabelText('Content')).toBeInTheDocument();
+  });
+
   it('changes the active presentation card from the left panel', () => {
     const onActiveMessageIndexChange = vi.fn();
     render(<PresentationPreviewPanel {...baseProps} onActiveMessageIndexChange={onActiveMessageIndexChange} />);
+    openCardEdit();
 
     fireEvent.change(screen.getByLabelText('Card'), { target: { value: '1' } });
 
@@ -59,6 +77,7 @@ describe('PresentationPreviewPanel', () => {
   it('emits a temporary draft when the displayed content is edited', () => {
     const onActiveDraftChange = vi.fn();
     render(<PresentationPreviewPanel {...baseProps} onActiveDraftChange={onActiveDraftChange} />);
+    openCardEdit();
 
     fireEvent.change(screen.getByLabelText('Content'), { target: { value: 'Edited for slide' } });
 
@@ -71,12 +90,26 @@ describe('PresentationPreviewPanel', () => {
   it('emits a temporary draft when the displayed role is edited', () => {
     const onActiveDraftChange = vi.fn();
     render(<PresentationPreviewPanel {...baseProps} onActiveDraftChange={onActiveDraftChange} />);
+    openCardEdit();
 
     fireEvent.change(screen.getByLabelText('Role'), { target: { value: 'user' } });
 
     expect(onActiveDraftChange).toHaveBeenCalledWith({
       ...activeDraft,
       role: 'user',
+    });
+  });
+
+  it('emits a temporary draft when the displayed label is edited', () => {
+    const onActiveDraftChange = vi.fn();
+    render(<PresentationPreviewPanel {...baseProps} onActiveDraftChange={onActiveDraftChange} />);
+    openCardEdit();
+
+    fireEvent.change(screen.getByLabelText('Label'), { target: { value: 'GPT-5.1' } });
+
+    expect(onActiveDraftChange).toHaveBeenCalledWith({
+      ...activeDraft,
+      displayLabel: 'GPT-5.1',
     });
   });
 });
