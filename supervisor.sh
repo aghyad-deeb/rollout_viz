@@ -37,6 +37,22 @@ cd "$SCRIPT_DIR"
 
 # ── Configuration ──────────────────────────────────────────────────────
 BACKEND_PORT=3000
+# Prefer a repo-local venv, but support this transfer layout where the shared
+# reward_seeker venv lives one directory above the app checkout.
+VENV_DIR="${VENV_DIR:-$SCRIPT_DIR/venv}"
+if [[ ! -x "$VENV_DIR/bin/python" && -x "$SCRIPT_DIR/../venv/bin/python" ]]; then
+  VENV_DIR="$SCRIPT_DIR/../venv"
+fi
+CLOUDFLARED_BIN="${CLOUDFLARED_BIN:-cloudflared}"
+TUNNEL_NAME="${TUNNEL_NAME:-rollout-viz}"
+TUNNEL_TOKEN_FILE="${TUNNEL_TOKEN_FILE:-$HOME/.cloudflared/$TUNNEL_NAME.token}"
+# `cloudflared service install <token>` creates a systemd connector that owns
+# the tunnel independently of this app supervisor. In that common deployment,
+# launch.sh should only keep the backend alive and let systemd keep the public
+# connector alive. Set USE_SYSTEM_CLOUDFLARED=false to force the supervisor to
+# run its own tunnel process instead.
+SYSTEM_CLOUDFLARED_SERVICE="${SYSTEM_CLOUDFLARED_SERVICE:-cloudflared}"
+USE_SYSTEM_CLOUDFLARED="${USE_SYSTEM_CLOUDFLARED:-auto}"
 # Port 3000 was previously used by Vite dev. Keep it only for cleanup; when
 # BACKEND_PORT is also 3000, the duplicate cleanup pass is harmless.
 DEV_FRONTEND_PORT=3000
@@ -49,20 +65,48 @@ RESTART_BACKOFF_LIMIT_SECONDS=60              # max backoff between restarts
 SUPERVISOR_PID_FILE="$SCRIPT_DIR/.supervisor.pid"
 SHUTDOWN_FLAG="$SCRIPT_DIR/.supervisor.stop"
 
-SERVICES=(backend tunnel)
+system_cloudflared_active() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+  systemctl is-active --quiet "$SYSTEM_CLOUDFLARED_SERVICE" 2>/dev/null
+}
+
+use_system_cloudflared() {
+  case "${USE_SYSTEM_CLOUDFLARED,,}" in
+    1|true|yes|on) return 0 ;;
+    0|false|no|off) return 1 ;;
+    auto|"") system_cloudflared_active ;;
+    *) system_cloudflared_active ;;
+  esac
+}
+
+if use_system_cloudflared; then
+  SERVICES=(backend)
+else
+  SERVICES=(backend tunnel)
+fi
 
 # Per-service: command to run (one shell command, may include `cd` etc.)
 service_cmd() {
   case "$1" in
     backend)
-      # Activate venv inside the subshell so PATH is correct regardless of
-      # how the supervisor was launched. `--reload` is fine here — uvicorn's
-      # auto-reload handles it within the process; we still get supervised
-      # restart on a hard crash.
-      echo "source venv/bin/activate && exec python -m uvicorn backend.main:app --host 127.0.0.1 --port $BACKEND_PORT"
+      printf 'exec %q -m uvicorn backend.main:app --host 127.0.0.1 --port %q
+' \
+        "$VENV_DIR/bin/python" "$BACKEND_PORT"
       ;;
     tunnel)
-      echo "exec cloudflared tunnel run --url http://localhost:$BACKEND_PORT rollout-viz"
+      if [[ -n "${TUNNEL_TOKEN:-}" ]]; then
+        printf 'exec %q tunnel run --url %q
+' \
+          "$CLOUDFLARED_BIN" "http://localhost:$BACKEND_PORT"
+      elif [[ -r "$TUNNEL_TOKEN_FILE" ]]; then
+        printf 'exec %q tunnel run --url %q --token-file %q
+' \
+          "$CLOUDFLARED_BIN" "http://localhost:$BACKEND_PORT" "$TUNNEL_TOKEN_FILE"
+      else
+        printf 'exec %q tunnel run --url %q %q
+' \
+          "$CLOUDFLARED_BIN" "http://localhost:$BACKEND_PORT" "$TUNNEL_NAME"
+      fi
       ;;
     *) return 1 ;;
   esac
@@ -144,13 +188,58 @@ check_security_config() {
   fi
 }
 
+check_backend_runtime() {
+  if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+    echo "Missing Python venv at $VENV_DIR."
+    echo "Set VENV_DIR to the venv path, or create ./venv."
+    return 1
+  fi
+  if ! "$VENV_DIR/bin/python" -c 'import fastapi, uvicorn' >/dev/null 2>&1; then
+    echo "Backend runtime dependencies are missing from $VENV_DIR."
+    echo "Install with: uv pip install -r requirements.txt --python $VENV_DIR/bin/python"
+    return 1
+  fi
+}
+
+check_public_tunnel_runtime() {
+  if use_system_cloudflared; then
+    if system_cloudflared_active; then
+      return 0
+    fi
+    echo "USE_SYSTEM_CLOUDFLARED is enabled, but systemd service '$SYSTEM_CLOUDFLARED_SERVICE' is not active."
+    echo "Start it with: sudo systemctl start $SYSTEM_CLOUDFLARED_SERVICE"
+    return 1
+  fi
+
+  if ! command -v "$CLOUDFLARED_BIN" >/dev/null 2>&1; then
+    echo "Missing cloudflared; cannot start the public rollout-viz.com tunnel."
+    echo "Install cloudflared or set CLOUDFLARED_BIN to its absolute path."
+    return 1
+  fi
+  if [[ -n "${TUNNEL_TOKEN:-}" || -r "$TUNNEL_TOKEN_FILE" ]]; then
+    return 0
+  fi
+  if ! "$CLOUDFLARED_BIN" tunnel list 2>/dev/null | grep -q "$TUNNEL_NAME"; then
+    echo "Missing Cloudflare credentials for tunnel '$TUNNEL_NAME'."
+    echo "Set TUNNEL_TOKEN for this process, place a readable token in $TUNNEL_TOKEN_FILE,"
+    echo "restore ~/.cloudflared credentials for the named tunnel,"
+    echo "or start the systemd connector: sudo systemctl start $SYSTEM_CLOUDFLARED_SERVICE"
+    return 1
+  fi
+}
+
 build_frontend() {
   if [[ ! -f frontend/package.json ]]; then
     echo "Missing frontend/package.json"
     return 1
   fi
   if [[ ! -d frontend/node_modules ]]; then
-    echo "Missing frontend/node_modules. Run npm install in ./frontend first."
+    if [[ -f frontend/dist/index.html ]]; then
+      echo "Missing frontend/node_modules; using existing frontend/dist build."
+      return 0
+    fi
+    echo "Missing frontend/node_modules and frontend/dist/index.html."
+    echo "Run npm install in ./frontend first, then npm run build."
     return 1
   fi
   echo "Building production frontend..."
@@ -307,6 +396,11 @@ cmd_start() {
   rm -f "$SHUTDOWN_FLAG" "$SUPERVISOR_PID_FILE"
 
   check_security_config || return 1
+  check_backend_runtime || return 1
+  check_public_tunnel_runtime || return 1
+  if use_system_cloudflared; then
+    echo "Using active systemd Cloudflare connector '$SYSTEM_CLOUDFLARED_SERVICE'; supervisor will manage backend only."
+  fi
   build_frontend || return 1
 
   # Refuse to start if ports are already taken by something we don't own;
@@ -436,6 +530,11 @@ cmd_status() {
     fi
     printf '  %-10s %-6s %-12s %-10s %s\n' "$name" "${port:-—}" "$state" "$pid" "$probe"
   done
+  if use_system_cloudflared; then
+    local cf_state=DOWN
+    if system_cloudflared_active; then cf_state=active; fi
+    printf '\n  %-10s %-6s %-12s %-10s %s\n' tunnel — "systemd:$cf_state" "$SYSTEM_CLOUDFLARED_SERVICE" external
+  fi
   echo
   echo "Logs: $LOG_DIR/<service>.log     ('./supervisor.sh logs <name>' to tail)"
 }

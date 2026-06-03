@@ -3,17 +3,20 @@ import type { LLMProvider } from '../../types';
 import { LLM_PROVIDERS } from '../../types';
 import type { useGrading } from '../../hooks/useGrading';
 
-interface GradingPanelProps {
-  filteredSampleIds: number[];
+interface GradingJob {
   filePath: string;
+  sampleIds: number[];
+}
+
+interface GradingPanelProps {
+  gradingJobs: GradingJob[];
   isDarkMode: boolean;
   onGradingComplete: () => void; // Callback to refresh samples after grading
   grading: ReturnType<typeof useGrading>; // Grading state from parent
 }
 
 export function GradingPanel({
-  filteredSampleIds,
-  filePath,
+  gradingJobs,
   isDarkMode,
   onGradingComplete,
   grading,
@@ -77,6 +80,11 @@ export function GradingPanel({
     return presetMetrics[selectedMetric];
   }, [selectedMetric, customMetricName, customPrompt, gradeType, presetMetrics]);
 
+  const totalSampleCount = useMemo(
+    () => gradingJobs.reduce((count, job) => count + job.sampleIds.length, 0),
+    [gradingJobs],
+  );
+
   // Handle provider change
   const handleProviderChange = (newProvider: LLMProvider) => {
     setProvider(newProvider);
@@ -102,7 +110,7 @@ export function GradingPanel({
 
   // Start grading
   const handleGrade = async () => {
-    if (!currentMetric || !filePath || filteredSampleIds.length === 0) return;
+    if (!currentMetric || totalSampleCount === 0) return;
 
     const advancedSettings = {
       ...(temperature !== undefined ? { temperature } : {}),
@@ -115,20 +123,30 @@ export function GradingPanel({
       maxQuoteRetries: 2,
     };
 
-    const result = await gradeAndSave(
-      filePath,
-      filteredSampleIds,
-      selectedMetric === 'custom' ? customMetricName : selectedMetric,
-      currentMetric.prompt,
-      currentMetric.grade_type as 'float' | 'int' | 'bool' | 'freeform',
-      provider,
-      model,
-      parallelSize,
-      Object.keys(advancedSettings).length > 0 ? advancedSettings : undefined,
-      quoteSettings,
-    );
+    const metricName = selectedMetric === 'custom' ? customMetricName : selectedMetric;
+    let completedAny = false;
 
-    if (result && result.graded_count > 0) {
+    for (const job of gradingJobs) {
+      if (job.sampleIds.length === 0) continue;
+
+      const result = await gradeAndSave(
+        job.filePath,
+        job.sampleIds,
+        metricName,
+        currentMetric.prompt,
+        currentMetric.grade_type as 'float' | 'int' | 'bool' | 'freeform',
+        provider,
+        model,
+        parallelSize,
+        Object.keys(advancedSettings).length > 0 ? advancedSettings : undefined,
+        quoteSettings,
+      );
+
+      if (!result) break;
+      completedAny = completedAny || result.graded_count > 0;
+    }
+
+    if (completedAny) {
       onGradingComplete();
     }
   };
@@ -595,15 +613,15 @@ export function GradingPanel({
         ) : (
           <button
             onClick={handleGrade}
-            disabled={!hasApiKey || !currentMetric || filteredSampleIds.length === 0}
+            disabled={!hasApiKey || !currentMetric || totalSampleCount === 0}
             className={`w-full px-4 py-2 rounded-lg font-medium transition-colors flex items-center justify-center gap-2
-              ${hasApiKey && currentMetric && filteredSampleIds.length > 0
+              ${hasApiKey && currentMetric && totalSampleCount > 0
                 ? 'bg-blue-500 text-white hover:bg-blue-600' 
                 : 'bg-gray-200 text-gray-400 cursor-not-allowed dark:bg-gray-700'
               }`}
           >
             <span className="material-symbols-outlined" style={{ fontSize: 18 }}>psychology</span>
-            Grade {filteredSampleIds.length} sample{filteredSampleIds.length !== 1 ? 's' : ''}
+            Grade {totalSampleCount} sample{totalSampleCount !== 1 ? 's' : ''}
           </button>
         )}
       </div>

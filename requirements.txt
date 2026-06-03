@@ -23,3 +23,5 @@ openai>=1.0.0
 anthropic>=0.18.0
 google-generativeai>=0.4.0
 httpx>=0.26.0
+# model_router litellm provider; pinned above known 2026 compromised/vulnerable ranges.
+litellm==1.86.2

@@ -7,6 +7,7 @@ from unittest.mock import patch, MagicMock, AsyncMock
 import pytest
 from backend.llm_providers import (
     get_provider,
+    get_grading_provider,
     OpenAIProvider,
     AnthropicProvider,
     GoogleProvider,
@@ -326,6 +327,22 @@ class TestModelRouterProvider:
         assert result.model == "model_router:litellm:gpt-4o"
         assert result.quotes[0].channel == "text"
         assert result.quotes[0].text == "Hi there"
+
+    def test_openai_grading_defaults_to_litellm(self):
+        provider = get_grading_provider("openai", "test-key", "gpt-5.2")
+        assert isinstance(provider, ModelRouterProvider)
+        assert provider.router_provider == "litellm"
+        assert provider._router_model_name() == "gpt-5.2"
+
+    def test_non_openai_grading_defaults_to_litellm(self):
+        provider = get_grading_provider("anthropic", "test-key", "claude-opus-4-5")
+        assert isinstance(provider, ModelRouterProvider)
+        assert provider.router_provider == "litellm"
+
+    def test_invalid_env_router_provider_rejected(self, monkeypatch):
+        monkeypatch.setenv("ROLLOUT_VIZ_MODEL_ROUTER_PROVIDER", "model_router")
+        with pytest.raises(ValueError, match="ROLLOUT_VIZ_MODEL_ROUTER_PROVIDER"):
+            ModelRouterProvider(api_key="k", model="gpt-4o", provider_name="openai")
 
     async def test_missing_required_quote_rejected(self):
         provider = ModelRouterProvider(api_key="k", model="gpt-4o", provider_name="openai", max_attempts=1)

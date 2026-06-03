@@ -613,9 +613,11 @@ class TestResourcePressure:
         for r in responses:
             assert r.status_code == 200
 
-        # Force cleanup
+        # Force cleanup. Completed asyncio tasks may keep their result buffers
+        # reachable until the loop gets a scheduling turn.
         del responses
         del tasks
+        await asyncio.sleep(0)
         gc.collect()
 
         current, peak = tracemalloc.get_traced_memory()

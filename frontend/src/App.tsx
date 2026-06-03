@@ -576,6 +576,36 @@ function App() {
     return sample?.attributes.source_file || primaryFilePath;
   };
 
+  const gradingJobs = useMemo(() => {
+    const samplesByFile = new Map<string, Sample[]>();
+    for (const sample of samples) {
+      const sourceFile = sample.attributes.source_file || primaryFilePath;
+      const existing = samplesByFile.get(sourceFile);
+      if (existing) {
+        existing.push(sample);
+      } else {
+        samplesByFile.set(sourceFile, [sample]);
+      }
+    }
+
+    const idsByFile = new Map<string, number[]>();
+    for (const sample of filteredSamples) {
+      const sourceFile = sample.attributes.source_file || primaryFilePath;
+      const fileSamples = samplesByFile.get(sourceFile) || [];
+      const fileLocalId = fileSamples.findIndex(s => s.id === sample.id);
+      if (fileLocalId < 0) continue;
+
+      const existing = idsByFile.get(sourceFile);
+      if (existing) {
+        existing.push(fileLocalId);
+      } else {
+        idsByFile.set(sourceFile, [fileLocalId]);
+      }
+    }
+
+    return Array.from(idsByFile, ([filePath, sampleIds]) => ({ filePath, sampleIds }));
+  }, [filteredSamples, samples, primaryFilePath]);
+
   // File-relative index of the selected sample — the authoritative
   // disambiguator for share tokens. Two samples in the same file can share
   // (rollout_n, step), so filtering by those alone picks the wrong one.
@@ -806,8 +836,7 @@ function App() {
                 </div>
               }>
                 <GradingPanel
-                  filteredSampleIds={filteredSamples.map(s => s.id)}
-                  filePath={primaryFilePath}
+                  gradingJobs={gradingJobs}
                   isDarkMode={isDarkMode}
                   onGradingComplete={handleGradingComplete}
                   grading={grading}

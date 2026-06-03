@@ -1,4 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
+import { LLM_PROVIDERS } from '../types';
 import type { 
   GradeRequest, 
   GradeResponse, 
@@ -60,7 +61,7 @@ export function useGrading(enabled = true) {
   });
   
   const [lastModel, setLastModel] = useState<string>(() => {
-    return sessionStorage.getItem(MODEL_STORAGE_KEY) || 'gpt-4o';
+    return sessionStorage.getItem(MODEL_STORAGE_KEY) || LLM_PROVIDERS.openai.defaultModel;
   });
 
   // Abort controller for cancellation
@@ -183,6 +184,7 @@ export function useGrading(enabled = true) {
         body: JSON.stringify({
           provider,
           model,
+          router_provider: 'litellm',
           ...(apiKey ? { api_key: apiKey } : {}),
         }),
         signal,
@@ -205,6 +207,7 @@ export function useGrading(enabled = true) {
         grade_type: gradeType,
         provider,
         model,
+        router_provider: 'litellm',
         // Only include api_key if we have one locally, otherwise server uses .env
         ...(apiKey ? { api_key: apiKey } : {}),
         parallel_size: parallelSize,

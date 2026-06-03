@@ -117,7 +117,7 @@ them:
 | `tool_call_id` | required when `role: 'tool'` for threading | direct copy; required by validator |
 | `name` | tool message — name of originating tool | direct copy |
 | `openai_response_items` | rl_late reasoning round-trip | direct copy |
-| `tokens` / `prompt_tokens` | tinker_service tokenization cache | preserved in Exact Prefill v2 |
+| `tokens` / `prompt_tokens` | model_router tokenization cache | preserved in Exact Prefill v2 |
 | `prefilled` | UI badge marker | dropped on import (re-applied at run time) |
 
 ---
@@ -411,7 +411,7 @@ message is also populated — both must agree on `call_id`.
 
 The `function_call` item's `call_id` must equal `tool_calls[].id` on
 the same assistant message. Auto_eval's threading validator only
-checks `tool_calls[].id`; tinker_service's
+checks `tool_calls[].id`; model_router's
 `rl_late_provider.py:build_responses_input` matches `function_call`
 items to `tool_calls` and to subsequent tool results.
 

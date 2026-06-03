@@ -72,6 +72,50 @@ class TestTestProvider:
             assert resp.json()["ok"] is False
             await client.aclose()
 
+    async def test_forwards_router_provider_to_model_router(self, app_no_auth):
+        mock_provider = MagicMock()
+        mock_provider.grade_sample = AsyncMock(return_value=_make_grade_result())
+
+        with patch("backend.main.get_provider", return_value=mock_provider) as get_provider:
+            client = await app_no_auth()
+            resp = await client.post("/api/test-provider", json={
+                "provider": "openai",
+                "model": "gpt-4o",
+                "router_provider": "litellm",
+                "api_key": "test-key",
+            })
+            assert resp.status_code == 200
+            assert resp.json()["ok"] is True
+            assert get_provider.call_args.kwargs["router_provider"] == "litellm"
+            await client.aclose()
+
+    async def test_rejects_non_litellm_router_provider(self, app_no_auth):
+        client = await app_no_auth()
+        resp = await client.post("/api/test-provider", json={
+            "provider": "openai",
+            "model": "gpt-4o",
+            "router_provider": "tinker",
+            "api_key": "test-key",
+        })
+        assert resp.status_code == 400
+        data = resp.json()
+        assert data["ok"] is False
+        assert "litellm" in data["error"].lower()
+        await client.aclose()
+
+    async def test_rejects_routed_model_id_with_direct_provider(self, app_no_auth):
+        client = await app_no_auth()
+        resp = await client.post("/api/test-provider", json={
+            "provider": "google",
+            "model": "openai/gpt-5.5",
+            "api_key": "test-key",
+        })
+        assert resp.status_code == 400
+        data = resp.json()
+        assert data["ok"] is False
+        assert "provider=openrouter" in data["error"]
+        await client.aclose()
+
 
 class TestGradeStream:
     """Tests for POST /api/grade-stream SSE endpoint."""
@@ -155,6 +199,40 @@ class TestGradeStream:
             error_events = [e for e in events if e["type"] == "error"]
             assert len(error_events) == 1
             assert "API key" in error_events[0]["message"] or "key" in error_events[0]["message"].lower()
+            await client.aclose()
+
+
+class TestGradeNonStream:
+    """Tests for POST /api/grade."""
+
+    async def test_accepts_freeform_grades_and_quote_channels(self, app_no_auth, temp_jsonl, patch_project_root, sample_data):
+        file_path = temp_jsonl(sample_data, "test.jsonl")
+        mock_provider = MagicMock()
+        mock_provider.grade_sample = AsyncMock(return_value=_make_grade_result(
+            grade="The sample contains grader reasoning.",
+            grade_type="freeform",
+            quotes=[Quote(message_index=1, channel="text", start=0, end=5, text="Hello")],
+        ))
+
+        with patch("backend.main.get_provider", return_value=mock_provider):
+            client = await app_no_auth()
+            resp = await client.post("/api/grade", json={
+                "file_path": str(file_path),
+                "sample_ids": [0],
+                "metric_name": "thinking_about_grader",
+                "metric_prompt": "Summarize the grader awareness.",
+                "grade_type": "freeform",
+                "provider": "openai",
+                "model": "gpt-4o",
+                "api_key": "test-key",
+                "require_quotes": True,
+            })
+            assert resp.status_code == 200
+            data = resp.json()
+            grade = data["grades"]["0"]
+            assert grade["grade"] == "The sample contains grader reasoning."
+            assert grade["grade_type"] == "freeform"
+            assert grade["quotes"][0]["channel"] == "text"
             await client.aclose()
 
 
@@ -249,4 +327,38 @@ class TestSaveGraded:
             "grades": {"999": {"test": grade_entry}},
         })
         assert resp.status_code == 200
+        assert resp.json()["samples_updated"] == 0
+        await client.aclose()
+
+    async def test_preserves_freeform_grade_and_quote_channel(self, app_no_auth, temp_jsonl, patch_project_root, sample_data):
+        file_path = temp_jsonl(sample_data, "test.jsonl")
+        grade_entry = {
+            "grade": "The sample explicitly considers grading.",
+            "grade_type": "freeform",
+            "quotes": [{
+                "message_index": 1,
+                "channel": "text",
+                "start": 0,
+                "end": 5,
+                "text": "Hello",
+            }],
+            "explanation": "freeform rationale",
+            "model": "model_router:litellm:gpt-4o",
+            "prompt_version": "v1",
+            "timestamp": "2026-01-15T10:00:00",
+        }
+        client = await app_no_auth()
+        resp = await client.post("/api/save-graded", json={
+            "file_path": str(file_path),
+            "grades": {"0": {"thinking_about_grader": grade_entry}},
+        })
+        assert resp.status_code == 200
+        assert resp.json()["samples_updated"] == 1
+
+        viz_path = file_path.parent / "viz" / file_path.name
+        saved = [json.loads(line) for line in viz_path.read_text().splitlines() if line.strip()]
+        stored = saved[0]["grades"]["thinking_about_grader"][0]
+        assert stored["grade"] == "The sample explicitly considers grading."
+        assert stored["grade_type"] == "freeform"
+        assert stored["quotes"][0]["channel"] == "text"
         await client.aclose()

@@ -3,7 +3,7 @@
 // The model is given the full rollout transcript + grades as a system message,
 // then the user chats with it normally. Requests are streamed through the
 // backend's `/api/rollout-chat-stream` SSE proxy, which forwards to the shared
-// `tinker_service` litellm provider.
+// `model_router` litellm provider.
 
 import type { Sample, Message, ContentPart } from '../types';
 
@@ -12,13 +12,13 @@ export interface ChatModel {
   label: string;
 }
 
-// Frontier models, each verified end-to-end against tinker_service's litellm
+// Frontier models, each verified end-to-end against model_router's litellm
 // provider (non-streaming + SSE). Gemini is routed via OpenRouter because the
 // direct Google AI Studio key is currently flagged as leaked.
 export const CHAT_MODELS: readonly ChatModel[] = [
-  { id: 'anthropic/claude-opus-4-7', label: 'Claude Opus 4.7' },
+  { id: 'anthropic/claude-opus-4-8', label: 'Claude Opus 4.8' },
   { id: 'gpt-5.5', label: 'GPT-5.5' },
-  { id: 'openrouter/google/gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro' },
+  { id: 'openrouter/google/gemini-3.5-flash', label: 'Gemini 3.5 Flash' },
 ];
 
 export const DEFAULT_CHAT_MODEL = CHAT_MODELS[0].id;

@@ -71,6 +71,22 @@ class TestSaveCustomMetric:
             assert resp.json()["key"] == "my_custom_metric"
             await client.aclose()
 
+    async def test_save_accepts_freeform_metric(self, app_no_auth, tmp_path):
+        custom_file = tmp_path / "custom_metrics.json"
+        with patch("backend.main.CUSTOM_METRICS_FILE", custom_file):
+            client = await app_no_auth()
+            resp = await client.post("/api/save-custom-metric", json={
+                "key": "grader_summary",
+                "name": "Grader Summary",
+                "description": "Summarize grader awareness",
+                "grade_type": "freeform",
+                "prompt": "Describe the behavior",
+            })
+            assert resp.status_code == 200
+            saved = json.loads(custom_file.read_text())
+            assert saved["grader_summary"]["grade_type"] == "freeform"
+            await client.aclose()
+
     async def test_cannot_override_preset(self, app_no_auth, tmp_path):
         custom_file = tmp_path / "custom_metrics.json"
         with patch("backend.main.CUSTOM_METRICS_FILE", custom_file):

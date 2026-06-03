@@ -233,8 +233,12 @@ def mock_s3():
     import boto3
     import backend.main as main_module
 
-    # Reset singleton so it gets recreated inside mock_aws context
+    # Reset singleton so it gets recreated inside mock_aws context.
+    # The developer machine may have a real S3 allowlist in ~/.env; mock S3
+    # tests should not inherit that production restriction.
     main_module._reset_s3_client()
+    original_allowed_buckets = main_module.VIZ_ALLOWED_S3_BUCKETS
+    main_module.VIZ_ALLOWED_S3_BUCKETS = None
 
     with mock_aws():
         s3 = boto3.client("s3", region_name="us-east-1")
@@ -281,3 +285,4 @@ def mock_s3():
 
         # Reset singleton after mock_aws context exits
         main_module._reset_s3_client()
+        main_module.VIZ_ALLOWED_S3_BUCKETS = original_allowed_buckets

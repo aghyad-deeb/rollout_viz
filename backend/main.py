@@ -6,8 +6,10 @@ Provides REST API endpoints for loading JSONL data from local files or S3.
 
 import asyncio
 import copy
+import gzip
 import json
 import os
+import re
 import secrets
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -74,6 +76,12 @@ if _env_file.exists():
 else:
     print(f"[CONFIG] WARNING: {_env_file} not found")
 
+# Keep ~/.env as the app's source of truth while still allowing helpers such as
+# ModelRouterProvider to read shared tuning knobs with os.getenv(). Existing
+# process env wins, which keeps one-off overrides possible.
+for _env_key, _env_value in _env_config.items():
+    os.environ.setdefault(_env_key, _env_value)
+
 # Shared model_router (stateless model-inference proxy in the monorepo).
 # Used by the "discuss this rollout" chat feature via its litellm provider.
 MODEL_ROUTER_URL = (
@@ -82,20 +90,22 @@ MODEL_ROUTER_URL = (
     or "http://localhost:8235"
 ).rstrip("/")
 
-# API key environment variable names for each provider
+# API key environment variable names for each provider. Values are aliases in
+# precedence order; Google/Gemini key names differ across SDKs and LiteLLM.
 API_KEY_ENV_VARS = {
-    "openai": "OPENAI_API_KEY",
-    "anthropic": "ANTHROPIC_API_KEY",
-    "google": "GOOGLE_API_KEY",
-    "openrouter": "OPENROUTER_API_KEY",
+    "openai": ("OPENAI_API_KEY",),
+    "anthropic": ("ANTHROPIC_API_KEY",),
+    "google": ("GOOGLE_API_KEY", "GEMINI_API_KEY", "GOOGLE_AI_API_KEY"),
+    "openrouter": ("OPENROUTER_API_KEY",),
 }
 
 
 def get_env_api_key(provider: str) -> Optional[str]:
     """Get API key from ~/.env for a provider (ignores shell environment)."""
-    env_var = API_KEY_ENV_VARS.get(provider)
-    if env_var:
-        return _env_config.get(env_var)
+    for env_var in API_KEY_ENV_VARS.get(provider.lower(), ()):
+        key = _env_config.get(env_var)
+        if key:
+            return key
     return None
 
 
@@ -118,10 +128,28 @@ def _validate_s3_bucket(bucket: str) -> None:
         raise ValueError(f"S3 bucket not allowed: {bucket}")
 
 
-def _safe_error_detail(e: Exception) -> str:
-    """Return a generic error message for client responses. Logs the real error server-side."""
+_SECRET_DETAIL_PATTERNS = (
+    re.compile(r"(?i)(api[_-]?key|authorization|bearer|token)([=:\s]+)([^\s,;]+)"),
+    re.compile(r"sk-[A-Za-z0-9_\-]{12,}"),
+)
+
+
+def _redact_error_detail(message: str) -> str:
+    """Remove obvious credential-shaped values from errors before returning them."""
+    redacted = message
+    redacted = _SECRET_DETAIL_PATTERNS[0].sub(r"\1\2[redacted]", redacted)
+    redacted = _SECRET_DETAIL_PATTERNS[1].sub("[redacted-api-key]", redacted)
+    return redacted[:1000] + ("..." if len(redacted) > 1000 else "")
+
+
+def _safe_error_detail(e: Exception, *, expose: bool = False) -> str:
+    """Log server-side errors; optionally return a redacted actionable message."""
     print(f"[ERROR] {type(e).__name__}: {e}")
-    return "Internal server error"
+    if not expose:
+        return "Internal server error"
+    if isinstance(e, HTTPException):
+        return _redact_error_detail(str(e.detail))
+    return _redact_error_detail(str(e) or type(e).__name__)
 
 app = FastAPI(title="Rollout Visualizer API", docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -453,6 +481,7 @@ class SamplesResponse(BaseModel):
 class Quote(BaseModel):
     """A quoted section from a message that supports the grade."""
     message_index: int
+    channel: Optional[str] = None
     start: int
     end: int
     text: str
@@ -460,8 +489,8 @@ class Quote(BaseModel):
 
 class GradeEntry(BaseModel):
     """A single grade entry for a metric."""
-    grade: Union[float, int, bool]
-    grade_type: str  # "float", "int", "bool"
+    grade: Union[bool, int, float, str]
+    grade_type: str  # "float", "int", "bool", "freeform"
     quotes: List[Quote]
     explanation: str
     model: str
@@ -479,7 +508,7 @@ class GradeRequest(BaseModel):
     sample_ids: List[int]  # Which samples to grade (max 10k per request)
     metric_name: str
     metric_prompt: str  # The grading prompt (max 50k chars)
-    grade_type: str  # "float", "int", "bool"
+    grade_type: str  # "float", "int", "bool", "freeform"
     provider: str  # "openai", "anthropic", "google", "openrouter"
     model: str  # e.g., "gpt-4o", "claude-3-opus"
     router_provider: Optional[str] = None  # model_router provider: "litellm", "rl_late", or "tinker"
@@ -492,6 +521,47 @@ class GradeRequest(BaseModel):
     temperature: Optional[float] = None  # 0.0 - 2.0, None = model default
     max_tokens: Optional[int] = None  # Max output tokens
     top_p: Optional[float] = None  # 0.0 - 1.0
+
+
+_GRADING_PROVIDERS = {"openai", "anthropic", "google", "openrouter"}
+_ROUTER_PROVIDERS = {"litellm", "rl_late", "tinker"}
+
+
+def _normalize_grading_provider(provider: str) -> str:
+    normalized = provider.lower().strip()
+    if normalized not in _GRADING_PROVIDERS:
+        raise HTTPException(
+            status_code=400,
+            detail="provider must be one of openai, anthropic, google, or openrouter; use router_provider to select model_router backend",
+        )
+    return normalized
+
+
+def _normalize_router_provider(router_provider: Optional[str]) -> str:
+    normalized = (router_provider or "litellm").lower().strip()
+    if normalized not in _ROUTER_PROVIDERS:
+        raise HTTPException(status_code=400, detail="router_provider must be litellm, rl_late, or tinker")
+    if normalized != "litellm":
+        raise HTTPException(
+            status_code=400,
+            detail="rollout-viz grading currently supports router_provider=litellm only",
+        )
+    return normalized
+
+
+def _validate_provider_model_pair(provider: str, model: str) -> None:
+    if provider != "openrouter" and "/" in model:
+        raise HTTPException(
+            status_code=400,
+            detail="routed model IDs containing '/' require provider=openrouter; use the provider's direct model ID otherwise",
+        )
+
+
+def _prepare_grading_route(provider: str, model: str, router_provider: Optional[str]) -> tuple[str, str]:
+    normalized_provider = _normalize_grading_provider(provider)
+    normalized_router = _normalize_router_provider(router_provider)
+    _validate_provider_model_pair(normalized_provider, model)
+    return normalized_provider, normalized_router
 
 
 class GradeResponse(BaseModel):
@@ -841,8 +911,10 @@ async def get_local_files(directory: str = Query(default=".")):
     try:
         files = list_local_files(directory)
         return files
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=_safe_error_detail(e))
+        raise HTTPException(status_code=500, detail=_safe_error_detail(e, expose=True))
 
 
 @app.get("/api/files/s3", response_model=List[FileInfo])
@@ -885,6 +957,18 @@ _ATTR_DEFAULTS = {
     "step": 0, "sample_index": 0, "rollout_n": 0, "reward": 0.0,
     "data_source": "unknown", "experiment_name": "unknown", "is_validate": False,
 }
+
+# Single-file responses above this size avoid GZipMiddleware's event-loop
+# compression path. If the client accepts gzip, compression happens in a worker
+# thread; otherwise we mark the response identity to prevent middleware work.
+_LARGE_SAMPLES_ASYNC_RENDER_THRESHOLD = 1000
+
+
+def _render_large_json_response(data: dict, accepts_gzip: bool) -> tuple[bytes, str]:
+    body = orjson.dumps(data)
+    if accepts_gzip:
+        return gzip.compress(body, compresslevel=1), "gzip"
+    return body, "identity"
 
 
 def _load_samples_sync(file: str, metadata_only: bool = False) -> dict:
@@ -998,6 +1082,15 @@ async def get_samples(
                 if s is not None:
                     samples = [sm for sm in samples if sm["attributes"].get("step") == s]
             data = {**data, "samples": samples, "total": len(samples)}
+
+        if data["total"] > _LARGE_SAMPLES_ASYNC_RENDER_THRESHOLD:
+            accepts_gzip = "gzip" in request.headers.get("accept-encoding", "").lower()
+            body, encoding = await asyncio.to_thread(_render_large_json_response, data, accepts_gzip)
+            return Response(
+                content=body,
+                media_type="application/json",
+                headers={"Content-Encoding": encoding, "Vary": "Accept-Encoding"},
+            )
 
         return ORJSONResponse(content=data)
     except FileNotFoundError:
@@ -1446,7 +1539,10 @@ def save_jsonl_to_file(file_path: str, samples: List[Dict[str, Any]]) -> None:
 
     path_str = str(path)
     _file_cache.pop(path_str, None)
-    _viz_exists_cache[path_str] = (time.time(), True)
+    now = time.time()
+    _viz_exists_cache[path_str] = (now, True)
+    if file_path != path_str:
+        _viz_exists_cache[file_path] = (now, True)
 
 
 def save_jsonl_to_s3(bucket: str, key: str, samples: List[Dict[str, Any]]) -> None:
@@ -1528,7 +1624,7 @@ class SaveCustomMetricRequest(BaseModel):
     key: str  # Unique identifier (lowercase, no spaces, max 100 chars)
     name: str  # Display name (max 200 chars)
     description: str  # max 1000 chars
-    grade_type: str  # 'float', 'int', or 'bool'
+    grade_type: str  # 'float', 'int', 'bool', or 'freeform'
     prompt: str  # max 50000 chars
 
 
@@ -1537,8 +1633,8 @@ async def save_custom_metric(request: SaveCustomMetricRequest):
     """Save a custom metric for future use."""
     if len(request.key) > 100 or len(request.name) > 200 or len(request.description) > 1000 or len(request.prompt) > 50000:
         raise HTTPException(status_code=400, detail="Field too long")
-    if request.grade_type not in ("float", "int", "bool"):
-        raise HTTPException(status_code=400, detail="grade_type must be 'float', 'int', or 'bool'")
+    if request.grade_type not in ("float", "int", "bool", "freeform"):
+        raise HTTPException(status_code=400, detail="grade_type must be 'float', 'int', 'bool', or 'freeform'")
     key = request.key.lower().replace(" ", "_")
     
     if key in PRESET_METRICS:
@@ -1578,9 +1674,8 @@ async def delete_custom_metric(key: str):
 async def get_available_api_keys():
     """Check which API keys are available from server environment (.env file)."""
     available = {}
-    for provider, env_var in API_KEY_ENV_VARS.items():
-        key = _env_config.get(env_var)
-        available[provider] = bool(key and len(key) > 0)
+    for provider, env_vars in API_KEY_ENV_VARS.items():
+        available[provider] = any(bool(_env_config.get(env_var)) for env_var in env_vars)
     return available
 
 
@@ -1588,6 +1683,7 @@ class TestProviderRequest(BaseModel):
     """Request to test an LLM provider connection."""
     provider: str
     model: str
+    router_provider: Optional[str] = None
     api_key: Optional[str] = None
 
 
@@ -1608,20 +1704,23 @@ async def test_provider(request: TestProviderRequest):
     starting a full grading job. Results are cached for 5 minutes.
     """
     try:
+        provider_name, router_provider = _prepare_grading_route(
+            request.provider, request.model, request.router_provider
+        )
         api_key = request.api_key
         if not api_key:
-            api_key = get_env_api_key(request.provider)
+            api_key = get_env_api_key(provider_name)
 
         if not api_key:
             return JSONResponse(
                 status_code=400,
-                content={"ok": False, "error": f"No API key for {request.provider}"}
+                content={"ok": False, "error": f"No API key for {provider_name}"}
             )
 
         # Check cache
         import hashlib
         key_hash = hashlib.sha256(api_key.encode()).hexdigest()[:16]
-        cache_key = (request.provider, request.model, key_hash)
+        cache_key = (provider_name, request.model, router_provider, key_hash)
         now = time.time()
         if cache_key in _test_provider_cache:
             cached_time, cached_ok = _test_provider_cache[cache_key]
@@ -1629,11 +1728,12 @@ async def test_provider(request: TestProviderRequest):
                 return {"ok": cached_ok}
 
         provider = get_provider(
-            request.provider,
+            provider_name,
             api_key,
             request.model,
             max_tokens=200,
             router_url=MODEL_ROUTER_URL,
+            router_provider=router_provider,
             max_attempts=2,
         )
 
@@ -1657,7 +1757,7 @@ async def test_provider(request: TestProviderRequest):
     except Exception as e:
         return JSONResponse(
             status_code=400,
-            content={"ok": False, "error": _safe_error_detail(e)}
+            content={"ok": False, "error": _safe_error_detail(e, expose=True)}
         )
 
 
@@ -1675,8 +1775,9 @@ async def grade_samples(request: GradeRequest):
         request.top_p = max(0.0, min(request.top_p, 1.0))
     if request.api_key and len(request.api_key) > 500:
         raise HTTPException(status_code=400, detail="API key too long")
-    if request.router_provider and request.router_provider not in {"litellm", "rl_late", "tinker"}:
-        raise HTTPException(status_code=400, detail="router_provider must be litellm, rl_late, or tinker")
+    request.provider, request.router_provider = _prepare_grading_route(
+        request.provider, request.model, request.router_provider
+    )
     if request.max_attempts is not None:
         request.max_attempts = max(1, min(request.max_attempts, 30))
     if len(request.sample_ids) > _GRADE_MAX_SAMPLES:
@@ -1765,7 +1866,7 @@ async def grade_samples(request: GradeRequest):
                 )
                 return sample_id, grade_entry, None
             except Exception as e:
-                return sample_id, None, _safe_error_detail(e)
+                return sample_id, None, _safe_error_detail(e, expose=True)
         
         batch_size = min(request.parallel_size, 500)
 
@@ -1799,8 +1900,10 @@ async def grade_samples(request: GradeRequest):
             grades=grades,
         )
     
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=_safe_error_detail(e))
+        raise HTTPException(status_code=500, detail=_safe_error_detail(e, expose=True))
 
 
 @app.post("/api/grade-stream")
@@ -1817,8 +1920,9 @@ async def grade_samples_stream(request: GradeRequest):
         request.top_p = max(0.0, min(request.top_p, 1.0))
     if request.api_key and len(request.api_key) > 500:
         raise HTTPException(status_code=400, detail="API key too long")
-    if request.router_provider and request.router_provider not in {"litellm", "rl_late", "tinker"}:
-        raise HTTPException(status_code=400, detail="router_provider must be litellm, rl_late, or tinker")
+    request.provider, request.router_provider = _prepare_grading_route(
+        request.provider, request.model, request.router_provider
+    )
     if request.max_attempts is not None:
         request.max_attempts = max(1, min(request.max_attempts, 30))
     if len(request.sample_ids) > _GRADE_MAX_SAMPLES:
@@ -1913,7 +2017,7 @@ async def grade_samples_stream(request: GradeRequest):
                     }
                     return sample_id, grade_entry, None
                 except Exception as e:
-                    return sample_id, None, _safe_error_detail(e)
+                    return sample_id, None, _safe_error_detail(e, expose=True)
             
             batch_size = min(request.parallel_size, 500)
             sem = asyncio.Semaphore(batch_size)
@@ -1951,7 +2055,7 @@ async def grade_samples_stream(request: GradeRequest):
         except Exception as e:
             total_time = time.time() - start_time
             print(f"[SSE Grading] Error after {total_time:.2f}s: {str(e)}")
-            yield f"data: {json.dumps({'type': 'error', 'message': _safe_error_detail(e)})}\n\n"
+            yield f"data: {json.dumps({'type': 'error', 'message': _safe_error_detail(e, expose=True)})}\n\n"
     
     return StreamingResponse(
         generate_events(),
@@ -1974,11 +2078,22 @@ async def save_graded_samples(request: SaveGradedRequest):
     This merges new grades with any existing grades in the viz/ file.
     Uses a per-file lock to prevent concurrent writes from clobbering each other.
     """
-    lock_key = str(_safe_resolve_path(request.file_path)) if not request.file_path.startswith("s3://") else request.file_path
+    try:
+        lock_key = (
+            str(_safe_resolve_path(request.file_path))
+            if not request.file_path.startswith("s3://")
+            else request.file_path
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=_safe_error_detail(e, expose=True))
+
     if len(_save_locks) >= _MAX_SAVE_LOCKS:
         oldest_key = next(iter(_save_locks))
         del _save_locks[oldest_key]
     lock = _save_locks.setdefault(lock_key, asyncio.Lock())
+
     async with lock:
         try:
             original_path = request.file_path
@@ -1997,6 +2112,7 @@ async def save_graded_samples(request: SaveGradedRequest):
                 raw_samples = load_jsonl_from_file(source_path)
 
             raw_samples = list(raw_samples)
+            samples_updated = 0
 
             for sample_id_str, metric_grades in request.grades.items():
                 sample_id = int(sample_id_str)
@@ -2018,6 +2134,8 @@ async def save_graded_samples(request: SaveGradedRequest):
                     else:
                         sample['grades'][metric_name].append(grade_entry.model_dump())
 
+                samples_updated += 1
+
             if viz_path.startswith("s3://"):
                 s3_path = viz_path[5:]
                 bucket, key = s3_path.split("/", 1)
@@ -2027,11 +2145,13 @@ async def save_graded_samples(request: SaveGradedRequest):
 
             return {
                 "success": True,
-                "samples_updated": len(request.grades),
+                "samples_updated": samples_updated,
             }
 
+        except HTTPException:
+            raise
         except Exception as e:
-            raise HTTPException(status_code=500, detail=_safe_error_detail(e))
+            raise HTTPException(status_code=500, detail=_safe_error_detail(e, expose=True))
 
 
 def _frontend_response(full_path: str) -> FileResponse:

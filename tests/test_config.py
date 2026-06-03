@@ -24,6 +24,12 @@ class TestEnvParsing:
         result = get_env_api_key("openai")
         assert result == "sk-test-123"
 
+    def test_get_env_api_key_accepts_google_aliases(self, mock_env_config):
+        from backend.main import get_env_api_key
+        mock_env_config(GOOGLE_API_KEY="", GEMINI_API_KEY="gemini-test-key", GOOGLE_AI_API_KEY="")
+        result = get_env_api_key("google")
+        assert result == "gemini-test-key"
+
     def test_get_env_api_key_unknown_provider(self):
         from backend.main import get_env_api_key
         result = get_env_api_key("unknown_provider")
@@ -67,4 +73,12 @@ class TestAvailableApiKeys:
         resp = await client.get("/api/available-api-keys")
         data = resp.json()
         assert data["openai"] is True
+        await client.aclose()
+
+    async def test_reflects_google_key_aliases(self, app_no_auth, mock_env_config):
+        mock_env_config(GEMINI_API_KEY="gemini-test-key")
+        client = await app_no_auth()
+        resp = await client.get("/api/available-api-keys")
+        data = resp.json()
+        assert data["google"] is True
         await client.aclose()

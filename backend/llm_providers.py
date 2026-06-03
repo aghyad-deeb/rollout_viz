@@ -594,9 +594,15 @@ class ModelRouterProvider(LLMProvider):
 
     def _default_router_provider(self) -> str:
         configured = os.getenv("ROLLOUT_VIZ_MODEL_ROUTER_PROVIDER")
+        allowed = {"litellm", "rl_late", "tinker"}
         if configured:
-            return configured
-        if self.provider_name in {"tinker", "rl_late", "litellm"}:
+            normalized = configured.lower().strip()
+            if normalized not in allowed:
+                raise ValueError(
+                    "ROLLOUT_VIZ_MODEL_ROUTER_PROVIDER must be litellm, rl_late, or tinker"
+                )
+            return normalized
+        if self.provider_name in allowed:
             return self.provider_name
         if self.model.startswith("tinker://"):
             return "tinker"

@@ -12,11 +12,11 @@ import type { Message } from '../types';
 describe('rolloutChat', () => {
   it('exposes the three frontier models', () => {
     expect(CHAT_MODELS.map((m) => m.id)).toEqual([
-      'anthropic/claude-opus-4-7',
+      'anthropic/claude-opus-4-8',
       'gpt-5.5',
-      'openrouter/google/gemini-3.1-pro-preview',
+      'openrouter/google/gemini-3.5-flash',
     ]);
-    expect(DEFAULT_CHAT_MODEL).toBe('anthropic/claude-opus-4-7');
+    expect(DEFAULT_CHAT_MODEL).toBe('anthropic/claude-opus-4-8');
   });
 
   it('formatRolloutForChat includes the transcript and attributes', () => {

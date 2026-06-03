@@ -1,4 +1,5 @@
 import {
+  CAPTURE_ICON_PATHS,
   imageToPdf,
   loadCaptureWidth,
   saveCaptureWidth,
@@ -9,6 +10,12 @@ import { blobToBytes } from './pngMetadata';
 
 // imageToPdf treats the image payload as opaque bytes, so a stub is fine.
 const fakeJpeg = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4, 5, 0xff, 0xd9]);
+
+describe('capture icon paths', () => {
+  it('includes the file role icon used by presentation captures', () => {
+    expect(CAPTURE_ICON_PATHS.description).toBeTruthy();
+  });
+});
 
 // Read the PDF bytes back as a Latin-1 string so string indices == byte
 // offsets (needed to verify the xref table).

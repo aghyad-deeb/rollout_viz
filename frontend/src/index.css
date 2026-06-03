@@ -1,7 +1,7 @@
 @import "tailwindcss";
 
-/* Make Tailwind's `dark:` variant follow the `.dark` class on <html>
-   (toggled by useDarkMode) instead of the OS `prefers-color-scheme`.
+/* Make Tailwind's `dark:` variant follow the `.dark` class controlled by
+   useDarkMode instead of the OS `prefers-color-scheme` directly.
    Without this, `dark:` utilities and the in-app dark toggle disagree
    whenever the OS theme differs from the user's choice — and Presentation
    Mode's image-theme override (which flips `.dark`) wouldn't reach them. */
