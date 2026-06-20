@@ -179,7 +179,10 @@ export function GradesDisplay({
             const latest = gradeList[gradeList.length - 1];
             if (!latest) return null;
             
-            const isSelected = selectedMetric === metric;
+            const quoteList = latest.quotes ?? [];
+            const quoteCount = quoteList.length;
+            const hasQuotes = quoteCount > 0;
+            const isSelected = selectedMetric === metric && hasQuotes;
             
             return (
               <div 
@@ -209,38 +212,50 @@ export function GradesDisplay({
                       </span>
                     )}
                   </div>
-                  <button
-                    onClick={() => {
-                      if (isSelected) {
-                        onSelectMetric(undefined);
-                      } else {
-                        onSelectMetric(metric);
-                        onQuoteIndexChange?.(0); // Reset to first quote
-                        // Scroll to first quote. Use the sort that matches
-                        // `selectedQuotes` (by message_index, then start) so
-                        // index 0 in the scroll callback points to the same
-                        // mark the prev/next buttons will navigate around.
-                        if (latest.quotes && latest.quotes.length > 0 && onScrollToQuote) {
-                          const sorted = [...latest.quotes].sort((a, b) => {
-                            if (a.message_index !== b.message_index) return a.message_index - b.message_index;
-                            return a.start - b.start;
-                          });
-                          onScrollToQuote(sorted[0].message_index, 0);
+                  {hasQuotes ? (
+                    <button
+                      onClick={() => {
+                        if (isSelected) {
+                          onSelectMetric(undefined);
+                        } else {
+                          onSelectMetric(metric);
+                          onQuoteIndexChange?.(0); // Reset to first quote
+                          // Scroll to first quote. Use the sort that matches
+                          // `selectedQuotes` (by message_index, then start) so
+                          // index 0 in the scroll callback points to the same
+                          // mark the prev/next buttons will navigate around.
+                          if (onScrollToQuote) {
+                            const sorted = [...quoteList].sort((a, b) => {
+                              if (a.message_index !== b.message_index) return a.message_index - b.message_index;
+                              return a.start - b.start;
+                            });
+                            onScrollToQuote(sorted[0].message_index, 0);
+                          }
                         }
-                      }
-                    }}
-                    className={`flex items-center gap-1 px-2 py-1 rounded text-xs font-medium transition-colors ${
-                      isSelected
-                        ? (isDarkMode ? 'bg-purple-600 text-white' : 'bg-purple-500 text-white')
-                        : (isDarkMode ? 'bg-gray-700 text-gray-300 hover:bg-gray-600' : 'bg-gray-200 text-gray-600 hover:bg-gray-300')
-                    }`}
-                    title={isSelected ? 'Click to hide highlights' : 'Click to highlight quotes in chat'}
-                  >
-                    <span className="material-symbols-outlined" style={{ fontSize: 14 }}>
-                      {isSelected ? 'visibility_off' : 'format_quote'}
+                      }}
+                      className={`flex items-center gap-1 px-2 py-1 rounded text-xs font-medium transition-colors ${
+                        isSelected
+                          ? (isDarkMode ? 'bg-purple-600 text-white' : 'bg-purple-500 text-white')
+                          : (isDarkMode ? 'bg-gray-700 text-gray-300 hover:bg-gray-600' : 'bg-gray-200 text-gray-600 hover:bg-gray-300')
+                      }`}
+                      title={isSelected ? 'Click to hide highlights' : 'Click to highlight quotes in chat'}
+                    >
+                      <span className="material-symbols-outlined" style={{ fontSize: 14 }}>
+                        {isSelected ? 'visibility_off' : 'format_quote'}
+                      </span>
+                      {isSelected ? 'Hide quotes' : 'Show quotes'}
+                    </button>
+                  ) : (
+                    <span
+                      className={`flex items-center gap-1 px-2 py-1 rounded text-xs font-medium ${
+                        isDarkMode ? 'bg-gray-800 text-gray-500' : 'bg-gray-100 text-gray-400'
+                      }`}
+                      title="This grade did not save any quote spans"
+                    >
+                      <span className="material-symbols-outlined" style={{ fontSize: 14 }}>format_quote</span>
+                      No quotes saved
                     </span>
-                    {isSelected ? 'Hide quotes' : 'Show quotes'}
-                  </button>
+                  )}
                 </div>
 
                 {/* Freeform answer — primary content for this grade type.
@@ -266,12 +281,12 @@ export function GradesDisplay({
                 {/* Quotes navigation and model info */}
                 <div className={`flex items-center justify-between mt-1 text-xs ${isDarkMode ? 'text-gray-500' : 'text-gray-400'}`}>
                   <span>
-                    {latest.quotes && latest.quotes.length > 0 && (
+                    {hasQuotes && (
                       <>
                         <span className="material-symbols-outlined mr-0.5" style={{ fontSize: 12, verticalAlign: 'middle' }}>
                           format_quote
                         </span>
-                        {latest.quotes.length} quote{latest.quotes.length !== 1 ? 's' : ''}
+                        {quoteCount} quote{quoteCount !== 1 ? 's' : ''}
                         {' • '}
                       </>
                     )}

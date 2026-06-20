@@ -20,6 +20,53 @@ PIDFILE="$SCRIPT_DIR/.rollout_viz.pids"
 BACKEND_PORT=8000
 FRONTEND_PORT=3000
 
+read_env_key() {
+    local key=$1
+    local env_file="$HOME/.env"
+    [[ -f $env_file ]] || return 0
+    awk -F= -v key="$key" '$1 == key {print substr($0, length(key) + 2); exit}' "$env_file" \
+        | sed 's/^ *//; s/ *$//; s/^"//; s/"$//; s/^'"'"'//; s/'"'"'$//'
+}
+
+allow_public_no_auth() {
+    local allow_public_no_auth
+    allow_public_no_auth=$(read_env_key VIZ_ALLOW_PUBLIC_NO_AUTH || true)
+    if [[ -z $allow_public_no_auth ]]; then
+        allow_public_no_auth="${VIZ_ALLOW_PUBLIC_NO_AUTH:-}"
+    fi
+    case "${allow_public_no_auth,,}" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+check_security_config() {
+    local password secret buckets
+    password=$(read_env_key VIZ_PASSWORD || true)
+    secret=$(read_env_key VIZ_SECRET_KEY || true)
+    buckets=$(read_env_key VIZ_ALLOWED_S3_BUCKETS || true)
+
+    if ! allow_public_no_auth && [[ -z $password ]]; then
+        echo "Refusing to start: public tunnel startup requires VIZ_PASSWORD in ~/.env."
+        echo "Set VIZ_PASSWORD and VIZ_SECRET_KEY, or set VIZ_ALLOW_PUBLIC_NO_AUTH=true only for an intentionally public instance."
+        return 1
+    fi
+
+    if [[ -n $password && -z $secret ]]; then
+        echo "Refusing to start: VIZ_PASSWORD is set but VIZ_SECRET_KEY is missing from ~/.env."
+        echo "Generate one with: openssl rand -hex 32"
+        return 1
+    fi
+
+    if [[ -n $(read_env_key AWS_ACCESS_KEY_ID || true) || -n $(read_env_key AWS_SECRET_ACCESS_KEY || true) ]]; then
+        if [[ -z $buckets ]]; then
+            echo "Refusing to start: AWS credentials are configured but VIZ_ALLOWED_S3_BUCKETS is missing from ~/.env."
+            echo "Set it to a comma-separated allowlist, for example: VIZ_ALLOWED_S3_BUCKETS=rewardseeker"
+            return 1
+        fi
+    fi
+}
+
 # ──────────────────────────────────────────
 # Stop command
 # ──────────────────────────────────────────
@@ -79,9 +126,16 @@ if [ "${1:-}" = "stop" ]; then
     exit 0
 fi
 
+if [ "${1:-}" = "__check_security_config" ]; then
+    check_security_config
+    exit $?
+fi
+
 # ──────────────────────────────────────────
 # Start command
 # ──────────────────────────────────────────
+
+check_security_config || exit 1
 
 # Stop any existing instances first
 stop_app 2>/dev/null
@@ -131,8 +185,14 @@ trap 'if ! $_cleanup_done; then _cleanup_done=true; cleanup EXIT/child-died; fi'
 echo -e "${GREEN}Starting backend on port $BACKEND_PORT...${NC}"
 source venv/bin/activate
 
-# Backend reads all config (API keys, VIZ_PASSWORD) directly from ~/.env
-python -m uvicorn backend.main:app --host 127.0.0.1 --port $BACKEND_PORT --reload &
+# Backend reads all config (API keys, VIZ_PASSWORD) directly from ~/.env.
+# Force fail-closed auth in legacy mode unless the operator explicitly opts
+# into a public no-auth instance.
+if allow_public_no_auth; then
+    python -m uvicorn backend.main:app --host 127.0.0.1 --port $BACKEND_PORT --reload &
+else
+    VIZ_REQUIRE_AUTH=1 python -m uvicorn backend.main:app --host 127.0.0.1 --port $BACKEND_PORT --reload &
+fi
 BACKEND_PID=$!
 
 # Wait for backend to be ready (poll health endpoint)

@@ -99,6 +99,8 @@ export interface Sample {
 }
 
 // Grading request/response types
+export type GradingReasoningEffort = 'low' | 'medium' | 'high';
+
 export interface GradeRequest {
   file_path: string;
   sample_ids: number[];
@@ -116,6 +118,7 @@ export interface GradeRequest {
   // Advanced settings
   temperature?: number;  // 0.0 - 2.0, undefined = model default
   max_tokens?: number;  // Max output tokens
+  reasoning_effort?: GradingReasoningEffort;  // Reasoning effort hint
   top_p?: number;  // 0.0 - 1.0
 }
 

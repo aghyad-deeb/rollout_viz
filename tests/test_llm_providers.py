@@ -16,6 +16,7 @@ from backend.llm_providers import (
     InvalidGradeResponse,
     LLMProvider,
     PRESET_METRICS,
+    _format_target_conversation,
 )
 
 
@@ -289,6 +290,57 @@ class TestModelRouterProvider:
             == "openrouter/openai/gpt-4o"
         )
 
+    def test_build_payload_includes_budget_and_reasoning_effort(self):
+        provider = ModelRouterProvider(
+            api_key="k",
+            model="gpt-5.5",
+            provider_name="openai",
+            max_tokens=32768,
+            reasoning_effort="low",
+            max_attempts=1,
+        )
+        formatted = _format_target_conversation([
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there"},
+        ])
+
+        payload = provider._build_payload(
+            formatted,
+            metric_prompt="Is the assistant polite?",
+            grade_type="bool",
+            require_quotes=True,
+            attempt=1,
+            previous_error=None,
+        )
+
+        assert payload["sampling"]["max_tokens"] == 32768
+        assert payload["sampling"]["reasoning_effort"] == "low"
+        assert "temperature" not in payload["sampling"]
+
+    def test_build_payload_forwards_explicit_temperature(self):
+        provider = ModelRouterProvider(
+            api_key="k",
+            model="gpt-4o",
+            provider_name="openai",
+            temperature=0.25,
+            max_attempts=1,
+        )
+        formatted = _format_target_conversation([
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there"},
+        ])
+
+        payload = provider._build_payload(
+            formatted,
+            metric_prompt="Is the assistant polite?",
+            grade_type="bool",
+            require_quotes=True,
+            attempt=1,
+            previous_error=None,
+        )
+
+        assert payload["sampling"]["temperature"] == 0.25
+
     async def test_grade_sample_parses_tool_call_and_validates_quote(self):
         provider = ModelRouterProvider(api_key="k", model="gpt-4o", provider_name="openai", max_attempts=1)
         provider._post_step = AsyncMock(return_value={
@@ -344,9 +396,10 @@ class TestModelRouterProvider:
         with pytest.raises(ValueError, match="ROLLOUT_VIZ_MODEL_ROUTER_PROVIDER"):
             ModelRouterProvider(api_key="k", model="gpt-4o", provider_name="openai")
 
-    async def test_missing_required_quote_rejected(self):
-        provider = ModelRouterProvider(api_key="k", model="gpt-4o", provider_name="openai", max_attempts=1)
-        provider._post_step = AsyncMock(return_value={
+    async def test_missing_required_quote_rejected_on_non_final_attempt(self):
+        # With max_attempts=2, attempt 1 is non-final and must raise to trigger a retry.
+        provider = ModelRouterProvider(api_key="k", model="gpt-4o", provider_name="openai", max_attempts=2)
+        empty_quote_step = {
             "decoded_message": {
                 "tool_calls": [{
                     "function": {
@@ -360,15 +413,248 @@ class TestModelRouterProvider:
                     },
                 }],
             },
+        }
+        provider._post_step = AsyncMock(return_value=empty_quote_step)
+        # Suppress backoff sleeps for speed.
+        with patch("backend.llm_providers.asyncio.sleep", new=AsyncMock()):
+            # Final attempt (attempt 2) returns the grade with empty quotes instead of raising.
+            result = await provider.grade_sample(
+                messages=[{"role": "assistant", "content": "Hi"}],
+                metric_prompt="metric",
+                grade_type="bool",
+                require_quotes=True,
+            )
+        assert result.grade is True
+        assert result.quotes == []
+        # Should have retried (2 attempts).
+        assert provider._post_step.await_count == 2
+
+    def test_normalize_quotes_raises_on_non_final_returns_on_final(self):
+        provider = ModelRouterProvider(api_key="k", model="gpt-4o", provider_name="openai", max_attempts=2)
+        formatted = _format_target_conversation([{"role": "assistant", "content": "Hi"}])
+        # Non-final attempt: missing required quotes raises.
+        with pytest.raises(InvalidGradeResponse, match="quote"):
+            provider._normalize_quotes([], formatted, require_quotes=True, is_final=False)
+        # Final attempt: returns empty list, no raise.
+        assert provider._normalize_quotes([], formatted, require_quotes=True, is_final=True) == []
+
+    async def test_rejected_grader_output_is_logged(self, capsys):
+        provider = ModelRouterProvider(api_key="k", model="gpt-4o", provider_name="openai", max_attempts=1)
+        provider._post_step = AsyncMock(return_value={
+            "stop_reason": "length",
+            "parse_success": True,
+            "usage": {"completion_tokens": 4096},
+            "decoded_message": {
+                "role": "assistant",
+                "content": "I need more room before I can call the tool.",
+                "content_parts": [
+                    {"type": "text", "text": "I need more room before I can call the tool."},
+                ],
+                "tool_calls": [],
+                "openai_response_items": [
+                    {"type": "reasoning", "summary": "thinking", "encrypted_content": "secret"},
+                ],
+            },
+            "unparsed_tool_calls": [{"raw_text": "<submit_grade bad", "error": "bad xml"}],
         })
 
-        with pytest.raises(InvalidGradeResponse, match="quote"):
+        with pytest.raises(InvalidGradeResponse, match="submit_grade"):
             await provider.grade_sample(
                 messages=[{"role": "assistant", "content": "Hi"}],
                 metric_prompt="metric",
                 grade_type="bool",
                 require_quotes=True,
             )
+
+        captured = capsys.readouterr().out
+        assert "grader output rejected" in captured
+        assert "I need more room" in captured
+        assert '"stop_reason": "length"' in captured
+        assert "bad xml" in captured
+        assert "encrypted_content" not in captured
+
+
+def _step_with_args(args):
+    return {
+        "decoded_message": {
+            "tool_calls": [{"function": {"name": "submit_grade", "arguments": args}}],
+        },
+    }
+
+
+class TestEmptyExplanationAccepted:
+    """P0: a schema-valid grade with empty explanation must not be dropped."""
+
+    @pytest.mark.parametrize(
+        "grade_type,grade",
+        [("bool", True), ("int", 3), ("float", 0.5)],
+    )
+    def test_parse_step_result_accepts_empty_explanation(self, grade_type, grade):
+        provider = ModelRouterProvider(api_key="k", model="gpt-4o", provider_name="openai", max_attempts=1)
+        formatted = _format_target_conversation([{"role": "assistant", "content": "Hi there"}])
+        step = _step_with_args({
+            "grade": grade,
+            "grade_type": grade_type,
+            "quotes": [{
+                "message_index": 0,
+                "channel": "text",
+                "start": 0,
+                "end": 8,
+                "text": "Hi there",
+            }],
+            "explanation": "",
+        })
+        result = provider._parse_step_result(step, formatted, grade_type, require_quotes=True, is_final=True)
+        assert result.grade == grade
+        # A non-empty placeholder explanation is synthesized.
+        assert result.explanation
+
+    def test_freeform_empty_explanation_still_accepted(self):
+        provider = ModelRouterProvider(api_key="k", model="gpt-4o", provider_name="openai", max_attempts=1)
+        formatted = _format_target_conversation([{"role": "assistant", "content": "Hi there"}])
+        step = _step_with_args({
+            "grade": "some summary",
+            "grade_type": "freeform",
+            "quotes": [],
+            "explanation": "",
+        })
+        result = provider._parse_step_result(step, formatted, "freeform", require_quotes=False, is_final=True)
+        assert result.grade == "some summary"
+
+
+class TestSubmitGradeToolSchema:
+    def test_required_no_longer_includes_explanation_or_grade_type(self):
+        from backend.llm_providers import _submit_grade_tool
+        required = _submit_grade_tool()["parameters"]["required"]
+        assert "explanation" not in required
+        assert "grade_type" not in required
+        assert "grade" in required
+        assert "quotes" in required
+
+
+class TestQuoteWhitespaceFallback:
+    def test_quote_with_collapsed_whitespace_matches(self):
+        provider = ModelRouterProvider(api_key="k", model="gpt-4o", provider_name="openai", max_attempts=1)
+        formatted = _format_target_conversation([
+            {"role": "assistant", "content": "Hello   there\nfriend"},
+        ])
+        # Quote text uses single spaces / different whitespace than the channel.
+        quotes = provider._normalize_quotes(
+            [{"message_index": 0, "channel": "text", "start": 0, "end": 0, "text": "Hello there friend"}],
+            formatted,
+            require_quotes=True,
+            is_final=False,
+        )
+        assert len(quotes) == 1
+
+
+class TestReasoningEffortGating:
+    def test_google_omits_reasoning_effort(self):
+        provider = ModelRouterProvider(
+            api_key="k", model="gemini-2.5-pro", provider_name="google",
+            reasoning_effort="low", max_attempts=1,
+        )
+        formatted = _format_target_conversation([{"role": "assistant", "content": "Hi"}])
+        payload = provider._build_payload(formatted, "m", "bool", False, 1, None)
+        assert "reasoning_effort" not in payload["sampling"]
+
+    def test_openai_includes_reasoning_effort(self):
+        provider = ModelRouterProvider(
+            api_key="k", model="gpt-5.5", provider_name="openai",
+            reasoning_effort="low", max_attempts=1,
+        )
+        formatted = _format_target_conversation([{"role": "assistant", "content": "Hi"}])
+        payload = provider._build_payload(formatted, "m", "bool", False, 1, None)
+        assert payload["sampling"]["reasoning_effort"] == "low"
+
+
+class TestToolCallSalvage:
+    def test_fenced_json_arguments_parsed(self):
+        provider = ModelRouterProvider(api_key="k", model="gpt-4o", provider_name="openai", max_attempts=1)
+        args = '```json\n{"grade": true, "grade_type": "bool", "quotes": [], "explanation": "x"}\n```'
+        payload = provider._extract_tool_payload(_step_with_args(args))
+        assert payload["grade"] is True
+
+    def test_payload_recovered_from_unparsed_tool_calls(self):
+        provider = ModelRouterProvider(api_key="k", model="gpt-4o", provider_name="openai", max_attempts=1)
+        step = {
+            "decoded_message": {"tool_calls": []},
+            "unparsed_tool_calls": [
+                {"raw_text": '{"name": "submit_grade", "arguments": {"grade": true, "grade_type": "bool", "quotes": [], "explanation": "x"}}'},
+            ],
+        }
+        payload = provider._extract_tool_payload(step)
+        assert payload["grade"] is True
+
+    def test_absent_submit_grade_still_raises(self):
+        provider = ModelRouterProvider(api_key="k", model="gpt-4o", provider_name="openai", max_attempts=1)
+        step = {"decoded_message": {"tool_calls": [], "content": "no tool"}}
+        with pytest.raises(InvalidGradeResponse, match="submit_grade"):
+            provider._extract_tool_payload(step)
+
+
+class TestBackoffSkipForInvalidGrade:
+    async def test_no_backoff_for_invalid_grade_response(self):
+        provider = ModelRouterProvider(api_key="k", model="gpt-4o", provider_name="openai", max_attempts=2)
+        # First attempt: model fails to call submit_grade (InvalidGradeResponse, non-final).
+        # Second attempt: succeeds.
+        good_step = _step_with_args({
+            "grade": True, "grade_type": "bool",
+            "quotes": [{"message_index": 0, "channel": "text", "start": 0, "end": 8, "text": "Hi there"}],
+            "explanation": "ok",
+        })
+        bad_step = {"decoded_message": {"tool_calls": [], "content": "nope"}}
+        provider._post_step = AsyncMock(side_effect=[bad_step, good_step])
+        sleep_mock = AsyncMock()
+        with patch("backend.llm_providers.asyncio.sleep", new=sleep_mock):
+            result = await provider.grade_sample(
+                messages=[{"role": "assistant", "content": "Hi there"}],
+                metric_prompt="m",
+                grade_type="bool",
+                require_quotes=True,
+            )
+        assert result.grade is True
+        # No backoff sleep should be taken for an InvalidGradeResponse retry.
+        sleep_mock.assert_not_awaited()
+
+
+class TestRetryNoteQuoteSpecific:
+    def test_quote_error_produces_verbatim_instruction(self):
+        provider = ModelRouterProvider(api_key="k", model="gpt-4o", provider_name="openai", max_attempts=2)
+        formatted = _format_target_conversation([{"role": "assistant", "content": "Hi"}])
+        prompt = provider._build_user_prompt(
+            formatted, "m", "bool", True, attempt=2,
+            previous_error="missing at least one valid supporting quote",
+        )
+        assert "verbatim" in prompt.lower()
+
+
+class TestGradeCoercionTolerance:
+    def test_bool_with_trailing_punctuation(self):
+        provider = ModelRouterProvider(api_key="k", model="gpt-4o", provider_name="openai", max_attempts=1)
+        assert provider._coerce_grade("True.", "bool") is True
+        assert provider._coerce_grade("yes", "bool") is True
+        assert provider._coerce_grade("Fail!", "bool") is False
+
+    def test_ambiguous_bool_still_raises(self):
+        provider = ModelRouterProvider(api_key="k", model="gpt-4o", provider_name="openai", max_attempts=1)
+        with pytest.raises(InvalidGradeResponse):
+            provider._coerce_grade("likely", "bool")
+
+
+class TestMissingKeyError:
+    def test_google_missing_key_raises_named_error(self):
+        provider = ModelRouterProvider(api_key="", model="gemini-2.5-pro", provider_name="google", max_attempts=1)
+        formatted = _format_target_conversation([{"role": "assistant", "content": "Hi"}])
+        with pytest.raises(RuntimeError, match="google"):
+            provider._build_payload(formatted, "m", "bool", False, 1, None)
+
+    def test_openai_no_key_does_not_raise(self):
+        # openai relies on server-side router keys; api_key may legitimately be empty.
+        provider = ModelRouterProvider(api_key="", model="gpt-4o", provider_name="openai", max_attempts=1)
+        formatted = _format_target_conversation([{"role": "assistant", "content": "Hi"}])
+        payload = provider._build_payload(formatted, "m", "bool", False, 1, None)
+        assert payload["api_key"] is None
 
 
 class TestGoogleProviderClientReuse:

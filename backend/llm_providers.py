@@ -5,6 +5,7 @@ Supports model_router-backed grading plus legacy OpenAI, Anthropic, Google, and 
 """
 
 import asyncio
+import contextvars
 import json
 import math
 import os
@@ -54,6 +55,31 @@ class InvalidGradeResponse(RuntimeError):
     """Raised when a judge response is well-formed transport-wise but unusable."""
 
 
+_GRADING_LOG_CONTEXT: contextvars.ContextVar[Dict[str, Any]] = contextvars.ContextVar(
+    "grading_log_context",
+    default={},
+)
+
+
+def set_grading_log_context(context: Dict[str, Any]) -> contextvars.Token[Dict[str, Any]]:
+    return _GRADING_LOG_CONTEXT.set(context)
+
+
+def reset_grading_log_context(token: contextvars.Token[Dict[str, Any]]) -> None:
+    _GRADING_LOG_CONTEXT.reset(token)
+
+
+def _grading_log_context_note() -> str:
+    context = _GRADING_LOG_CONTEXT.get()
+    parts: List[str] = []
+    prefix = context.get("prefix")
+    if prefix:
+        parts.append(str(prefix))
+    if context.get("sample_id") is not None:
+        parts.append(f"sample={context['sample_id']}")
+    return f" {' '.join(parts)}" if parts else ""
+
+
 class LLMProvider(ABC):
     """Abstract base class for LLM providers."""
     
@@ -64,12 +90,14 @@ class LLMProvider(ABC):
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         top_p: Optional[float] = None,
+        reasoning_effort: Optional[str] = None,
     ):
         self.api_key = api_key
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.top_p = top_p
+        self.reasoning_effort = reasoning_effort
     
     @abstractmethod
     async def grade_sample(
@@ -328,6 +356,36 @@ def _json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
 
 
+def _truncate_log_value(value: Any, *, string_limit: int = 1200, depth: int = 0) -> Any:
+    if depth > 5:
+        return _log_excerpt(value, 500)
+    if isinstance(value, str):
+        if len(value) <= string_limit:
+            return value
+        omitted = len(value) - string_limit
+        return f"{value[:string_limit]}... [truncated {omitted} chars]"
+    if isinstance(value, list):
+        limited = [_truncate_log_value(item, string_limit=string_limit, depth=depth + 1) for item in value[:8]]
+        if len(value) > 8:
+            limited.append(f"... [truncated {len(value) - 8} list items]")
+        return limited
+    if isinstance(value, dict):
+        redacted_keys = {"api_key", "encrypted_content"}
+        items = [
+            (key, item)
+            for key, item in value.items()
+            if str(key) not in redacted_keys
+        ]
+        limited = {
+            str(key): _truncate_log_value(item, string_limit=string_limit, depth=depth + 1)
+            for key, item in items[:32]
+        }
+        if len(items) > 32:
+            limited["__truncated_keys__"] = len(items) - 32
+        return limited
+    return value
+
+
 def _content_to_text(content: Any) -> str:
     if content is None:
         return ""
@@ -500,6 +558,51 @@ def _format_target_conversation(messages: List[Dict[str, Any]]) -> _FormattedCon
     return _FormattedConversation(text=combined, channels=channel_map, truncated=False, original_len=original_len)
 
 
+def _tolerant_json_loads(raw: str) -> Optional[Dict[str, Any]]:
+    """Best-effort JSON parse: strip code fences and brace-scan to the outermost object."""
+    text = raw.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+    start = text.find("{")
+    end = text.rfind("}") + 1
+    if start != -1 and end > start:
+        try:
+            parsed = json.loads(text[start:end])
+            return parsed if isinstance(parsed, dict) else None
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
+def _find_whitespace_normalized(channel_text: str, text: str) -> Optional[tuple]:
+    """Locate `text` within `channel_text` ignoring whitespace differences.
+
+    Returns a (start, end) span in the ORIGINAL channel_text whose whitespace-
+    normalized content equals the whitespace-normalized `text`, or None. Only
+    affects highlight precision, never the grade.
+    """
+    target = re.sub(r"\s+", " ", text).strip()
+    if not target:
+        return None
+    # Build a regex that matches the target words separated by arbitrary whitespace.
+    words = target.split(" ")
+    pattern = r"\s+".join(re.escape(w) for w in words)
+    match = re.search(pattern, channel_text)
+    if match:
+        return (match.start(), match.end())
+    return None
+
+
 def _grade_instruction(grade_type: str) -> str:
     if grade_type == "bool":
         return "Respond with a boolean grade: true or false."
@@ -555,7 +658,7 @@ def _submit_grade_tool() -> Dict[str, Any]:
                     "description": "Short explanation for the grade, grounded in the submitted quotes.",
                 },
             },
-            "required": ["grade", "grade_type", "quotes", "explanation"],
+            "required": ["grade", "quotes"],
         },
     }
 
@@ -570,6 +673,13 @@ def _retry_after_ms(value: Optional[str]) -> Optional[int]:
     except ValueError:
         return None
     return None
+
+
+def _log_excerpt(value: Any, limit: int = 240) -> str:
+    text = " ".join(str(value).split())
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit - 3]}..."
 
 
 class ModelRouterProvider(LLMProvider):
@@ -617,6 +727,23 @@ class ModelRouterProvider(LLMProvider):
         if self.provider_name == "openrouter" and not model.startswith("openrouter/"):
             return f"openrouter/{model}"
         return model
+
+    def _accepts_reasoning_effort(self) -> bool:
+        """Only forward reasoning_effort to providers/models known to accept it.
+
+        Gemini and most non-reasoning OpenRouter models reject the parameter and
+        (without litellm.drop_params) hard-fail, so we gate it app-side.
+        """
+        if self.provider_name == "google":
+            return False
+        if self.provider_name == "openrouter":
+            model = self.model.lower()
+            return any(
+                token in model
+                for token in ("o1", "o3", "o4-mini", "gpt-5", "thinking", "reasoning")
+            )
+        # openai (reasoning families) and anthropic accept it.
+        return True
 
     def _is_local_router(self) -> bool:
         parsed = urlparse(self.router_url)
@@ -728,7 +855,18 @@ Quotes must be exact substrings from the named channel. start/end offsets are ch
             )
         retry_note = ""
         if attempt > 1 and previous_error:
-            retry_note = f"\n\nYour previous attempt was rejected: {previous_error}. Correct it and call submit_grade now."
+            if "quote" in previous_error.lower():
+                retry_note = (
+                    f"\n\nYour previous attempt was rejected: {previous_error}. "
+                    "Each quote's text MUST be an EXACT verbatim substring of the shown transcript "
+                    "channel text (which may have been center-truncated). Copy the characters exactly. "
+                    "Call submit_grade now."
+                )
+            else:
+                retry_note = (
+                    f"\n\nYour previous attempt was rejected: {previous_error}. "
+                    "Correct it and call submit_grade now."
+                )
         return f"""## Conversation to Evaluate
 
 {formatted.text}{truncation}
@@ -744,7 +882,7 @@ Quotes must be exact substrings from the named channel. start/end offsets are ch
 {_grade_instruction(grade_type)}
 
 {quote_rule}
-For every quote, provide message_index, channel, exact text, start, and end.
+For every quote, provide message_index, channel, exact text, start, and end. Quote text must be a verbatim substring of the shown transcript channel text.
 
 Call submit_grade with grade_type=\"{grade_type}\".{retry_note}"""
 
@@ -759,13 +897,25 @@ Call submit_grade with grade_type=\"{grade_type}\".{retry_note}"""
     ) -> Dict[str, Any]:
         sampling: Dict[str, Any] = {
             "max_tokens": self.max_tokens or 4096,
-            "temperature": self.temperature if self.temperature is not None else 0.0,
             "stream": False,
         }
-        if os.getenv("ROLLOUT_VIZ_GRADER_REASONING_EFFORT"):
-            sampling["reasoning_effort"] = os.getenv("ROLLOUT_VIZ_GRADER_REASONING_EFFORT")
+        if self.temperature is not None:
+            sampling["temperature"] = self.temperature
+        reasoning_effort = self.reasoning_effort or os.getenv("ROLLOUT_VIZ_GRADER_REASONING_EFFORT")
+        if reasoning_effort and self._accepts_reasoning_effort():
+            sampling["reasoning_effort"] = reasoning_effort
         if os.getenv("ROLLOUT_VIZ_GRADER_REASONING_SUMMARY"):
             sampling["reasoning_summary"] = os.getenv("ROLLOUT_VIZ_GRADER_REASONING_SUMMARY")
+        # model_router only carries server-side keys for openai/anthropic/tinker.
+        # google/openrouter must pass an api_key; surface a clear, non-retryable
+        # error instead of sending api_key=None and letting the router fall back
+        # to its own dotenv and return an opaque upstream 4xx.
+        if self.provider_name in {"google", "openrouter"} and not self.api_key:
+            raise RuntimeError(
+                f"No API key resolved for provider {self.provider_name}; "
+                f"set the corresponding key (e.g. GOOGLE_API_KEY / OPENROUTER_API_KEY) "
+                "or pass api_key in the grading request."
+            )
         return {
             "provider": self.router_provider,
             "model_name": self._router_model_name(),
@@ -809,6 +959,36 @@ Call submit_grade with grade_type=\"{grade_type}\".{retry_note}"""
             raise RuntimeError(f"model_router HTTP {resp.status_code}: {detail}")
         return resp.json()
 
+    def _grader_output_debug_summary(self, step_data: Dict[str, Any]) -> Dict[str, Any]:
+        decoded = _as_plain_dict(step_data.get("decoded_message") or {})
+        summary = {
+            "stop_reason": step_data.get("stop_reason"),
+            "parse_success": step_data.get("parse_success"),
+            "usage": step_data.get("usage"),
+            "decoded_message": {
+                "role": decoded.get("role"),
+                "content": decoded.get("content"),
+                "content_parts": decoded.get("content_parts"),
+                "tool_calls": decoded.get("tool_calls"),
+                "openai_response_items": decoded.get("openai_response_items"),
+            },
+            "unparsed_tool_calls": step_data.get("unparsed_tool_calls"),
+        }
+        return _truncate_log_value(summary)
+
+    def _log_grader_output(self, step_data: Dict[str, Any], reason: str) -> None:
+        try:
+            summary = self._grader_output_debug_summary(step_data)
+            print(
+                f"[ModelRouterGrader]{_grading_log_context_note()} grader output rejected "
+                f"reason={_log_excerpt(reason)} data={_json_dumps(summary)}"
+            )
+        except Exception as log_error:
+            print(
+                f"[ModelRouterGrader]{_grading_log_context_note()} failed to log grader output: "
+                f"{type(log_error).__name__}: {_log_excerpt(log_error)}"
+            )
+
     def _coerce_grade(self, raw_grade: Any, grade_type: str) -> Union[float, int, bool, str]:
         if grade_type == "bool":
             if isinstance(raw_grade, bool):
@@ -816,10 +996,11 @@ Call submit_grade with grade_type=\"{grade_type}\".{retry_note}"""
             if isinstance(raw_grade, (int, float)) and not isinstance(raw_grade, bool):
                 return float(raw_grade) >= 0.5
             if isinstance(raw_grade, str):
-                lowered = raw_grade.strip().lower()
-                if lowered in {"true", "yes", "1"}:
+                # Strip surrounding whitespace and trailing punctuation (e.g. "True.").
+                lowered = raw_grade.strip().strip(".!?,;:").lower()
+                if lowered in {"true", "yes", "y", "pass", "correct", "1"}:
                     return True
-                if lowered in {"false", "no", "0"}:
+                if lowered in {"false", "no", "n", "fail", "incorrect", "0"}:
                     return False
             raise InvalidGradeResponse(f"grade {raw_grade!r} is not a valid bool")
         if grade_type == "int":
@@ -854,21 +1035,53 @@ Call submit_grade with grade_type=\"{grade_type}\".{retry_note}"""
             if isinstance(args, dict):
                 return args
             if isinstance(args, str):
+                # Strict parse first; fall back to tolerant repair (code fences /
+                # surrounding prose) before hard-failing.
                 try:
                     parsed = json.loads(args)
                 except json.JSONDecodeError as e:
+                    salvaged = _tolerant_json_loads(args)
+                    if salvaged is not None:
+                        return salvaged
                     raise InvalidGradeResponse("submit_grade arguments were not valid JSON") from e
                 if isinstance(parsed, dict):
                     return parsed
             raise InvalidGradeResponse("submit_grade arguments were not an object")
+        # Salvage: a submit_grade payload may only be present in unparsed_tool_calls.
+        salvaged = self._salvage_unparsed_tool_calls(step_data)
+        if salvaged is not None:
+            return salvaged
         content = str(decoded.get("content") or "").strip()
         raise InvalidGradeResponse(f"model did not call submit_grade; content={content[:200]!r}")
+
+    def _salvage_unparsed_tool_calls(self, step_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        for entry in step_data.get("unparsed_tool_calls") or []:
+            entry_dict = _as_plain_dict(entry)
+            raw = entry_dict.get("raw_text") or entry_dict.get("arguments") or ""
+            if not isinstance(raw, str) or not raw:
+                continue
+            parsed = _tolerant_json_loads(raw)
+            if parsed is None:
+                continue
+            # The raw text may be the full tool call ({name, arguments}) or just the args.
+            if parsed.get("name") == "submit_grade":
+                args = parsed.get("arguments")
+                if isinstance(args, dict):
+                    return args
+                if isinstance(args, str):
+                    inner = _tolerant_json_loads(args)
+                    if inner is not None:
+                        return inner
+            elif "grade" in parsed:
+                return parsed
+        return None
 
     def _normalize_quotes(
         self,
         raw_quotes: Any,
         formatted: _FormattedConversation,
         require_quotes: bool,
+        is_final: bool = True,
     ) -> List[Quote]:
         if raw_quotes is None:
             raw_quotes = []
@@ -913,6 +1126,13 @@ Call submit_grade with grade_type=\"{grade_type}\".{retry_note}"""
                     start = found
                     end = found + len(text)
                     break
+                # Whitespace-normalized fallback: recover loosely-quoted outputs whose
+                # only difference from the channel is collapsed/extra whitespace.
+                ws_span = _find_whitespace_normalized(channel_text, text)
+                if ws_span is not None:
+                    chosen_channel = channel
+                    start, end = ws_span
+                    break
             if chosen_channel:
                 normalized.append(
                     Quote(
@@ -924,7 +1144,7 @@ Call submit_grade with grade_type=\"{grade_type}\".{retry_note}"""
                     )
                 )
 
-        if require_quotes and not normalized:
+        if require_quotes and not normalized and not is_final:
             raise InvalidGradeResponse("missing at least one valid supporting quote")
         return normalized
 
@@ -934,13 +1154,20 @@ Call submit_grade with grade_type=\"{grade_type}\".{retry_note}"""
         formatted: _FormattedConversation,
         grade_type: str,
         require_quotes: bool,
+        is_final: bool = True,
     ) -> GradeResult:
         payload = self._extract_tool_payload(step_data)
         grade = self._coerce_grade(payload.get("grade"), grade_type)
-        quotes = self._normalize_quotes(payload.get("quotes"), formatted, require_quotes)
+        quotes = self._normalize_quotes(payload.get("quotes"), formatted, require_quotes, is_final)
         explanation = str(payload.get("explanation") or "")
-        if not explanation and grade_type != "freeform":
-            raise InvalidGradeResponse("missing explanation")
+        if not explanation:
+            # An empty explanation is schema-valid; never discard an otherwise-valid
+            # grade over a cosmetic field. Synthesize a deterministic placeholder,
+            # preferring the first surviving quote text when available.
+            if quotes and quotes[0].text:
+                explanation = f"Grade: {grade}. Supporting quote: {quotes[0].text}"
+            else:
+                explanation = f"Grade: {grade}. (No explanation provided by grader.)"
         return GradeResult(
             grade=grade,
             grade_type=grade_type,
@@ -971,7 +1198,14 @@ Call submit_grade with grade_type=\"{grade_type}\".{retry_note}"""
     ) -> GradeResult:
         formatted = _format_target_conversation(messages)
         previous_error: Optional[str] = "previous response omitted required quotes" if is_quote_retry else None
+        model_name = self._router_model_name()
         for attempt in range(1, self.max_attempts + 1):
+            if attempt > 1:
+                print(
+                    f"[ModelRouterGrader]{_grading_log_context_note()} retrying provider={self.router_provider} model={model_name} "
+                    f"attempt={attempt}/{self.max_attempts} require_quotes={require_quotes} "
+                    f"reason={_log_excerpt(previous_error)}"
+                )
             payload = self._build_payload(
                 formatted,
                 metric_prompt,
@@ -980,14 +1214,47 @@ Call submit_grade with grade_type=\"{grade_type}\".{retry_note}"""
                 attempt,
                 previous_error,
             )
+            is_final = attempt >= self.max_attempts
             try:
                 step_data = await self._post_step(payload)
-                return self._parse_step_result(step_data, formatted, grade_type, require_quotes)
+                try:
+                    result = self._parse_step_result(
+                        step_data, formatted, grade_type, require_quotes, is_final
+                    )
+                except InvalidGradeResponse as e:
+                    self._log_grader_output(step_data, str(e))
+                    raise
+                if attempt > 1:
+                    print(
+                        f"[ModelRouterGrader]{_grading_log_context_note()} success after retry provider={self.router_provider} "
+                        f"model={model_name} attempts_used={attempt}/{self.max_attempts} "
+                        f"quotes={len(result.quotes)} grade_type={result.grade_type}"
+                    )
+                return result
             except (RetryableModelRouterError, InvalidGradeResponse) as e:
                 previous_error = str(e)
+                error_type = type(e).__name__
                 if attempt >= self.max_attempts:
+                    print(
+                        f"[ModelRouterGrader]{_grading_log_context_note()} failed provider={self.router_provider} model={model_name} "
+                        f"attempts={attempt}/{self.max_attempts} error_type={error_type} "
+                        f"error={_log_excerpt(previous_error)}"
+                    )
                     raise
-                await asyncio.sleep(self._retry_delay(attempt, e))
+                # Backoff only helps transient/transport errors. Application-side
+                # rejections (InvalidGradeResponse) gain nothing from waiting, so
+                # retry immediately.
+                if isinstance(e, RetryableModelRouterError):
+                    delay = self._retry_delay(attempt, e)
+                else:
+                    delay = 0.0
+                print(
+                    f"[ModelRouterGrader]{_grading_log_context_note()} retry scheduled provider={self.router_provider} model={model_name} "
+                    f"attempt={attempt}/{self.max_attempts} error_type={error_type} "
+                    f"error={_log_excerpt(previous_error)} next_delay={delay:.2f}s"
+                )
+                if delay > 0:
+                    await asyncio.sleep(delay)
         raise InvalidGradeResponse("grading failed without a result")
 
 
@@ -1239,6 +1506,7 @@ def get_provider(
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
     top_p: Optional[float] = None,
+    reasoning_effort: Optional[str] = None,
 ) -> LLMProvider:
     """Factory function to get the appropriate LLM provider."""
     providers = {
@@ -1258,6 +1526,7 @@ def get_provider(
         temperature=temperature,
         max_tokens=max_tokens,
         top_p=top_p,
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -1271,6 +1540,7 @@ def get_grading_provider(
     router_url: Optional[str] = None,
     router_provider: Optional[str] = None,
     max_attempts: Optional[int] = None,
+    reasoning_effort: Optional[str] = None,
 ) -> LLMProvider:
     """Factory for grading.
 
@@ -1286,6 +1556,7 @@ def get_grading_provider(
             temperature=temperature,
             max_tokens=max_tokens,
             top_p=top_p,
+            reasoning_effort=reasoning_effort,
         )
 
     supported = {"openai", "anthropic", "google", "openrouter", "model_router", "litellm", "rl_late", "tinker"}
@@ -1300,6 +1571,7 @@ def get_grading_provider(
         router_url=router_url,
         router_provider=router_provider,
         max_attempts=max_attempts,
+        reasoning_effort=reasoning_effort,
         temperature=temperature,
         max_tokens=max_tokens,
         top_p=top_p,

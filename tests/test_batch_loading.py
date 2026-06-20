@@ -258,6 +258,48 @@ class TestBatchEndpoint:
         assert data["samples"][1]["attributes"]["source_file"] == f2
         await client.aclose()
 
+    @pytest.mark.asyncio
+    async def test_batch_endpoint_rejects_duplicate_files(self, app_no_auth, tmp_path, patch_project_root):
+        f1 = self._make_file(tmp_path, "a.jsonl", [self._make_sample("Q1")])
+
+        client = await app_no_auth()
+        resp = await client.post("/api/samples/batch", json={"files": [f1, f1]})
+
+        assert resp.status_code == 400
+        assert "duplicate" in resp.json()["detail"].lower()
+        await client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_batch_endpoint_enforces_local_aggregate_cap(self, app_no_auth, tmp_path, patch_project_root, monkeypatch):
+        import backend.main as main_module
+
+        monkeypatch.setattr(main_module, "_BATCH_MAX_AGGREGATE_BYTES", 1)
+        f1 = self._make_file(tmp_path, "a.jsonl", [self._make_sample("Q1")])
+
+        client = await app_no_auth()
+        resp = await client.post("/api/samples/batch", json={"files": [f1]})
+
+        assert resp.status_code == 413
+        assert "too large" in resp.json()["detail"].lower()
+        await client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_batch_endpoint_enforces_sample_cap(self, app_no_auth, tmp_path, patch_project_root, monkeypatch):
+        import backend.main as main_module
+
+        monkeypatch.setattr(main_module, "_BATCH_MAX_SAMPLES", 1)
+        f1 = self._make_file(tmp_path, "a.jsonl", [
+            self._make_sample("Q1"),
+            self._make_sample("Q2"),
+        ])
+
+        client = await app_no_auth()
+        resp = await client.post("/api/samples/batch", json={"files": [f1]})
+
+        assert resp.status_code == 400
+        assert "too many samples" in resp.json()["detail"].lower()
+        await client.aclose()
+
 
 class TestBatchConcurrency:
     """Tests for concurrent S3 loading in batch."""

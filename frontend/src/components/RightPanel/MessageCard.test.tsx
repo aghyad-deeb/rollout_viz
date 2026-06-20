@@ -272,6 +272,27 @@ describe('MessageCard', () => {
     expect(container.querySelector('[data-block-kind="content"] mark.grade-quote-mark')).toBeNull();
   });
 
+  it('highlights legacy text quotes inside rendered Harmony reasoning blocks', () => {
+    const { container } = render(<MessageCard {...defaultProps}
+      message={{
+        role: 'assistant',
+        content: '<|channel|>analysis<|message|>We need to adapt to pass their asserts.<|end|><|start|>assistant<|channel|>final<|message|>Done<|return|>',
+      }}
+      gradeQuotes={[{
+        message_index: 0,
+        channel: 'text',
+        start: 0,
+        end: 39,
+        text: 'We need to adapt to pass their asserts.',
+      }]}
+    />);
+
+    const reasoningBlock = container.querySelector('[data-block-kind="reasoning"]');
+    const mark = reasoningBlock?.querySelector('mark.grade-quote-mark');
+    expect(mark).not.toBeNull();
+    expect(mark!.textContent).toBe('We need to adapt to pass their asserts.');
+  });
+
   it('applies tool_call quote channels to structured tool-call text', () => {
     const { container } = render(<MessageCard {...defaultProps}
       message={{

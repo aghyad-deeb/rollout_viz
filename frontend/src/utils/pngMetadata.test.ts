@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { addPngTextChunk, readPngTextChunks, crc32, blobToBytes } from './pngMetadata';
+import { addPngTextChunk, readPngTextChunks, stripPngTextChunks, crc32, blobToBytes } from './pngMetadata';
 
 // A minimal byte sequence the chunk-walker accepts: the 8-byte PNG
 // signature followed by a zero-length IEND chunk. addPngTextChunk /
@@ -39,6 +39,26 @@ describe('pngMetadata', () => {
     png = await addPngTextChunk(png, 'b', 'second');
     const chunks = await readPngTextChunks(png);
     expect(chunks).toEqual({ a: 'first', b: 'second' });
+  });
+
+  it('strips only selected text metadata chunks', async () => {
+    let png = makeMinimalPng();
+    png = await addPngTextChunk(png, 'rollout-viz', 'hidden source path');
+    png = await addPngTextChunk(png, 'note', 'keep me');
+
+    const stripped = await stripPngTextChunks(png, ['rollout-viz']);
+
+    expect(await readPngTextChunks(stripped)).toEqual({ note: 'keep me' });
+  });
+
+  it('strips all text metadata chunks when no keyword list is supplied', async () => {
+    let png = makeMinimalPng();
+    png = await addPngTextChunk(png, 'rollout-viz', 'hidden source path');
+    png = await addPngTextChunk(png, 'note', 'drop me too');
+
+    const stripped = await stripPngTextChunks(png);
+
+    expect(await readPngTextChunks(stripped)).toEqual({});
   });
 
   it('inserts the new chunk before IEND, keeping IEND last', async () => {

@@ -2,7 +2,7 @@ import { useState, useMemo, useRef, useEffect, useLayoutEffect, memo, Fragment }
 import type { Message, ToolCall, SearchCondition, SearchField, Quote, EphemeralHighlight, CollapsedRegion, RegionLocator } from '../../types';
 import { normalizeAssistantMessage, fieldAppliesToContent, fieldAppliesToReasoning, formatMessageText } from '../../utils/parseContent';
 import { findAllMatches, findAllMatchesCI } from '../../utils/textMatch';
-import { PUBLIC_BASE_URL } from '../../config';
+import { buildPublicUrl } from '../../config';
 import { ElisionPill } from './ElisionPill';
 
 interface MessageCardProps {
@@ -486,6 +486,7 @@ function MessageCardInner({
   const highlightSearchAndUrl = useMemo(() => {
     const quoteAppliesToRenderedBlock = (
       quote: Quote,
+      text: string,
       isReasoningBlock: boolean,
       blockKind?: RenderBlockKind,
     ): boolean => {
@@ -497,7 +498,14 @@ function MessageCardInner({
       if (channel === 'tool_result') {
         return message.role === 'tool' && blockKind === 'content';
       }
-      return !isReasoningBlock && blockKind !== 'tool';
+
+      const appliesToTextBlock = !isReasoningBlock && blockKind !== 'tool';
+      if (appliesToTextBlock) return true;
+
+      // Older grader runs labeled raw Harmony analysis content as channel=text.
+      // The UI parser renders that same text in the reasoning block, so allow
+      // an exact text match there instead of hiding an otherwise valid quote.
+      return blockKind === 'reasoning' && findAllMatches(text, quote.text).length > 0;
     };
 
     return (
@@ -556,7 +564,7 @@ function MessageCardInner({
       }
 
       const quotesForThisMessage = gradeQuotes.filter(q =>
-        q.message_index === index && quoteAppliesToRenderedBlock(q, isReasoning, blockKind)
+        q.message_index === index && quoteAppliesToRenderedBlock(q, text, isReasoning, blockKind)
       );
       for (const quote of quotesForThisMessage) {
         for (const m of findAllMatches(text, quote.text)) {
@@ -917,7 +925,7 @@ function MessageCardInner({
       }
       if (token) {
         const params = new URLSearchParams({ share: token, message: index.toString() });
-        const url = `${PUBLIC_BASE_URL}/?${params.toString()}`;
+        const url = buildPublicUrl(params);
         navigator.clipboard.writeText(url);
         setSharedMsg(true);
         setTimeout(() => setSharedMsg(false), 2000);
@@ -1290,7 +1298,7 @@ function MessageCardInner({
                       message: index.toString(),
                       highlight: selectionPopup.text,
                     });
-                    navigator.clipboard.writeText(`${PUBLIC_BASE_URL}/?${params.toString()}`);
+                    navigator.clipboard.writeText(buildPublicUrl(params));
                     setCopiedSelection(true);
                     setTimeout(() => {
                       setCopiedSelection(false);

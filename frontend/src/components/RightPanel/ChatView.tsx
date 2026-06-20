@@ -7,10 +7,10 @@ import { countMessageOccurrences, buildSearchCorpus } from '../../utils/parseCon
 import { findAllMatchesCI } from '../../utils/textMatch';
 import { extractHighlightAnchor } from '../../utils/textSnippet';
 import { captureCardToPng, copyImageToClipboard, downloadBlob, FONT_SIZE_PRESETS } from '../../utils/captureImage';
-import { addPngTextChunk, readPngTextChunks } from '../../utils/pngMetadata';
+import { readPngTextChunks, stripPngTextChunks } from '../../utils/pngMetadata';
 import { applyPresentationDraft, type PresentationMessageDrafts } from '../../utils/presentationDraft';
 import { CapturePreviewModal } from './CapturePreviewModal';
-import { PUBLIC_BASE_URL } from '../../config';
+import { buildPublicUrl, safeSameOriginRolloutUrl } from '../../config';
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -305,28 +305,8 @@ export function ChatView({
   // Resolve the chosen font-size preset to a numeric multiplier.
   const fontScale = FONT_SIZE_PRESETS.find((p) => p.id === fontSize)?.scale ?? 1;
 
-  // The deep-link JSON embedded as hidden PNG metadata — lets an exported
-  // image be dropped back onto the chat to revisit its source rollout.
-  const buildLinkMeta = useCallback((messageIndex: number) => {
-    const url = generateLink({
-      file: filePath,
-      rollout: sample.attributes.rollout_n,
-      step: sample.attributes.step,
-      index: selectedIndexInFile,
-      message: messageIndex,
-    });
-    return JSON.stringify({
-      url,
-      file: filePath,
-      rollout: sample.attributes.rollout_n,
-      step: sample.attributes.step,
-      message: messageIndex,
-    });
-  }, [generateLink, filePath, sample.attributes, selectedIndexInFile]);
-
-  // Render a message card to a PNG with a deep link embedded as hidden
-  // metadata; returns it with a provenance caption. Shared by the
-  // capture-to-clipboard and the preview paths.
+  // Render a message card to a PNG. We strip rollout-viz text metadata from
+  // new exports so shared captures do not carry hidden source paths or origins.
   //
   // `flushSync` commits the off-screen portal card for `messageIndex` (in
   // the image theme) synchronously, so the capture clones the right card
@@ -337,12 +317,12 @@ export function ChatView({
     const cardEl = captureHost.firstElementChild as HTMLElement | null;
     if (!cardEl) throw new Error('capture card is not mounted');
     const rawPng = await captureCardToPng(cardEl, { exportWidth, imageTheme, fontScale });
-    const png = await addPngTextChunk(rawPng, 'rollout-viz', buildLinkMeta(messageIndex));
+    const png = await stripPngTextChunks(rawPng, ['rollout-viz']);
     const caption =
       `${sample.attributes.experiment_name} · rollout ${sample.attributes.rollout_n}` +
       ` · step ${sample.attributes.step}`;
     return { png, caption };
-  }, [captureHost, exportWidth, imageTheme, fontScale, buildLinkMeta, sample.attributes, setActivePresentationIndex]);
+  }, [captureHost, exportWidth, imageTheme, fontScale, sample.attributes, setActivePresentationIndex]);
 
   // P / camera button: capture straight to the clipboard.
   const captureMessage = useCallback(async (messageIndex: number) => {
@@ -386,7 +366,7 @@ export function ChatView({
       if (!cardEl) return;
       try {
         const raw = await captureCardToPng(cardEl, { exportWidth, imageTheme, fontScale });
-        const blob = await addPngTextChunk(raw, 'rollout-viz', buildLinkMeta(activeIndex));
+        const blob = await stripPngTextChunks(raw, ['rollout-viz']);
         if (cancelled) return;
         const url = URL.createObjectURL(blob);
         if (leftPreviewUrlRef.current) URL.revokeObjectURL(leftPreviewUrlRef.current);
@@ -395,7 +375,7 @@ export function ChatView({
       } catch { /* best-effort — leave the last preview in place */ }
     }, 380);
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [isPresentationMode, activeIndex, displayedMessages, collapsedRegions, ephemeralHighlights, wrappedToolCalls, exportWidth, imageTheme, fontScale, onPresentationPreview, captureHost, buildLinkMeta]);
+  }, [isPresentationMode, activeIndex, displayedMessages, collapsedRegions, ephemeralHighlights, wrappedToolCalls, exportWidth, imageTheme, fontScale, onPresentationPreview, captureHost]);
 
   // Free the left-panel preview URL on unmount.
   useEffect(() => () => {
@@ -413,7 +393,8 @@ export function ChatView({
       const raw = chunks['rollout-viz'];
       if (!raw) return;
       const meta = JSON.parse(raw) as { url?: string };
-      if (meta.url) window.location.href = meta.url;
+      const safeUrl = meta.url ? safeSameOriginRolloutUrl(meta.url) : null;
+      if (safeUrl) window.location.href = safeUrl;
     } catch { /* not one of our exports — ignore */ }
   }, []);
 
@@ -580,7 +561,7 @@ export function ChatView({
       let url: string;
       if (shareToken) {
         const p = new URLSearchParams({ share: shareToken, message: msgIndex.toString(), highlight: anchorText });
-        url = `${PUBLIC_BASE_URL}/?${p.toString()}`;
+        url = buildPublicUrl(p);
       } else {
         url = generateLink({ file: filePath, rollout: sample.attributes.rollout_n, step: sample.attributes.step, message: msgIndex, highlight: anchorText });
       }

@@ -32,4 +32,13 @@ Thumbs.db
 # Logs
 *.log
 npm-debug.log*
+logs/
+
+# Local runtime / tooling artifacts (not committed)
+.vite/
+.supervisor.pid
+.supervisor.backend.pid
+frontend/test-results/
+.playwright-mcp/
+.claude/settings.local.json
 

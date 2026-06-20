@@ -7,6 +7,7 @@ import type {
   PresetMetric, 
   LLMProvider,
   Sample,
+  GradingReasoningEffort,
 } from '../types';
 
 type GradingStatus = 'idle' | 'connecting' | 'grading' | 'saving' | 'complete' | 'error' | 'cancelled';
@@ -145,6 +146,7 @@ export function useGrading(enabled = true) {
     advancedSettings?: {
       temperature?: number;
       maxTokens?: number;
+      reasoningEffort?: GradingReasoningEffort;
       topP?: number;
     },
     quoteSettings?: {
@@ -212,11 +214,12 @@ export function useGrading(enabled = true) {
         ...(apiKey ? { api_key: apiKey } : {}),
         parallel_size: parallelSize,
         // Quote settings
-        require_quotes: quoteSettings?.requireQuotes ?? false,
+        require_quotes: quoteSettings?.requireQuotes ?? true,
         max_quote_retries: quoteSettings?.maxQuoteRetries ?? 2,
         // Advanced settings
         ...(advancedSettings?.temperature !== undefined ? { temperature: advancedSettings.temperature } : {}),
         ...(advancedSettings?.maxTokens !== undefined ? { max_tokens: advancedSettings.maxTokens } : {}),
+        ...(advancedSettings?.reasoningEffort !== undefined ? { reasoning_effort: advancedSettings.reasoningEffort } : {}),
         ...(advancedSettings?.topP !== undefined ? { top_p: advancedSettings.topP } : {}),
       };
 
@@ -450,6 +453,7 @@ export function useGrading(enabled = true) {
     advancedSettings?: {
       temperature?: number;
       maxTokens?: number;
+      reasoningEffort?: GradingReasoningEffort;
       topP?: number;
     },
     quoteSettings?: {
@@ -533,9 +537,10 @@ export function useGrading(enabled = true) {
     description: string,
     gradeType: 'float' | 'int' | 'bool' | 'freeform',
     prompt: string,
+    keyOverride?: string,
   ): Promise<boolean> => {
     try {
-      const key = name.toLowerCase().replace(/\s+/g, '_');
+      const key = keyOverride ?? name.toLowerCase().replace(/\s+/g, '_');
       const response = await fetch('/api/save-custom-metric', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

@@ -7,6 +7,7 @@ Provides REST API endpoints for loading JSONL data from local files or S3.
 import asyncio
 import copy
 import gzip
+import ipaddress
 import json
 import os
 import re
@@ -34,8 +35,11 @@ from starlette.middleware.gzip import GZipMiddleware
 from backend.llm_providers import (
     get_grading_provider,
     GradeResult,
+    InvalidGradeResponse,
     Quote as LLMQuote,
     PRESET_METRICS,
+    reset_grading_log_context,
+    set_grading_log_context,
 )
 
 # Backward-compatible patch point for tests and local scripts that mocked
@@ -100,6 +104,25 @@ API_KEY_ENV_VARS = {
 }
 
 
+def _config_int(name: str, default: int, *, minimum: int = 1) -> int:
+    raw = os.getenv(name) or _env_config.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        print(f"[CONFIG] WARNING: invalid integer for {name}; using {default}")
+        return default
+    return max(minimum, value)
+
+
+def _config_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name) or _env_config.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def get_env_api_key(provider: str) -> Optional[str]:
     """Get API key from ~/.env for a provider (ignores shell environment)."""
     for env_var in API_KEY_ENV_VARS.get(provider.lower(), ()):
@@ -118,13 +141,39 @@ VIZ_ALLOWED_S3_BUCKETS: Optional[set] = (
 _cors_origins_raw = _env_config.get("VIZ_CORS_ORIGINS", "")
 VIZ_CORS_ORIGINS = [origin.strip() for origin in _cors_origins_raw.split(",") if origin.strip()]
 
+
+TrustedProxyNetwork = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
+
+
+def _parse_trusted_proxy_networks(raw: str) -> List[TrustedProxyNetwork]:
+    networks: List[TrustedProxyNetwork] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            print(f"[CONFIG] WARNING: invalid VIZ_TRUSTED_PROXIES entry: {item}")
+    return networks
+
+
+_trusted_proxies_raw = os.getenv("VIZ_TRUSTED_PROXIES") or _env_config.get("VIZ_TRUSTED_PROXIES", "")
+VIZ_TRUSTED_PROXY_NETWORKS = _parse_trusted_proxy_networks(_trusted_proxies_raw)
+
 # Max JSONL file size to load (prevents OOM). Default 500 MB.
 MAX_FILE_SIZE = int(_env_config.get("VIZ_MAX_FILE_SIZE_MB", "500")) * 1024 * 1024
+_BATCH_MAX_FILES = _config_int("VIZ_BATCH_MAX_FILES", 50)
+_BATCH_MAX_AGGREGATE_BYTES = _config_int("VIZ_BATCH_MAX_AGGREGATE_MB", 500) * 1024 * 1024
+_BATCH_MAX_SAMPLES = _config_int("VIZ_BATCH_MAX_SAMPLES", 50_000)
+_BATCH_MAX_RESPONSE_BYTES = _config_int("VIZ_BATCH_MAX_RESPONSE_MB", 200) * 1024 * 1024
 
 
 def _validate_s3_bucket(bucket: str) -> None:
-    """Raise ValueError if the bucket is not in the allowlist (when configured)."""
-    if VIZ_ALLOWED_S3_BUCKETS is not None and bucket not in VIZ_ALLOWED_S3_BUCKETS:
+    """Raise ValueError if S3 access is not explicitly scoped to this bucket."""
+    if VIZ_ALLOWED_S3_BUCKETS is None:
+        raise ValueError("S3 bucket allowlist not configured; set VIZ_ALLOWED_S3_BUCKETS")
+    if bucket not in VIZ_ALLOWED_S3_BUCKETS:
         raise ValueError(f"S3 bucket not allowed: {bucket}")
 
 
@@ -190,6 +239,8 @@ _raw_password = _env_config.get("VIZ_PASSWORD")
 if _raw_password is not None and _raw_password == "":
     print("[AUTH] WARNING: VIZ_PASSWORD is set to empty string — treating as unset (no auth)")
     _raw_password = None
+if _config_bool("VIZ_REQUIRE_AUTH") and not _raw_password:
+    raise RuntimeError("VIZ_REQUIRE_AUTH=1 requires VIZ_PASSWORD")
 VIZ_PASSWORD = _raw_password
 SECRET_KEY = _env_config.get("VIZ_SECRET_KEY", secrets.token_hex(32))
 cookie_serializer = URLSafeTimedSerializer(SECRET_KEY)
@@ -236,6 +287,89 @@ def _record_failed_attempt(client_ip: str):
 
 def _clear_attempts(client_ip: str):
     _login_attempts.pop(client_ip, None)
+
+
+_abuse_rate_limits: Dict[str, Dict[str, List[float]]] = {}
+
+
+def _is_trusted_proxy(host: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return any(ip in network for network in VIZ_TRUSTED_PROXY_NETWORKS)
+
+
+def _request_client_key(request: Request) -> str:
+    peer = request.client.host if request.client else "unknown"
+    if not _is_trusted_proxy(peer):
+        return peer
+
+    forwarded_for = request.headers.get("x-forwarded-for", "")
+    chain = [part.strip() for part in forwarded_for.split(",") if part.strip()]
+    # Walk from the proxy nearest this app toward the original client and use
+    # the first non-trusted IP. This resists client-supplied spoof prefixes
+    # preserved by an upstream trusted proxy.
+    for candidate in reversed(chain):
+        try:
+            ipaddress.ip_address(candidate)
+        except ValueError:
+            continue
+        if not _is_trusted_proxy(candidate):
+            return candidate
+    return peer
+
+
+def _enforce_window_rate_limit(
+    bucket_name: str,
+    request: Request,
+    *,
+    max_requests: int,
+    window_seconds: int,
+) -> None:
+    now = time.time()
+    cutoff = now - window_seconds
+    bucket = _abuse_rate_limits.setdefault(bucket_name, {})
+    if len(bucket) > 10_000:
+        for key, times in list(bucket.items()):
+            if not times or max(times) < cutoff:
+                del bucket[key]
+
+    key = _request_client_key(request)
+    attempts = [t for t in bucket.get(key, []) if t >= cutoff]
+    if len(attempts) >= max_requests:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests. Try again shortly.",
+            headers={"Retry-After": str(window_seconds)},
+        )
+    attempts.append(now)
+    bucket[key] = attempts
+
+
+def _clear_abuse_rate_limits():
+    _abuse_rate_limits.clear()
+
+
+def _can_use_server_api_keys(request: Request) -> bool:
+    return bool(VIZ_PASSWORD) and getattr(request.state, "access_level", None) == "full"
+
+
+def _resolve_llm_api_key(provider: str, provided_key: Optional[str], request: Request) -> str:
+    if provided_key:
+        if len(provided_key) > 500:
+            raise HTTPException(status_code=400, detail="API key too long")
+        return provided_key
+
+    env_key = get_env_api_key(provider)
+    if env_key and not _can_use_server_api_keys(request):
+        raise HTTPException(
+            status_code=403,
+            detail="Server API keys require an authenticated password session",
+        )
+    if env_key:
+        return env_key
+    raise HTTPException(status_code=400, detail=f"No API key provided for {provider}")
 
 
 @app.middleware("http")
@@ -382,7 +516,7 @@ if not _env_config.get("VIZ_SECRET_KEY"):
     print(f"[AUTH] WARNING: VIZ_SECRET_KEY not set — sessions and share links will not survive restarts")
 
 if VIZ_ALLOWED_S3_BUCKETS is None and any(k.startswith("AWS_") for k in _env_config):
-    print(f"[SECURITY] WARNING: VIZ_ALLOWED_S3_BUCKETS not set — all S3 buckets accessible to configured AWS credentials")
+    print("[SECURITY] WARNING: VIZ_ALLOWED_S3_BUCKETS not set — S3 browsing is disabled until a bucket allowlist is configured")
 
 
 class CreateShareRequest(BaseModel):
@@ -498,32 +632,41 @@ class GradeEntry(BaseModel):
     timestamp: str
 
 
-_GRADE_MAX_SAMPLES = 10_000
-_GRADE_MAX_PROMPT_LEN = 50_000
-_GLOBAL_GRADING_SEM = asyncio.Semaphore(500)
+_GRADE_MAX_SAMPLES = _config_int("VIZ_GRADE_MAX_SAMPLES", 10_000)
+_GRADE_MAX_PROMPT_LEN = _config_int("VIZ_GRADE_MAX_PROMPT_LEN", 10_000)
+_GRADE_MAX_PARALLEL = _config_int("VIZ_GRADE_MAX_PARALLEL", 25)
+_GRADE_MAX_TOKENS = _config_int("VIZ_GRADE_MAX_TOKENS", 128_000)
+_GRADE_DEFAULT_MAX_TOKENS = max(1, min(_config_int("VIZ_GRADE_DEFAULT_MAX_TOKENS", 32_768), _GRADE_MAX_TOKENS))
+_GRADE_MAX_ATTEMPTS = _config_int("VIZ_GRADE_MAX_ATTEMPTS", 5)
+_GRADE_MAX_QUOTE_RETRIES = _config_int("VIZ_GRADE_MAX_QUOTE_RETRIES", 2, minimum=0)
+_GRADE_RATE_LIMIT_MAX = _config_int("VIZ_GRADE_RATE_LIMIT_MAX", 20)
+_GRADE_RATE_LIMIT_WINDOW = _config_int("VIZ_GRADE_RATE_LIMIT_WINDOW_SECONDS", 60)
+_GLOBAL_GRADING_SEM = asyncio.Semaphore(_config_int("VIZ_GRADE_GLOBAL_CONCURRENCY", 50))
 
 class GradeRequest(BaseModel):
     """Request to grade samples."""
     file_path: str
-    sample_ids: List[int]  # Which samples to grade (max 10k per request)
+    sample_ids: List[int]  # Which samples to grade
     metric_name: str
-    metric_prompt: str  # The grading prompt (max 50k chars)
+    metric_prompt: str  # The grading prompt
     grade_type: str  # "float", "int", "bool", "freeform"
     provider: str  # "openai", "anthropic", "google", "openrouter"
     model: str  # e.g., "gpt-4o", "claude-3-opus"
     router_provider: Optional[str] = None  # model_router provider: "litellm", "rl_late", or "tinker"
     max_attempts: Optional[int] = None  # Model-router grader attempts per sample
-    api_key: Optional[str] = None  # Optional - will use .env if not provided (max 500 chars)
-    parallel_size: int = 100  # Number of concurrent requests
+    api_key: Optional[str] = None  # Optional; authenticated sessions can use .env if omitted
+    parallel_size: int = 10  # Number of concurrent requests
     require_quotes: bool = True  # Whether to require quotes from the model
-    max_quote_retries: int = 2  # Max retries if quotes are required but missing (capped at 5)
+    max_quote_retries: int = 2  # Max retries if quotes are required but missing
     # Advanced settings
     temperature: Optional[float] = None  # 0.0 - 2.0, None = model default
     max_tokens: Optional[int] = None  # Max output tokens
+    reasoning_effort: Optional[str] = None  # "low", "medium", or "high"; None = provider default
     top_p: Optional[float] = None  # 0.0 - 1.0
 
 
 _GRADING_PROVIDERS = {"openai", "anthropic", "google", "openrouter"}
+_GRADING_REASONING_EFFORTS = {"low", "medium", "high"}
 _ROUTER_PROVIDERS = {"litellm", "rl_late", "tinker"}
 
 
@@ -564,6 +707,62 @@ def _prepare_grading_route(provider: str, model: str, router_provider: Optional[
     return normalized_provider, normalized_router
 
 
+def _prepare_grade_request(request: GradeRequest) -> None:
+    request.sample_ids = list(dict.fromkeys(request.sample_ids))
+    request.max_quote_retries = max(0, min(request.max_quote_retries, _GRADE_MAX_QUOTE_RETRIES))
+    request.parallel_size = max(1, min(request.parallel_size, _GRADE_MAX_PARALLEL))
+    request.max_tokens = _GRADE_DEFAULT_MAX_TOKENS if request.max_tokens is None else max(1, min(request.max_tokens, _GRADE_MAX_TOKENS))
+    if request.temperature is not None:
+        request.temperature = max(0.0, min(request.temperature, 2.0))
+    if request.top_p is not None:
+        request.top_p = max(0.0, min(request.top_p, 1.0))
+    if request.reasoning_effort is not None:
+        request.reasoning_effort = request.reasoning_effort.lower().strip()
+        if request.reasoning_effort not in _GRADING_REASONING_EFFORTS:
+            raise HTTPException(status_code=400, detail="reasoning_effort must be low, medium, or high")
+    request.provider, request.router_provider = _prepare_grading_route(
+        request.provider, request.model, request.router_provider
+    )
+    if request.max_attempts is None:
+        # The provider's attempt loop owns transport/tool-call/transient retries
+        # with the full budget; do not starve it when require_quotes is True.
+        request.max_attempts = _GRADE_MAX_ATTEMPTS
+    request.max_attempts = max(1, min(request.max_attempts, _GRADE_MAX_ATTEMPTS))
+    if len(request.sample_ids) > _GRADE_MAX_SAMPLES:
+        raise HTTPException(status_code=400, detail=f"Too many samples (max {_GRADE_MAX_SAMPLES})")
+    if len(request.metric_prompt) > _GRADE_MAX_PROMPT_LEN:
+        raise HTTPException(status_code=400, detail=f"Prompt too long (max {_GRADE_MAX_PROMPT_LEN} chars)")
+
+
+def _has_supporting_quotes(result: Optional[GradeResult]) -> bool:
+    return bool(result and result.quotes)
+
+
+def _missing_required_quotes_error(max_attempts: int) -> str:
+    attempt_word = "attempt" if max_attempts == 1 else "attempts"
+    return f"Missing required quotes after {max_attempts} grading {attempt_word}; no grade was saved"
+
+
+def _grade_log_prefix(endpoint: str) -> str:
+    return f"[{endpoint} Grading:{secrets.token_hex(4)}]"
+
+
+def _log_grading_start(prefix: str, request: GradeRequest, *, actual_path: Optional[str] = None) -> None:
+    path_note = f", file={actual_path}" if actual_path else ""
+    print(
+        f"{prefix} start samples={len(request.sample_ids)} provider={request.provider} "
+        f"router_provider={request.router_provider} model={request.model} "
+        f"require_quotes={request.require_quotes} provider_attempts={request.max_attempts} "
+        f"max_tokens={request.max_tokens} reasoning_effort={request.reasoning_effort or 'auto'} "
+        f"quote_retries_requested={request.max_quote_retries} parallel_size={request.parallel_size}{path_note}"
+    )
+    if request.require_quotes:
+        print(
+            f"{prefix} retry plan: backend_attempts=1; provider owns quote/tool-call retries "
+            f"up to provider_attempts={request.max_attempts}"
+        )
+
+
 class GradeResponse(BaseModel):
     """Response from grading operation."""
     graded_count: int
@@ -581,6 +780,33 @@ class BatchSamplesRequest(BaseModel):
     """Request to load samples from multiple files in one request."""
     files: List[str]  # max 50 files per request
     metadata_only: bool = False
+
+
+def _prepare_batch_files(files: List[str]) -> List[str]:
+    if len(files) > _BATCH_MAX_FILES:
+        raise HTTPException(status_code=400, detail=f"Too many files (max {_BATCH_MAX_FILES})")
+
+    seen = set()
+    total_local_size = 0
+    prepared: List[str] = []
+    for file_path in files:
+        if file_path in seen:
+            raise ValueError(f"Duplicate file in batch: {file_path}")
+        seen.add(file_path)
+        prepared.append(file_path)
+
+        if file_path.startswith("s3://"):
+            continue
+        resolved = _safe_resolve_path(file_path)
+        if resolved.exists() and resolved.is_file():
+            total_local_size += resolved.stat().st_size
+            if total_local_size > _BATCH_MAX_AGGREGATE_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Batch files too large (max {_BATCH_MAX_AGGREGATE_BYTES // (1024 * 1024)}MB)",
+                )
+
+    return prepared
 
 
 class PresetMetricInfo(BaseModel):
@@ -926,6 +1152,10 @@ async def get_s3_files(
     try:
         files = list_s3_files(bucket, prefix)
         return files
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=_safe_error_detail(e, expose=True))
     except Exception as e:
         raise HTTPException(status_code=500, detail=_safe_error_detail(e))
 
@@ -1173,6 +1403,14 @@ def _load_samples_batch_sync(files: List[str], metadata_only: bool = False) -> d
         with ThreadPoolExecutor(max_workers=min(len(s3_files), 10)) as pool:
             list(pool.map(_get_meta, s3_files))
 
+        total_s3_size = sum(
+            meta.get("size", 0)
+            for meta in s3_meta.values()
+            if meta and not meta.get("cached") and not meta.get("local_path")
+        )
+        if total_s3_size > _BATCH_MAX_AGGREGATE_BYTES:
+            raise ValueError(f"Batch S3 files too large (max {_BATCH_MAX_AGGREGATE_BYTES // (1024 * 1024)}MB)")
+
         # Phase 2: build all Range download tasks across all files (flat list)
         chunk_tasks = []  # (idx, bucket, key, range_start, range_end, chunk_idx)
         cached_results = {}  # idx -> raw_samples
@@ -1323,6 +1561,8 @@ def _load_samples_batch_sync(files: List[str], metadata_only: bool = False) -> d
 
         file_sample_count = 0
         for sample in data["samples"]:
+            if next_id >= _BATCH_MAX_SAMPLES:
+                raise ValueError(f"Too many samples in batch (max {_BATCH_MAX_SAMPLES})")
             s = {**sample, "id": next_id, "attributes": {**sample.get("attributes", {}), "source_file": file_path}}
             combined_samples.append(s)
             next_id += 1
@@ -1350,18 +1590,26 @@ async def get_samples_batch(request: BatchSamplesRequest):
     — for 155 MB payloads, gzip at level 1 adds ~1.4s of CPU that's wasted
     on localhost/proxy traffic.
     """
-    if len(request.files) > 50:
-        raise HTTPException(status_code=400, detail="Too many files (max 50)")
     try:
-        data = await asyncio.to_thread(_load_samples_batch_sync, request.files, request.metadata_only)
+        files = _prepare_batch_files(request.files)
+        data = await asyncio.to_thread(_load_samples_batch_sync, files, request.metadata_only)
         if request.metadata_only:
             return ORJSONResponse(content=data)
         body = orjson.dumps(data)
+        if len(body) > _BATCH_MAX_RESPONSE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Batch response too large (max {_BATCH_MAX_RESPONSE_BYTES // (1024 * 1024)}MB)",
+            )
         return Response(
             content=body,
             media_type="application/json",
             headers={"Content-Encoding": "identity"},
         )
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=_safe_error_detail(e, expose=True))
     except Exception as e:
         raise HTTPException(status_code=500, detail=_safe_error_detail(e))
 
@@ -1671,11 +1919,12 @@ async def delete_custom_metric(key: str):
 
 
 @app.get("/api/available-api-keys")
-async def get_available_api_keys():
+async def get_available_api_keys(request: Request):
     """Check which API keys are available from server environment (.env file)."""
     available = {}
+    reveal_server_keys = _can_use_server_api_keys(request)
     for provider, env_vars in API_KEY_ENV_VARS.items():
-        available[provider] = any(bool(_env_config.get(env_var)) for env_var in env_vars)
+        available[provider] = reveal_server_keys and any(bool(_env_config.get(env_var)) for env_var in env_vars)
     return available
 
 
@@ -1691,31 +1940,31 @@ class TestProviderRequest(BaseModel):
 _test_provider_cache: Dict[tuple, tuple] = {}
 _TEST_PROVIDER_TTL = 300  # 5 minutes
 _TEST_PROVIDER_MAX = 1000
+_TEST_PROVIDER_RATE_LIMIT_MAX = _config_int("VIZ_TEST_PROVIDER_RATE_LIMIT_MAX", 10)
+_TEST_PROVIDER_RATE_LIMIT_WINDOW = _config_int("VIZ_TEST_PROVIDER_RATE_LIMIT_WINDOW_SECONDS", 60)
 
 def _clear_test_provider_cache():
     """Clear the test-provider cache (for tests)."""
     _test_provider_cache.clear()
 
 @app.post("/api/test-provider")
-async def test_provider(request: TestProviderRequest):
+async def test_provider(request: TestProviderRequest, http_request: Request):
     """Test that an LLM provider + model + API key combination works.
 
     Makes a minimal API call to validate the configuration before
     starting a full grading job. Results are cached for 5 minutes.
     """
     try:
+        _enforce_window_rate_limit(
+            "test-provider",
+            http_request,
+            max_requests=_TEST_PROVIDER_RATE_LIMIT_MAX,
+            window_seconds=_TEST_PROVIDER_RATE_LIMIT_WINDOW,
+        )
         provider_name, router_provider = _prepare_grading_route(
             request.provider, request.model, request.router_provider
         )
-        api_key = request.api_key
-        if not api_key:
-            api_key = get_env_api_key(provider_name)
-
-        if not api_key:
-            return JSONResponse(
-                status_code=400,
-                content={"ok": False, "error": f"No API key for {provider_name}"}
-            )
+        api_key = _resolve_llm_api_key(provider_name, request.api_key, http_request)
 
         # Check cache
         import hashlib
@@ -1745,15 +1994,21 @@ async def test_provider(request: TestProviderRequest):
                 grade_type="bool",
                 require_quotes=False,
             )
-        except ValueError:
-            # ValueError = JSON parse error = API responded but format was off.
-            # That's fine — the connection works.
+        except (ValueError, InvalidGradeResponse):
+            # ValueError = legacy JSON parse error; InvalidGradeResponse = router-path
+            # formatting/validation miss. Either way the API responded and the
+            # connection works, so the pre-flight passes.
             pass
         if len(_test_provider_cache) >= _TEST_PROVIDER_MAX:
             oldest = min(_test_provider_cache, key=lambda k: _test_provider_cache[k][0])
             del _test_provider_cache[oldest]
         _test_provider_cache[cache_key] = (now, True)
         return {"ok": True}
+    except HTTPException as e:
+        return JSONResponse(
+            status_code=e.status_code,
+            content={"ok": False, "error": _safe_error_detail(e, expose=True)}
+        )
     except Exception as e:
         return JSONResponse(
             status_code=400,
@@ -1762,39 +2017,18 @@ async def test_provider(request: TestProviderRequest):
 
 
 @app.post("/api/grade", response_model=GradeResponse)
-async def grade_samples(request: GradeRequest):
+async def grade_samples(request: GradeRequest, http_request: Request):
     """Grade samples using an LLM provider."""
-    request.sample_ids = list(dict.fromkeys(request.sample_ids))
-    request.max_quote_retries = min(request.max_quote_retries, 5)
-    request.parallel_size = max(1, min(request.parallel_size, 500))
-    if request.max_tokens is not None:
-        request.max_tokens = min(request.max_tokens, 16384)
-    if request.temperature is not None:
-        request.temperature = max(0.0, min(request.temperature, 2.0))
-    if request.top_p is not None:
-        request.top_p = max(0.0, min(request.top_p, 1.0))
-    if request.api_key and len(request.api_key) > 500:
-        raise HTTPException(status_code=400, detail="API key too long")
-    request.provider, request.router_provider = _prepare_grading_route(
-        request.provider, request.model, request.router_provider
+    _prepare_grade_request(request)
+    _enforce_window_rate_limit(
+        "grade",
+        http_request,
+        max_requests=_GRADE_RATE_LIMIT_MAX,
+        window_seconds=_GRADE_RATE_LIMIT_WINDOW,
     )
-    if request.max_attempts is not None:
-        request.max_attempts = max(1, min(request.max_attempts, 30))
-    if len(request.sample_ids) > _GRADE_MAX_SAMPLES:
-        raise HTTPException(status_code=400, detail=f"Too many samples (max {_GRADE_MAX_SAMPLES})")
-    if len(request.metric_prompt) > _GRADE_MAX_PROMPT_LEN:
-        raise HTTPException(status_code=400, detail=f"Prompt too long (max {_GRADE_MAX_PROMPT_LEN} chars)")
     try:
-        api_key = request.api_key
-        if not api_key:
-            api_key = get_env_api_key(request.provider)
-        
-        if not api_key:
-            raise HTTPException(
-                status_code=400,
-                detail=f"No API key provided for {request.provider}"
-            )
-        
+        api_key = _resolve_llm_api_key(request.provider, request.api_key, http_request)
+
         # Load the samples (check viz/ version first, same as GET /api/samples)
         actual_path = request.file_path
         viz_path = get_viz_path(request.file_path)
@@ -1808,6 +2042,9 @@ async def grade_samples(request: GradeRequest):
         else:
             raw_samples = load_jsonl_from_file(actual_path)
 
+        prefix = _grade_log_prefix("HTTP")
+        _log_grading_start(prefix, request, actual_path=actual_path)
+
         # Get the LLM provider with advanced settings
         provider = get_provider(
             request.provider,
@@ -1819,6 +2056,7 @@ async def grade_samples(request: GradeRequest):
             router_url=MODEL_ROUTER_URL,
             router_provider=request.router_provider,
             max_attempts=request.max_attempts,
+            reasoning_effort=request.reasoning_effort,
         )
 
         # Grade each requested sample
@@ -1833,28 +2071,21 @@ async def grade_samples(request: GradeRequest):
             messages = raw.get('messages', [])
             
             try:
-                result = None
-                max_attempts = (request.max_quote_retries + 1) if request.require_quotes else 1
-                
-                for attempt in range(max_attempts):
-                    # On retry, use stronger language about quotes
-                    is_retry = attempt > 0
-                    
+                context_token = set_grading_log_context({"prefix": prefix, "sample_id": sample_id})
+                try:
                     result = await provider.grade_sample(
                         messages=messages,
                         metric_prompt=request.metric_prompt,
                         grade_type=request.grade_type,
                         require_quotes=request.require_quotes,
-                        is_quote_retry=is_retry,
+                        is_quote_retry=False,
                     )
-                    
-                    # Check if we got quotes when required
-                    if not request.require_quotes or (result.quotes and len(result.quotes) > 0):
-                        break
-                    
-                    # Log retry attempt
-                    print(f"Sample {sample_id}: No quotes received, retrying ({attempt + 1}/{max_attempts})")
-                
+                finally:
+                    reset_grading_log_context(context_token)
+
+                # The provider (grade_sample) is the single source of truth for quote
+                # handling. A returned grade with empty quotes is intentional (the
+                # provider exhausted its quote-retry budget) and must be saved.
                 grade_entry = GradeEntry(
                     grade=result.grade,
                     grade_type=result.grade_type,
@@ -1868,14 +2099,14 @@ async def grade_samples(request: GradeRequest):
             except Exception as e:
                 return sample_id, None, _safe_error_detail(e, expose=True)
         
-        batch_size = min(request.parallel_size, 500)
+        batch_size = min(request.parallel_size, _GRADE_MAX_PARALLEL)
 
         async def _grade_with_global_limit(sid: int):
             async with _GLOBAL_GRADING_SEM:
                 return await grade_one(sid)
 
         total_start = time.time()
-        print(f"[Grading] Starting {len(request.sample_ids)} samples with batch_size={batch_size}")
+        print(f"{prefix} batching batch_size={batch_size}")
         
         for i in range(0, len(request.sample_ids), batch_size):
             batch = request.sample_ids[i:i + batch_size]
@@ -1889,10 +2120,10 @@ async def grade_samples(request: GradeRequest):
                 elif grade_entry:
                     grades[sample_id] = grade_entry
             
-            print(f"[Grading] Batch {i//batch_size + 1}: {len(batch)} samples in {batch_time:.2f}s ({batch_time/len(batch):.2f}s per sample)")
+            print(f"{prefix} batch {i//batch_size + 1}: {len(batch)} samples in {batch_time:.2f}s ({batch_time/len(batch):.2f}s per sample)")
         
         total_time = time.time() - total_start
-        print(f"[Grading] Complete: {len(grades)} graded, {len(errors)} errors in {total_time:.2f}s")
+        print(f"{prefix} complete: {len(grades)} graded, {len(errors)} errors in {total_time:.2f}s")
         
         return GradeResponse(
             graded_count=len(grades),
@@ -1907,44 +2138,26 @@ async def grade_samples(request: GradeRequest):
 
 
 @app.post("/api/grade-stream")
-async def grade_samples_stream(request: GradeRequest):
+async def grade_samples_stream(request: GradeRequest, http_request: Request):
     """Grade samples using an LLM provider with SSE streaming progress."""
-    request.sample_ids = list(dict.fromkeys(request.sample_ids))
-    request.max_quote_retries = min(request.max_quote_retries, 5)
-    request.parallel_size = max(1, min(request.parallel_size, 500))
-    if request.max_tokens is not None:
-        request.max_tokens = min(request.max_tokens, 16384)
-    if request.temperature is not None:
-        request.temperature = max(0.0, min(request.temperature, 2.0))
-    if request.top_p is not None:
-        request.top_p = max(0.0, min(request.top_p, 1.0))
-    if request.api_key and len(request.api_key) > 500:
-        raise HTTPException(status_code=400, detail="API key too long")
-    request.provider, request.router_provider = _prepare_grading_route(
-        request.provider, request.model, request.router_provider
+    _prepare_grade_request(request)
+    _enforce_window_rate_limit(
+        "grade-stream",
+        http_request,
+        max_requests=_GRADE_RATE_LIMIT_MAX,
+        window_seconds=_GRADE_RATE_LIMIT_WINDOW,
     )
-    if request.max_attempts is not None:
-        request.max_attempts = max(1, min(request.max_attempts, 30))
-    if len(request.sample_ids) > _GRADE_MAX_SAMPLES:
-        raise HTTPException(status_code=400, detail=f"Too many samples (max {_GRADE_MAX_SAMPLES})")
-    if len(request.metric_prompt) > _GRADE_MAX_PROMPT_LEN:
-        raise HTTPException(status_code=400, detail=f"Prompt too long (max {_GRADE_MAX_PROMPT_LEN} chars)")
     import time
-    
+
     async def generate_events():
         start_time = time.time()
+        prefix = _grade_log_prefix("SSE")
         try:
-            print(f"[SSE Grading] Starting {len(request.sample_ids)} samples, require_quotes={request.require_quotes}, parallel_size={request.parallel_size}")
+            _log_grading_start(prefix, request)
             
-            # Get API key - use provided key or fall back to environment
-            api_key = request.api_key
-            if not api_key:
-                api_key = get_env_api_key(request.provider)
-            
-            if not api_key:
-                yield f"data: {json.dumps({'type': 'error', 'message': f'No API key for {request.provider}'})}\n\n"
-                return
-            
+            # Get API key - use provided key or authenticated server configuration.
+            api_key = _resolve_llm_api_key(request.provider, request.api_key, http_request)
+
             # Load the samples (check viz/ version first, same as GET /api/samples)
             actual_path = request.file_path
             viz_path = get_viz_path(request.file_path)
@@ -1958,7 +2171,7 @@ async def grade_samples_stream(request: GradeRequest):
             else:
                 raw_samples = await asyncio.to_thread(load_jsonl_from_file, actual_path)
 
-            print(f"[SSE Grading] Loaded {len(raw_samples)} samples from {actual_path}, grading IDs: {request.sample_ids[:5]}{'...' if len(request.sample_ids) > 5 else ''}")
+            print(f"{prefix} loaded {len(raw_samples)} samples from {actual_path}, grading IDs: {request.sample_ids[:5]}{'...' if len(request.sample_ids) > 5 else ''}")
 
             # Get the LLM provider with advanced settings
             provider = get_provider(
@@ -1971,6 +2184,7 @@ async def grade_samples_stream(request: GradeRequest):
                 router_url=MODEL_ROUTER_URL,
                 router_provider=request.router_provider,
                 max_attempts=request.max_attempts,
+                reasoning_effort=request.reasoning_effort,
             )
 
             total_samples = len(request.sample_ids)
@@ -1989,23 +2203,19 @@ async def grade_samples_stream(request: GradeRequest):
                 messages = raw.get('messages', [])
                 
                 try:
-                    result = None
-                    max_attempts = (request.max_quote_retries + 1) if request.require_quotes else 1
-                    
-                    for attempt in range(max_attempts):
-                        is_retry = attempt > 0
-                        
+                    context_token = set_grading_log_context({"prefix": prefix, "sample_id": sample_id})
+                    try:
                         result = await provider.grade_sample(
                             messages=messages,
                             metric_prompt=request.metric_prompt,
                             grade_type=request.grade_type,
                             require_quotes=request.require_quotes,
-                            is_quote_retry=is_retry,
+                            is_quote_retry=False,
                         )
-                        
-                        if not request.require_quotes or (result.quotes and len(result.quotes) > 0):
-                            break
-                    
+                    finally:
+                        reset_grading_log_context(context_token)
+
+                    # Provider owns quote handling; an empty-quote grade is saved.
                     grade_entry = {
                         "grade": result.grade,
                         "grade_type": result.grade_type,
@@ -2019,7 +2229,7 @@ async def grade_samples_stream(request: GradeRequest):
                 except Exception as e:
                     return sample_id, None, _safe_error_detail(e, expose=True)
             
-            batch_size = min(request.parallel_size, 500)
+            batch_size = min(request.parallel_size, _GRADE_MAX_PARALLEL)
             sem = asyncio.Semaphore(batch_size)
 
             async def grade_with_limit(sample_id: int) -> tuple:
@@ -2027,34 +2237,65 @@ async def grade_samples_stream(request: GradeRequest):
                     async with sem:
                         return await grade_one(sample_id)
 
-            tasks = [asyncio.create_task(grade_with_limit(sid)) for sid in request.sample_ids]
-
             last_progress_update = 0
             progress_interval = max(1, total_samples // 20)  # Update ~20 times during grading
 
-            for coro in asyncio.as_completed(tasks):
-                sample_id, grade_entry, error = await coro
-                completed += 1
+            result_queue: asyncio.Queue[tuple[int, Optional[dict], Optional[str]]] = asyncio.Queue()
+            sample_iter = iter(request.sample_ids)
+            sample_iter_lock = asyncio.Lock()
+            worker_count = min(batch_size, total_samples)
 
-                if error:
-                    errors.append({"sample_id": sample_id, "error": error})
-                    print(f"[SSE Grading] Sample {sample_id} error: {error}")
-                elif grade_entry:
-                    grades[sample_id] = grade_entry
+            async def next_sample_id() -> Optional[int]:
+                async with sample_iter_lock:
+                    return next(sample_iter, None)
 
-                # Send progress update periodically (not on every single completion)
-                if completed - last_progress_update >= progress_interval or completed == total_samples:
-                    yield f"data: {json.dumps({'type': 'progress', 'completed': completed, 'total': total_samples})}\n\n"
-                    last_progress_update = completed
+            async def worker() -> None:
+                while True:
+                    sample_id = await next_sample_id()
+                    if sample_id is None:
+                        return
+                    await result_queue.put(await grade_with_limit(sample_id))
+
+            workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
+
+            try:
+                while completed < total_samples:
+                    sample_id, grade_entry, error = await result_queue.get()
+                    completed += 1
+
+                    if error:
+                        errors.append({"sample_id": sample_id, "error": error})
+                        print(f"{prefix} sample={sample_id} error: {error}")
+                    elif grade_entry:
+                        grades[sample_id] = grade_entry
+
+                    # Send progress update periodically (not on every single completion)
+                    if completed - last_progress_update >= progress_interval or completed == total_samples:
+                        yield f"data: {json.dumps({'type': 'progress', 'completed': completed, 'total': total_samples})}\n\n"
+                        last_progress_update = completed
+            finally:
+                for worker_task in workers:
+                    if not worker_task.done():
+                        worker_task.cancel()
+                await asyncio.gather(*workers, return_exceptions=True)
             
             # Send final result
             total_time = time.time() - start_time
-            print(f"[SSE Grading] Complete: {len(grades)} graded, {len(errors)} errors in {total_time:.2f}s ({total_time/max(1,len(request.sample_ids)):.2f}s per sample)")
-            yield f"data: {json.dumps({'type': 'complete', 'graded_count': len(grades), 'errors': errors, 'grades': grades})}\n\n"
+            print(f"{prefix} complete: {len(grades)} graded, {len(errors)} errors in {total_time:.2f}s ({total_time/max(1,len(request.sample_ids)):.2f}s per sample)")
+            failure_ratio = (len(errors) / total_samples) if total_samples else 0.0
+            complete_event = {
+                "type": "complete",
+                "graded_count": len(grades),
+                "errors": errors,
+                "grades": grades,
+                "failure_ratio": failure_ratio,
+                "severity": "warning" if failure_ratio > 0.5 else "ok",
+            }
+            yield f"data: {json.dumps(complete_event)}\n\n"
             
         except Exception as e:
             total_time = time.time() - start_time
-            print(f"[SSE Grading] Error after {total_time:.2f}s: {str(e)}")
+            print(f"{prefix} error after {total_time:.2f}s: {str(e)}")
             yield f"data: {json.dumps({'type': 'error', 'message': _safe_error_detail(e, expose=True)})}\n\n"
     
     return StreamingResponse(
@@ -2193,6 +2434,19 @@ def _frontend_response(full_path: str) -> FileResponse:
 # streams a reply by proxying model_router's litellm provider. Stateless —
 # the whole history is re-sent each turn. Auth-protected like every /api route.
 
+_ROLLOUT_CHAT_ALLOWED_MODELS = {
+    "anthropic/claude-opus-4-8",
+    "gpt-5.5",
+    "openrouter/google/gemini-3.5-flash",
+}
+_ROLLOUT_CHAT_ALLOWED_ROLES = {"system", "user", "assistant"}
+_ROLLOUT_CHAT_MAX_TOKENS = _config_int("VIZ_ROLLOUT_CHAT_MAX_TOKENS", 8_192)
+_ROLLOUT_CHAT_MAX_MESSAGES = _config_int("VIZ_ROLLOUT_CHAT_MAX_MESSAGES", 64)
+_ROLLOUT_CHAT_MAX_CHARS = _config_int("VIZ_ROLLOUT_CHAT_MAX_CHARS", 250_000)
+_ROLLOUT_CHAT_RATE_LIMIT_MAX = _config_int("VIZ_ROLLOUT_CHAT_RATE_LIMIT_MAX", 30)
+_ROLLOUT_CHAT_RATE_LIMIT_WINDOW = _config_int("VIZ_ROLLOUT_CHAT_RATE_LIMIT_WINDOW_SECONDS", 60)
+
+
 class RolloutChatMessage(BaseModel):
     role: str
     content: str
@@ -2201,9 +2455,33 @@ class RolloutChatMessage(BaseModel):
 class RolloutChatRequest(BaseModel):
     model: str
     messages: List[RolloutChatMessage]
-    # Generous budget: the frontier models are reasoning models, and this
-    # ceiling covers hidden reasoning *plus* the visible answer.
-    max_tokens: int = 32000
+    max_tokens: Optional[int] = None
+
+
+def _prepare_rollout_chat_request(request: RolloutChatRequest) -> tuple[str, int, List[dict]]:
+    model = request.model.strip()
+    if model not in _ROLLOUT_CHAT_ALLOWED_MODELS:
+        raise HTTPException(status_code=400, detail="Unsupported rollout chat model")
+    if not request.messages:
+        raise HTTPException(status_code=400, detail="At least one message is required")
+    if len(request.messages) > _ROLLOUT_CHAT_MAX_MESSAGES:
+        raise HTTPException(status_code=400, detail=f"Too many messages (max {_ROLLOUT_CHAT_MAX_MESSAGES})")
+
+    total_chars = 0
+    messages: List[dict] = []
+    for message in request.messages:
+        role = message.role.strip().lower()
+        if role not in _ROLLOUT_CHAT_ALLOWED_ROLES:
+            raise HTTPException(status_code=400, detail="Unsupported rollout chat message role")
+        total_chars += len(message.content)
+        if total_chars > _ROLLOUT_CHAT_MAX_CHARS:
+            raise HTTPException(status_code=400, detail=f"Rollout chat prompt too long (max {_ROLLOUT_CHAT_MAX_CHARS} chars)")
+        messages.append({"role": role, "content": message.content})
+
+    max_tokens = _ROLLOUT_CHAT_MAX_TOKENS if request.max_tokens is None else request.max_tokens
+    if max_tokens < 1 or max_tokens > _ROLLOUT_CHAT_MAX_TOKENS:
+        raise HTTPException(status_code=400, detail=f"max_tokens must be between 1 and {_ROLLOUT_CHAT_MAX_TOKENS}")
+    return model, max_tokens, messages
 
 
 def _sse_frame(event: str, data: dict) -> bytes:
@@ -2211,23 +2489,35 @@ def _sse_frame(event: str, data: dict) -> bytes:
 
 
 @app.post("/api/rollout-chat-stream")
-async def rollout_chat_stream(request: RolloutChatRequest):
+async def rollout_chat_stream(request: RolloutChatRequest, http_request: Request):
     """Stream one assistant turn from a frontier model discussing a rollout.
 
     Thin SSE proxy to model_router `/step` (provider: litellm). The tinker
     event names (`response.output_text.delta`, `response.reasoning.delta`,
     `response.done`, `response.error`) pass straight through to the browser.
     """
+    if not _can_use_server_api_keys(http_request):
+        raise HTTPException(
+            status_code=403,
+            detail="Rollout chat requires an authenticated password session",
+        )
+    _enforce_window_rate_limit(
+        "rollout-chat",
+        http_request,
+        max_requests=_ROLLOUT_CHAT_RATE_LIMIT_MAX,
+        window_seconds=_ROLLOUT_CHAT_RATE_LIMIT_WINDOW,
+    )
+    model, max_tokens, messages = _prepare_rollout_chat_request(request)
     payload = {
         "provider": "litellm",
-        "model_name": request.model,
-        "messages": [{"role": m.role, "content": m.content} for m in request.messages],
+        "model_name": model,
+        "messages": messages,
         # `reasoning_effort: low` keeps the reasoning models (GPT-5.5, etc.)
         # snappy and stops them from burning the whole token budget on hidden
         # reasoning and emitting no visible answer.
         "sampling": {
             "stream": True,
-            "max_tokens": request.max_tokens,
+            "max_tokens": max_tokens,
             "reasoning_effort": "low",
         },
     }

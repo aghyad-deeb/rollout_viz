@@ -15,6 +15,8 @@ interface GradingPanelProps {
   grading: ReturnType<typeof useGrading>; // Grading state from parent
 }
 
+type ReasoningEffort = 'auto' | 'low' | 'medium' | 'high';
+
 export function GradingPanel({
   gradingJobs,
   isDarkMode,
@@ -44,18 +46,20 @@ export function GradingPanel({
   const [customMetricName, setCustomMetricName] = useState('');
   const [customPrompt, setCustomPrompt] = useState('');
   const [savingMetric, setSavingMetric] = useState(false);
+  const [editingMetricKey, setEditingMetricKey] = useState<string | null>(null);
   const [gradeType, setGradeType] = useState<'float' | 'int' | 'bool' | 'freeform'>('float');
   const [provider, setProvider] = useState<LLMProvider>(lastProvider);
   const [model, setModel] = useState<string>(lastModel);
   const [apiKeyInput, setApiKeyInput] = useState('');
   const [showApiKey, setShowApiKey] = useState(false);
   const [parallelSize, setParallelSize] = useState(100);
-  const [requireQuotes, setRequireQuotes] = useState(false); // Disabled by default for speed
+  const [maxTokens, setMaxTokens] = useState(32768);
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>('low');
+  const [requireQuotes, setRequireQuotes] = useState(true);
   
   // Advanced settings
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [temperature, setTemperature] = useState<number | undefined>(undefined);
-  const [maxTokens, setMaxTokens] = useState<number | undefined>(undefined);
   const [topP, setTopP] = useState<number | undefined>(undefined);
 
   // Check if we have a valid API key (local or server-side)
@@ -108,13 +112,44 @@ export function GradingPanel({
     }
   };
 
+  const resetCustomMetricDraft = () => {
+    setEditingMetricKey(null);
+    setCustomMetricName('');
+    setCustomPrompt('');
+    setGradeType('float');
+  };
+
+  const handleMetricSelectionChange = (metricKey: string) => {
+    setSelectedMetric(metricKey);
+    if (metricKey !== 'custom') {
+      resetCustomMetricDraft();
+    }
+  };
+
+  const handleEditCustomMetric = () => {
+    const metric = presetMetrics[selectedMetric];
+    if (!metric?.is_custom) return;
+    setEditingMetricKey(selectedMetric);
+    setCustomMetricName(metric.name);
+    setCustomPrompt(metric.prompt);
+    setGradeType(metric.grade_type as 'float' | 'int' | 'bool' | 'freeform');
+    setSelectedMetric('custom');
+  };
+
+  const handleCancelMetricEdit = () => {
+    const previousKey = editingMetricKey;
+    resetCustomMetricDraft();
+    setSelectedMetric(previousKey && presetMetrics[previousKey] ? previousKey : 'helpfulness');
+  };
+
   // Start grading
   const handleGrade = async () => {
     if (!currentMetric || totalSampleCount === 0) return;
 
     const advancedSettings = {
+      maxTokens,
+      ...(reasoningEffort !== 'auto' ? { reasoningEffort } : {}),
       ...(temperature !== undefined ? { temperature } : {}),
-      ...(maxTokens !== undefined ? { maxTokens } : {}),
       ...(topP !== undefined ? { topP } : {}),
     };
 
@@ -138,7 +173,7 @@ export function GradingPanel({
         provider,
         model,
         parallelSize,
-        Object.keys(advancedSettings).length > 0 ? advancedSettings : undefined,
+        advancedSettings,
         quoteSettings,
       );
 
@@ -185,7 +220,7 @@ export function GradingPanel({
         <div className="flex gap-2">
           <select
             value={selectedMetric}
-            onChange={(e) => setSelectedMetric(e.target.value)}
+            onChange={(e) => handleMetricSelectionChange(e.target.value)}
             className={`flex-1 px-3 py-2 rounded border text-sm ${inputClass}`}
           >
             <optgroup label="Built-in Metrics">
@@ -206,20 +241,30 @@ export function GradingPanel({
             )}
             <option value="custom">+ New Custom...</option>
           </select>
-          {/* Delete button for custom metrics */}
+          {/* Edit/delete buttons for custom metrics */}
           {selectedMetric !== 'custom' && presetMetrics[selectedMetric]?.is_custom && (
-            <button
-              onClick={async () => {
-                if (confirm(`Delete custom metric "${presetMetrics[selectedMetric].name}"?`)) {
-                  await deleteCustomMetric(selectedMetric);
-                  setSelectedMetric('helpfulness');
-                }
-              }}
-              className="px-2 py-1 rounded text-red-500 hover:bg-red-100 dark:hover:bg-red-900/30"
-              title="Delete custom metric"
-            >
-              <span className="material-symbols-outlined" style={{ fontSize: 18 }}>delete</span>
-            </button>
+            <>
+              <button
+                onClick={handleEditCustomMetric}
+                className={`px-2 py-1 rounded ${isDarkMode ? 'text-blue-400 hover:bg-blue-900/30' : 'text-blue-600 hover:bg-blue-50'}`}
+                title="Edit custom metric"
+              >
+                <span className="material-symbols-outlined" style={{ fontSize: 18 }}>edit</span>
+              </button>
+              <button
+                onClick={async () => {
+                  if (confirm(`Delete custom metric "${presetMetrics[selectedMetric].name}"?`)) {
+                    await deleteCustomMetric(selectedMetric);
+                    setSelectedMetric('helpfulness');
+                    resetCustomMetricDraft();
+                  }
+                }}
+                className="px-2 py-1 rounded text-red-500 hover:bg-red-100 dark:hover:bg-red-900/30"
+                title="Delete custom metric"
+              >
+                <span className="material-symbols-outlined" style={{ fontSize: 18 }}>delete</span>
+              </button>
+            </>
           )}
         </div>
 
@@ -270,42 +315,52 @@ export function GradingPanel({
             </div>
             {/* Optional: Save as preset */}
             {customMetricName.trim() && customPrompt.trim() && (
-              <div className="flex items-center justify-between pt-2 border-t border-gray-200 dark:border-gray-700">
+              <div className="flex items-center justify-between gap-3 pt-2 border-t border-gray-200 dark:border-gray-700">
                 <span className={`text-xs ${mutedClass}`}>
-                  You can grade now, or save this metric for future use:
+                  {editingMetricKey ? 'Save changes to this metric:' : 'You can grade now, or save this metric for future use:'}
                 </span>
-                <button
-                  onClick={async () => {
-                    setSavingMetric(true);
-                    try {
-                      const success = await saveCustomMetric(
-                        customMetricName.trim(),
-                        `Custom metric: ${customMetricName}`,
-                        gradeType,
-                        customPrompt.trim()
-                      );
-                      if (success) {
-                        // Switch to the newly saved metric
-                        const key = customMetricName.toLowerCase().replace(/\s+/g, '_');
-                        setSelectedMetric(key);
-                        setCustomMetricName('');
-                        setCustomPrompt('');
-                      }
-                    } finally {
-                      setSavingMetric(false);
-                    }
-                  }}
-                  disabled={savingMetric}
-                  className="flex items-center gap-1 px-2 py-1 text-xs rounded border border-blue-500 text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 disabled:opacity-50"
-                  title="Save this metric for future use"
-                >
-                  {savingMetric ? (
-                    <span className="material-symbols-outlined animate-spin" style={{ fontSize: 14 }}>progress_activity</span>
-                  ) : (
-                    <span className="material-symbols-outlined" style={{ fontSize: 14 }}>bookmark_add</span>
+                <div className="flex items-center gap-2">
+                  {editingMetricKey && (
+                    <button
+                      onClick={handleCancelMetricEdit}
+                      disabled={savingMetric}
+                      className={`px-2 py-1 text-xs rounded border ${isDarkMode ? 'border-gray-600 text-gray-300 hover:bg-gray-800' : 'border-gray-300 text-gray-600 hover:bg-gray-50'} disabled:opacity-50`}
+                    >
+                      Cancel
+                    </button>
                   )}
-                  Save for Later
-                </button>
+                  <button
+                    onClick={async () => {
+                      setSavingMetric(true);
+                      try {
+                        const key = editingMetricKey ?? customMetricName.toLowerCase().replace(/\s+/g, '_');
+                        const success = await saveCustomMetric(
+                          customMetricName.trim(),
+                          `Custom metric: ${customMetricName.trim()}`,
+                          gradeType,
+                          customPrompt.trim(),
+                          editingMetricKey ?? undefined,
+                        );
+                        if (success) {
+                          setSelectedMetric(key);
+                          resetCustomMetricDraft();
+                        }
+                      } finally {
+                        setSavingMetric(false);
+                      }
+                    }}
+                    disabled={savingMetric}
+                    className="flex items-center gap-1 px-2 py-1 text-xs rounded border border-blue-500 text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 disabled:opacity-50"
+                    title={editingMetricKey ? 'Save changes to this metric' : 'Save this metric for future use'}
+                  >
+                    {savingMetric ? (
+                      <span className="material-symbols-outlined animate-spin" style={{ fontSize: 14 }}>progress_activity</span>
+                    ) : (
+                      <span className="material-symbols-outlined" style={{ fontSize: 14 }}>{editingMetricKey ? 'save' : 'bookmark_add'}</span>
+                    )}
+                    {editingMetricKey ? 'Save Changes' : 'Save for Later'}
+                  </button>
+                </div>
               </div>
             )}
           </div>
@@ -353,6 +408,47 @@ export function GradingPanel({
         </div>
       </div>
 
+      {/* Grading budget */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <div className="space-y-2">
+          <label htmlFor="gradingMaxTokens" className={`text-sm font-medium ${textClass}`}>
+            Max Output Tokens
+          </label>
+          <div className="flex items-center gap-2">
+            <input
+              id="gradingMaxTokens"
+              aria-label="Max Output Tokens"
+              type="number"
+              min="1"
+              max="128000"
+              value={maxTokens}
+              onChange={(e) => setMaxTokens(Math.max(1, Math.min(128000, parseInt(e.target.value) || 32768)))}
+              className={`w-32 px-3 py-2 rounded border text-sm ${inputClass}`}
+            />
+            <span className={`text-xs ${mutedClass}`}>1 - 128k</span>
+          </div>
+        </div>
+
+        <div className="space-y-2">
+          <label htmlFor="gradingReasoningEffort" className={`text-sm font-medium ${textClass}`}>
+            Effort
+          </label>
+          <select
+            id="gradingReasoningEffort"
+            aria-label="Effort"
+            value={reasoningEffort}
+            onChange={(e) => setReasoningEffort(e.target.value as ReasoningEffort)}
+            className={`w-full px-3 py-2 rounded border text-sm ${inputClass}`}
+          >
+            <option value="auto">Auto</option>
+            <option value="low">Low</option>
+            <option value="medium">Medium</option>
+            <option value="high">High</option>
+          </select>
+          <p className={`text-xs ${mutedClass}`}>Auto uses the provider default.</p>
+        </div>
+      </div>
+
       {/* Require Quotes */}
       <div className="flex items-center gap-2">
         <input
@@ -365,7 +461,7 @@ export function GradingPanel({
         <label htmlFor="requireQuotes" className={`text-sm ${textClass}`}>
           Require quotes from transcript
         </label>
-        <span className={`text-xs ${mutedClass}`}>(will retry if missing)</span>
+        <span className={`text-xs ${mutedClass}`}>(will retry; quote-less samples fail)</span>
       </div>
 
       {/* Advanced Settings */}
@@ -411,32 +507,6 @@ export function GradingPanel({
               </div>
             </div>
 
-            {/* Max Tokens */}
-            <div className="space-y-1">
-              <label className={`text-xs font-medium ${textClass}`}>
-                Max Output Tokens
-                <span className={`ml-1 ${mutedClass}`}>(default: model default)</span>
-              </label>
-              <div className="flex items-center gap-2">
-                <input
-                  type="number"
-                  min="1"
-                  max="128000"
-                  value={maxTokens ?? ''}
-                  onChange={(e) => setMaxTokens(e.target.value ? parseInt(e.target.value) : undefined)}
-                  placeholder="Model default"
-                  className={`w-32 px-2 py-1 rounded border text-sm ${inputClass}`}
-                />
-                {maxTokens !== undefined && (
-                  <button
-                    onClick={() => setMaxTokens(undefined)}
-                    className={`text-xs ${mutedClass} hover:opacity-80`}
-                  >
-                    Reset
-                  </button>
-                )}
-              </div>
-            </div>
 
             {/* Top P */}
             <div className="space-y-1">

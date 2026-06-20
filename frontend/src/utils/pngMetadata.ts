@@ -1,7 +1,8 @@
 // PNG tEXt-chunk metadata — embed / extract hidden text in a PNG.
 //
-// Used by Presentation Mode to stamp a deep link to the source rollout into
-// exported images. PNG layout: an 8-byte signature, then a sequence of
+// Exported captures strip rollout-viz metadata by default; the reader remains
+// for backwards compatibility with older exports that included deep links.
+// PNG layout: an 8-byte signature, then a sequence of
 // chunks `[length:4 BE][type:4 ASCII][data:length][crc:4]` where the CRC
 // covers `type + data`; the stream ends with a zero-length `IEND` chunk.
 // A `tEXt` chunk's data is `keyword\0text`. We splice ours in immediately
@@ -116,6 +117,59 @@ export async function addPngTextChunk(
   out.set(bytes.subarray(iendStart), iendStart + chunk.length);
 
   return new Blob([out], { type: 'image/png' });
+}
+
+/**
+ * Return a PNG with selected `tEXt` chunks removed. If no keywords are
+ * supplied, all `tEXt` chunks are stripped. Non-PNG or malformed PNG blobs are
+ * returned unchanged.
+ */
+export async function stripPngTextChunks(
+  png: Blob,
+  keywords?: string[],
+): Promise<Blob> {
+  const bytes = await blobToBytes(png);
+  if (!isPng(bytes)) return png;
+
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const dec = new TextDecoder();
+  const removeAll = keywords === undefined;
+  const remove = new Set(keywords ?? []);
+  const chunks: Uint8Array[] = [bytes.subarray(0, 8)];
+  let changed = false;
+  let offset = 8;
+
+  while (offset + 8 <= bytes.length) {
+    const len = view.getUint32(offset, false);
+    const chunkEnd = offset + 12 + len;
+    if (chunkEnd > bytes.length) return png;
+    const type = String.fromCharCode(
+      bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7],
+    );
+    if (type === 'tEXt') {
+      const data = bytes.subarray(offset + 8, offset + 8 + len);
+      const nul = data.indexOf(0);
+      const keyword = nul === -1 ? '' : dec.decode(data.subarray(0, nul));
+      if (removeAll || remove.has(keyword)) {
+        changed = true;
+        offset = chunkEnd;
+        continue;
+      }
+    }
+    chunks.push(bytes.subarray(offset, chunkEnd));
+    offset = chunkEnd;
+    if (type === 'IEND') break;
+  }
+
+  if (!changed) return png;
+  const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const out = new Uint8Array(totalLength);
+  let cursor = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, cursor);
+    cursor += chunk.length;
+  }
+  return new Blob([out.buffer as ArrayBuffer], { type: 'image/png' });
 }
 
 /**

@@ -59,3 +59,27 @@ class TestSafeResolvePath:
         nested.touch()
         result = _safe_resolve_path("a/b/c/test.jsonl")
         assert result == nested.resolve()
+
+
+class TestS3BucketAllowlist:
+    """Tests for fail-closed S3 bucket validation."""
+
+    def test_s3_bucket_allowlist_is_required(self, monkeypatch):
+        import backend.main as main_module
+
+        monkeypatch.setattr(main_module, "VIZ_ALLOWED_S3_BUCKETS", None)
+        with pytest.raises(ValueError, match="allowlist"):
+            main_module._validate_s3_bucket("test-bucket")
+
+    def test_s3_bucket_allowlist_allows_configured_bucket(self, monkeypatch):
+        import backend.main as main_module
+
+        monkeypatch.setattr(main_module, "VIZ_ALLOWED_S3_BUCKETS", {"test-bucket"})
+        main_module._validate_s3_bucket("test-bucket")
+
+    def test_s3_bucket_allowlist_rejects_other_bucket(self, monkeypatch):
+        import backend.main as main_module
+
+        monkeypatch.setattr(main_module, "VIZ_ALLOWED_S3_BUCKETS", {"test-bucket"})
+        with pytest.raises(ValueError, match="not allowed"):
+            main_module._validate_s3_bucket("other-bucket")

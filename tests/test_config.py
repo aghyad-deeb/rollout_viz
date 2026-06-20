@@ -1,7 +1,9 @@
 """Tests for environment config parsing and API key retrieval."""
 
+import ipaddress
+
 import pytest
-from unittest.mock import patch
+from starlette.requests import Request
 
 
 class TestEnvParsing:
@@ -67,18 +69,70 @@ class TestAvailableApiKeys:
             assert isinstance(value, bool), f"{key} should be bool, got {type(value)}"
         await client.aclose()
 
-    async def test_reflects_env_config(self, app_no_auth, mock_env_config):
-        mock_env_config(OPENAI_API_KEY="sk-test")
+    async def test_no_auth_does_not_reveal_env_config(self, app_no_auth, mock_env_config):
+        mock_env_config(OPENAI_API_KEY="sk-test", GEMINI_API_KEY="gemini-test-key")
         client = await app_no_auth()
+        resp = await client.get("/api/available-api-keys")
+        data = resp.json()
+        assert data["openai"] is False
+        assert data["google"] is False
+        await client.aclose()
+
+    async def test_authenticated_reflects_env_config(self, authenticated_client, mock_env_config):
+        mock_env_config(OPENAI_API_KEY="sk-test")
+        client = await authenticated_client()
         resp = await client.get("/api/available-api-keys")
         data = resp.json()
         assert data["openai"] is True
         await client.aclose()
 
-    async def test_reflects_google_key_aliases(self, app_no_auth, mock_env_config):
+    async def test_authenticated_reflects_google_key_aliases(self, authenticated_client, mock_env_config):
         mock_env_config(GEMINI_API_KEY="gemini-test-key")
-        client = await app_no_auth()
+        client = await authenticated_client()
         resp = await client.get("/api/available-api-keys")
         data = resp.json()
         assert data["google"] is True
         await client.aclose()
+
+
+def _request_with_client(host: str, forwarded_for: str | None = None) -> Request:
+    headers = []
+    if forwarded_for is not None:
+        headers.append((b"x-forwarded-for", forwarded_for.encode("ascii")))
+    return Request({
+        "type": "http",
+        "method": "GET",
+        "path": "/",
+        "headers": headers,
+        "client": (host, 12345),
+        "server": ("testserver", 80),
+        "scheme": "http",
+        "query_string": b"",
+    })
+
+
+class TestTrustedProxyClientKey:
+    """Tests for abuse-rate-limit client keying."""
+
+    def test_ignores_x_forwarded_for_from_untrusted_peer(self, monkeypatch):
+        import backend.main as main_module
+
+        monkeypatch.setattr(main_module, "VIZ_TRUSTED_PROXY_NETWORKS", [])
+        request = _request_with_client("198.51.100.10", "203.0.113.99")
+
+        assert main_module._request_client_key(request) == "198.51.100.10"
+
+    def test_uses_nearest_untrusted_forwarded_ip_from_trusted_proxy(self, monkeypatch):
+        import backend.main as main_module
+
+        monkeypatch.setattr(
+            main_module,
+            "VIZ_TRUSTED_PROXY_NETWORKS",
+            [ipaddress.ip_network("10.0.0.0/8")],
+        )
+        request = _request_with_client(
+            "10.0.0.20",
+            "198.51.100.1, 203.0.113.7, 10.0.0.30",
+        )
+
+        assert main_module._request_client_key(request) == "203.0.113.7"

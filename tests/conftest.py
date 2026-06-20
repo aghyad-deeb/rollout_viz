@@ -205,11 +205,13 @@ def reset_rate_limiter():
     main_module._clear_file_cache()
     main_module._clear_viz_exists_cache()
     main_module._clear_test_provider_cache()
+    main_module._clear_abuse_rate_limits()
     yield
     main_module._login_attempts.clear()
     main_module._clear_file_cache()
     main_module._clear_viz_exists_cache()
     main_module._clear_test_provider_cache()
+    main_module._clear_abuse_rate_limits()
 
 
 @pytest.fixture
@@ -235,14 +237,14 @@ def mock_s3():
 
     # Reset singleton so it gets recreated inside mock_aws context.
     # The developer machine may have a real S3 allowlist in ~/.env; mock S3
-    # tests should not inherit that production restriction.
+    # tests should use the moto bucket explicitly instead.
     main_module._reset_s3_client()
     original_allowed_buckets = main_module.VIZ_ALLOWED_S3_BUCKETS
-    main_module.VIZ_ALLOWED_S3_BUCKETS = None
 
     with mock_aws():
         s3 = boto3.client("s3", region_name="us-east-1")
         bucket_name = "test-bucket"
+        main_module.VIZ_ALLOWED_S3_BUCKETS = {bucket_name}
         s3.create_bucket(Bucket=bucket_name)
 
         # Add test JSONL files

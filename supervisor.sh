@@ -56,7 +56,7 @@ USE_SYSTEM_CLOUDFLARED="${USE_SYSTEM_CLOUDFLARED:-auto}"
 # Port 3000 was previously used by Vite dev. Keep it only for cleanup; when
 # BACKEND_PORT is also 3000, the duplicate cleanup pass is harmless.
 DEV_FRONTEND_PORT=3000
-LOG_DIR="$SCRIPT_DIR/logs"
+LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/logs}"
 LOG_MAX_BYTES=$((10 * 1024 * 1024))          # 10 MB before rotation
 HEALTH_INTERVAL=30                            # seconds between probes
 HEALTH_GRACE=10                               # second-chance after a probe fail
@@ -89,9 +89,15 @@ fi
 service_cmd() {
   case "$1" in
     backend)
-      printf 'exec %q -m uvicorn backend.main:app --host 127.0.0.1 --port %q
+      if allow_public_no_auth; then
+        printf 'exec %q -m uvicorn backend.main:app --host 127.0.0.1 --port %q
 ' \
-        "$VENV_DIR/bin/python" "$BACKEND_PORT"
+          "$VENV_DIR/bin/python" "$BACKEND_PORT"
+      else
+        printf 'VIZ_REQUIRE_AUTH=1 exec %q -m uvicorn backend.main:app --host 127.0.0.1 --port %q
+' \
+          "$VENV_DIR/bin/python" "$BACKEND_PORT"
+      fi
       ;;
     tunnel)
       if [[ -n "${TUNNEL_TOKEN:-}" ]]; then
@@ -167,11 +173,29 @@ read_env_key() {
     | sed 's/^ *//; s/ *$//; s/^"//; s/"$//; s/^'"'"'//; s/'"'"'$//'
 }
 
+allow_public_no_auth() {
+  local allow_public_no_auth
+  allow_public_no_auth=$(read_env_key VIZ_ALLOW_PUBLIC_NO_AUTH || true)
+  if [[ -z $allow_public_no_auth ]]; then
+    allow_public_no_auth="${VIZ_ALLOW_PUBLIC_NO_AUTH:-}"
+  fi
+  case "${allow_public_no_auth,,}" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 check_security_config() {
   local password secret buckets
   password=$(read_env_key VIZ_PASSWORD || true)
   secret=$(read_env_key VIZ_SECRET_KEY || true)
   buckets=$(read_env_key VIZ_ALLOWED_S3_BUCKETS || true)
+
+  if ! allow_public_no_auth && [[ -z $password ]]; then
+    echo "Refusing to start: public tunnel startup requires VIZ_PASSWORD in ~/.env."
+    echo "Set VIZ_PASSWORD and VIZ_SECRET_KEY, or set VIZ_ALLOW_PUBLIC_NO_AUTH=true only for an intentionally public instance."
+    return 1
+  fi
 
   if [[ -n $password && -z $secret ]]; then
     echo "Refusing to start: VIZ_PASSWORD is set but VIZ_SECRET_KEY is missing from ~/.env."
@@ -558,6 +582,7 @@ case "${1:-}" in
   restart)  cmd_stop; sleep 1; cmd_start ;;
   status)   cmd_status ;;
   logs)     cmd_logs "${2:-supervisor}" ;;
+  __check_security_config) check_security_config ;; # internal — test hook
   __daemon) run_daemon ;;     # internal — invoked by `start` after setsid
   *)
     cat <<EOF

@@ -426,6 +426,28 @@ describe('GradesDisplay', () => {
     expect(screen.getByText('Show less')).toBeInTheDocument();
   });
 
+  it('does not offer Show quotes when a grade has no saved quotes', () => {
+    const grades: SampleGrades = {
+      accuracy: [
+        {
+          grade: true,
+          grade_type: 'bool',
+          quotes: [],
+          explanation: 'Correct.',
+          model: 'gpt-4o',
+          prompt_version: 'v1',
+          timestamp: '2026-01-15T10:00:00',
+        },
+      ],
+    };
+    render(<GradesDisplay {...defaultProps} grades={grades} />);
+    const header = screen.getByText('LLM Grades (1 metric)').closest('button');
+    fireEvent.click(header!);
+
+    expect(screen.queryByText('Show quotes')).not.toBeInTheDocument();
+    expect(screen.getByText('No quotes saved')).toBeInTheDocument();
+  });
+
   it('calls onSelectMetric when "Show quotes" is clicked', () => {
     const onSelectMetric = vi.fn();
     render(

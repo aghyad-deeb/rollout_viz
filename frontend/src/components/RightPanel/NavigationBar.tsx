@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { Sample, ViewMode } from '../../types';
-import { PUBLIC_BASE_URL } from '../../config';
+import { buildPublicUrl } from '../../config';
 import { toExactPrefillEnvelope } from '../../utils/exportPrefill';
 
 interface NavigationBarProps {
@@ -88,7 +88,7 @@ export function NavigationBar({
         const params = new URLSearchParams({ share: token });
         if (highlightedMessageIndex != null) params.set('message', highlightedMessageIndex.toString());
         if (highlightedText) params.set('highlight', highlightedText);
-        const url = `${PUBLIC_BASE_URL}/?${params.toString()}`;
+        const url = buildPublicUrl(params);
         navigator.clipboard.writeText(url);
         setShareCopied(true);
         setTimeout(() => setShareCopied(false), 2000);
