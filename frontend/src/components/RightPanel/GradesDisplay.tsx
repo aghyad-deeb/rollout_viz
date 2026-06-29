@@ -64,6 +64,12 @@ function formatGrade(grade: number | boolean | string, gradeType: string): strin
     if (text.length <= FREEFORM_PREVIEW_LEN) return text || '(empty)';
     return text.slice(0, FREEFORM_PREVIEW_LEN).trimEnd() + '…';
   }
+  if (gradeType === 'categorical') {
+    // The chosen category name — short by design; show it (lightly capped).
+    const text = String(grade ?? '').trim();
+    if (!text) return '(none)';
+    return text.length <= 32 ? text : text.slice(0, 32).trimEnd() + '…';
+  }
   return String(grade);
 }
 
@@ -76,6 +82,11 @@ function getGradeColor(grade: number | boolean | string, gradeType: string, isDa
   if (gradeType === 'freeform') {
     // Freeform grades aren't good/bad — neutral color.
     return isDarkMode ? 'text-gray-200' : 'text-gray-700';
+  }
+  if (gradeType === 'categorical') {
+    // Categories have no intrinsic good/bad ordering — render as a neutral
+    // label color (distinct from freeform gray so it reads as a value).
+    return isDarkMode ? 'text-sky-300' : 'text-sky-700';
   }
   const value = grade as number;
   if (value >= 0.7) return isDarkMode ? 'text-green-400' : 'text-green-600';

@@ -18,7 +18,8 @@ const FREEFORM_CELL_PREVIEW_LEN = 18;
 function formatGrade(grade: number | boolean | string, gradeType: string): string {
   if (gradeType === 'bool') return grade ? '✓' : '✗';
   if (gradeType === 'float') return (grade as number).toFixed(2);
-  if (gradeType === 'freeform') {
+  if (gradeType === 'freeform' || gradeType === 'categorical') {
+    // Freeform prose / categorical label — collapse + truncate to fit the cell.
     const text = String(grade ?? '').trim().replace(/\s+/g, ' ');
     if (!text) return '—';
     if (text.length <= FREEFORM_CELL_PREVIEW_LEN) return text;
@@ -37,6 +38,10 @@ function getGradeColor(grade: number | boolean | string, gradeType: string, isDa
   if (gradeType === 'freeform') {
     // No intrinsic ordering — render neutral.
     return isDarkMode ? 'text-gray-300' : 'text-gray-700';
+  }
+  if (gradeType === 'categorical') {
+    // Categories have no good/bad ordering — neutral label color.
+    return isDarkMode ? 'text-sky-300' : 'text-sky-700';
   }
   // For numeric grades, use a gradient
   const value = grade as number;

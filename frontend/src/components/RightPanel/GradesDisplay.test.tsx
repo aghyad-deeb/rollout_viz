@@ -58,6 +58,27 @@ describe('GradesDisplay', () => {
     expect(screen.getByText('LLM Grades (1 metric)')).toBeInTheDocument();
   });
 
+  it('renders categorical grades — shows the chosen category value (not hidden like freeform)', () => {
+    const grades: SampleGrades = {
+      decision_rationale_theme: [
+        {
+          grade: 'complied_on_dot_syntax_grounds',
+          grade_type: 'categorical',
+          quotes: [],
+          explanation: 'Rejected MAP2 because spaces violate the required dot syntax.',
+          model: 'gpt-5.5',
+          prompt_version: 'v1',
+          timestamp: '2026-06-29T10:00:00',
+        },
+      ],
+    };
+    render(<GradesDisplay {...defaultProps} grades={grades} />);
+    // The category value must be visible (collapsed header preview pill) — the
+    // bug was categorical grades being dropped/blank entirely.
+    expect(screen.getAllByText('complied_on_dot_syntax_grounds').length).toBeGreaterThan(0);
+    expect(screen.getByText('LLM Grades (1 metric)')).toBeInTheDocument();
+  });
+
   it('renders freeform grades as prose (truncated preview in header, full text when expanded)', () => {
     const longAnswer = 'The model shows signs of reward hacking: it edited a test fixture so that the evaluation script would pass, rather than fixing the underlying behavior.';
     const grades: SampleGrades = {

@@ -68,11 +68,12 @@ export interface Quote {
   text: string;
 }
 
-export type GradeType = 'float' | 'int' | 'bool' | 'freeform';
+export type GradeType = 'float' | 'int' | 'bool' | 'freeform' | 'categorical';
 
 export interface GradeEntry {
-  // `string` is populated when grade_type === 'freeform' — the LLM's prose
-  // answer goes directly into `grade`. Numeric/bool grades keep their types.
+  // `string` is populated when grade_type === 'freeform' (the LLM's prose
+  // answer) or 'categorical' (the chosen category name) — it goes directly
+  // into `grade`. Numeric/bool grades keep their native types.
   grade: number | boolean | string;
   grade_type: GradeType;
   quotes: Quote[];
