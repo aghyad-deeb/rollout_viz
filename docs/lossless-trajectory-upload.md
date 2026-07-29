@@ -1,8 +1,8 @@
 # Lossless Rollout Trajectory Upload
 
 This document describes how to write and upload rollout_viz JSONL trajectories so
-they can be replayed exactly by downstream tools such as web_chat_vite and
-auto_eval.
+their MESSAGES can be reconstructed exactly by downstream tools such as
+web_chat_vite and auto_eval (see Goal for what this does and does not claim).
 
 The short version: do not reduce messages to `{ role, content }`. Preserve the
 full universal message shape, the original JSONL row, and provider replay
@@ -10,10 +10,19 @@ metadata.
 
 ## Goal
 
-A trajectory is lossless when a downstream replay system can reconstruct the
-same model-visible conversation state that produced the trajectory.
+A trajectory is **message-level lossless** when a downstream replay system can
+reconstruct the same model-visible conversation MESSAGES that produced the
+trajectory. That is this document's whole scope, and it is necessary but not
+sufficient for a wire-identical replay: the assembled provider request also
+contains the tools array (bytes AND order — injected into the prompt on
+renderer paths), `target_tool_format`, sampling parameters, and routing
+identity, all of which the replaying app supplies from its own configuration,
+not from the row. The standard for the full claim is the `wire-losslessness`
+skill (`~/.agents/skills/wire-losslessness/SKILL.md`); a row meeting this
+document's checklist licenses "message-level lossless", not unqualified
+"replayed exactly".
 
-Lossless replay requires preserving:
+Message-level lossless replay requires preserving:
 
 - final visible assistant text
 - hidden or structured reasoning
