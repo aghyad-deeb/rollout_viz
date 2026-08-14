@@ -6,6 +6,7 @@
 // `model_router` litellm provider.
 
 import type { Sample, Message, ContentPart } from '../types';
+import { COMMENTS_METRIC, visibleComments } from './humanGrades';
 
 export interface ChatModel {
   id: string;
@@ -43,6 +44,12 @@ export interface ChatTurn {
   content: string;
   /** Streamed reasoning/thinking text — shown live while the answer is pending. */
   reasoning?: string;
+  /**
+   * Display label of the model that produced this assistant turn, stamped at
+   * creation so switching the picker never relabels earlier replies. Client
+   * UI only — the outbound payload maps just {role, content}.
+   */
+  model?: string;
 }
 
 // Render one message in full — every content-bearing field, format-agnostic.
@@ -130,13 +137,18 @@ export function formatRolloutForChat(sample: Sample): string {
   });
 
   const grades = sample.grades ?? {};
-  const metrics = Object.keys(grades);
+  // Soft-deleted comments (and their tombstones) are hidden in the UI and
+  // must not reach the discussion model either.
+  const metrics = Object.keys(grades).filter(
+    m => m !== COMMENTS_METRIC || visibleComments(grades[m]).length > 0,
+  );
   out.push('## Grades');
   if (metrics.length === 0) {
     out.push('(none)');
   } else {
     for (const metric of metrics) {
-      for (const g of grades[metric] ?? []) {
+      const entries = metric === COMMENTS_METRIC ? visibleComments(grades[metric]) : (grades[metric] ?? []);
+      for (const g of entries) {
         out.push(`- ${metric}: ${JSON.stringify(g.grade)}  (grader: ${g.model})`);
         if (g.explanation) out.push(`  explanation: ${g.explanation}`);
         for (const q of g.quotes ?? []) {

@@ -68,6 +68,7 @@
 
 /* Base styles */
 :root {
+  color-scheme: light;
   --bg-primary: #ffffff;
   --bg-secondary: #f8fafc;
   --bg-tertiary: #f1f5f9;
@@ -79,6 +80,7 @@
 }
 
 .dark {
+  color-scheme: dark;
   --bg-primary: #1a1a2e;
   --bg-secondary: #16213e;
   --bg-tertiary: #0f3460;
@@ -190,7 +192,7 @@
 }
 .dark .message-assistant-button {
   background-color: #c9a44a;
-  color: #ffffff;
+  color: #3d3520;
 }
 
 /* Tool: #264653 (dark teal) */
@@ -272,6 +274,131 @@
 .responsive-resize-handle:hover {
   background-color: #9ca3af;
 }
+
+/* Comments drawer — slides in from the right edge of the content area.
+   Replays on every open because the panel stays mounted and only toggles
+   `display` (drafts must survive a close). */
+@keyframes comments-drawer-in {
+  from { opacity: 0; transform: translateX(16px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+/* At sm+ the drawer is a static flex sibling: the chat column reflows the
+   instant it appears, so a slide would open a visible gap beside it. Fade
+   only there; the small-screen overlay keeps the slide. */
+@keyframes comments-drawer-fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.comments-drawer {
+  animation: comments-drawer-in 0.18s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@media (min-width: 640px) {
+  .comments-drawer { animation-name: comments-drawer-fade-in; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .comments-drawer { animation: none; }
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+   Analysis dashboard ("scientific instrument panel")
+   Cohesive with the app's warm palette; adds depth, motion, and a
+   monospace instrument-readout treatment for figures and axes.
+   ───────────────────────────────────────────────────────────────────── */
+
+/* Tabular monospace numerals for KPI readouts and chart axes. */
+.font-data {
+  font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+}
+.tnum { font-variant-numeric: tabular-nums; }
+
+/* Atmospheric backdrop — faint palette glows, never fighting the data. */
+.analysis-surface {
+  background-color: var(--bg-primary);
+  background-image:
+    radial-gradient(110% 75% at 100% 0%, rgba(42, 157, 143, 0.07), transparent 55%),
+    radial-gradient(95% 65% at 0% 100%, rgba(233, 196, 106, 0.06), transparent 50%);
+}
+.dark .analysis-surface {
+  background-color: #15152a;
+  background-image:
+    radial-gradient(110% 75% at 100% 0%, rgba(42, 157, 143, 0.12), transparent 55%),
+    radial-gradient(95% 65% at 0% 100%, rgba(15, 52, 96, 0.55), transparent 55%);
+}
+
+/* Card: hairline border, layered fill, accent rail on hover/elevation. */
+.analysis-card {
+  position: relative;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.65), rgba(248, 250, 252, 0.35));
+  border: 1px solid var(--border-color);
+  border-radius: 14px;
+  backdrop-filter: blur(2px);
+  transition: box-shadow 0.22s ease, transform 0.22s ease, border-color 0.22s ease;
+}
+.dark .analysis-card {
+  background: linear-gradient(180deg, rgba(31, 41, 64, 0.55), rgba(22, 33, 62, 0.35));
+  border-color: #2b3b57;
+}
+.analysis-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 14px 32px -18px rgba(38, 70, 83, 0.45);
+  border-color: rgba(42, 157, 143, 0.45);
+}
+/* A KPI tile carries a colored left accent rail. */
+.analysis-tile::before {
+  content: '';
+  position: absolute;
+  left: 0; top: 12px; bottom: 12px;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: var(--tile-accent, #2a9d8f);
+  opacity: 0.9;
+}
+
+/* Staggered entrance — one orchestrated reveal beats scattered jitter. */
+@keyframes analysis-rise {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.analysis-rise {
+  animation: analysis-rise 0.5s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .analysis-rise { animation: none; }
+}
+
+/* Segmented control (replaces loose pills for bins / scale / sort). */
+.seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  padding: 2px;
+  border-radius: 9px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+}
+.seg-btn {
+  font-size: 11px;
+  line-height: 1;
+  padding: 4px 8px;
+  border-radius: 7px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+  cursor: pointer;
+}
+.seg-btn:hover { color: var(--text-secondary); }
+.seg-btn[data-active='true'] {
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
+}
+.dark .seg-btn[data-active='true'] { background: #0f3460; color: #fff; }
+
+/* Recharts polish: thinner, calmer gridlines that recede behind the data. */
+.analysis-card .recharts-cartesian-grid line { opacity: 0.55; }
+.analysis-card .recharts-text { font-family: 'IBM Plex Mono', ui-monospace, monospace; }
 
 /* Material Symbols */
 .material-symbols-outlined {

@@ -365,3 +365,41 @@ describe('toExactPrefillEnvelope', () => {
     ]);
   });
 });
+
+describe('toExactPrefillEnvelope grades overlay', () => {
+  // raw_jsonl_entry is a load-time snapshot; grades appended this session
+  // (comments, deletion tombstones) exist only on sample.grades. The export
+  // must carry the LIVE grades so a deletion record is never missing from
+  // the archival copy.
+  it('overlays live grades onto the raw entry', () => {
+    const doomed = {
+      grade: 'oops', grade_type: 'freeform', quotes: [], explanation: '',
+      model: 'human:ada', prompt_version: 'comment-v1', timestamp: 't1',
+    };
+    const tombstone = {
+      ...doomed, grade: '', prompt_version: 'comment-delete-v1', timestamp: 't2',
+      explanation: 'deleted comment by human:ada from t1',
+      deletes: { model: 'human:ada', timestamp: 't1' },
+    };
+    const rawJsonlEntry = {
+      messages: [{ role: 'user', content: 'q' }],
+      grades: { comments: [doomed] },  // snapshot from load time
+      timestamp: 'now',
+    };
+    const sample = {
+      id: 0,
+      messages: [{ role: 'user', content: 'q' }],
+      attributes: { step: 0, sample_index: 0, rollout_n: 0, reward: 0, data_source: 'x', experiment_name: 'e', is_validate: false },
+      timestamp: 'now',
+      grades: { comments: [doomed, tombstone] },  // live state incl. tombstone
+      raw_jsonl_entry: rawJsonlEntry,
+    } as unknown as Sample;
+
+    const envelope = toExactPrefillEnvelope(sample);
+    const exported = envelope.raw.jsonl_entry as { grades: { comments: unknown[] } };
+    expect(exported.grades.comments).toHaveLength(2);
+    // Nothing else about the raw entry changes, and the original is untouched.
+    expect((exported as { timestamp?: string }).timestamp).toBe('now');
+    expect(rawJsonlEntry.grades.comments).toHaveLength(1);
+  });
+});

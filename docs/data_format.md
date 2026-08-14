@@ -4,7 +4,9 @@ This document describes the JSONL format expected by the Rollout Visualizer and 
 
 ## JSONL File Format
 
-Each line in the JSONL file must be a valid JSON object representing a single rollout sample.
+Each line in the JSONL file is a JSON object representing a single rollout sample.
+
+**Only `messages` is required.** Everything else is optional — **omit fields you don't have rather than faking them.** Producers historically wrote `reward: 0`, `step: 1`, `sample_index: 0` "for compatibility"; the viewer applies defaults itself, hides columns that are constant at their default across a whole file, and fake values actively pollute the Analysis charts.
 
 ### Schema
 
@@ -13,19 +15,15 @@ Each line in the JSONL file must be a valid JSON object representing a single ro
   "messages": [
     {
       "role": "system" | "user" | "assistant" | "tool",
-      "content": "string"
+      "content": "string",
+      "content_parts": [ ... ],   // optional; reasoning/text parts pass through losslessly
+      "tool_calls": [ ... ]       // optional; rendered as structured tool-call blocks
     }
   ],
-  "attributes": {
-    "sample_index": number,
-    "step": number,
-    "rollout_n": number,
-    "reward": number,
-    "data_source": "string",
-    "experiment_name": "string",
-    "validate": boolean
-  },
-  "timestamp": "ISO 8601 string"
+  "attributes": { ... },          // optional; see below
+  "grades": { ... },              // optional; written by the grading UI, not producers
+  "diagnostics": ["string"],      // optional; producer notes, surfaced as a "diag" pill
+  "timestamp": "ISO 8601 string"  // optional; the writer library fills it in
 }
 ```
 
@@ -37,149 +35,114 @@ An array of message objects representing the conversation/rollout trace.
 | Field | Type | Description |
 |-------|------|-------------|
 | `role` | string | One of: `"system"`, `"user"`, `"assistant"`, `"tool"` |
-| `content` | string | The message content. For assistant messages, may contain `<think>...</think>` blocks which are displayed as collapsible "reasoning" sections |
+| `content` | string | The message content. Assistant messages may contain `<think>...</think>` blocks or raw ChatML/Harmony token decodes — both render as collapsible reasoning sections |
+| `content_parts` | array | Optional structured parts (`{type: "text"|"reasoning"|"thinking", text}`) — preferred over inline tags when you have them |
+| `tool_calls` | array | Optional OpenAI-style tool calls (`{function: {name, arguments}}`) |
 
-#### `attributes` (required)
-Metadata about the sample.
+#### `attributes` (optional)
+Metadata about the sample. **Every field is optional. Omit what you don't have.**
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `sample_index` | number | 0 | Index within a batch/group of samples |
-| `step` | number | 0 | Training step or iteration number |
-| `rollout_n` | number | 0 | **Unique identifier** for this rollout. Used for URL linking and deduplication |
-| `reward` | number | 0.0 | Reward value for this rollout |
-| `data_source` | string | "unknown" | Category/source of the data (e.g., `"coding/test_cases"`, `"maze/reward_evaluation"`) |
-| `experiment_name` | string | "unknown" | Name of the experiment run |
-| `validate` | boolean | false | Whether this is a validation sample |
+| Field | Type | Meaning when present |
+|-------|------|----------------------|
+| `viz_id` | string | Stable unique id for this rollout. Stamped automatically by the writer library — the forward-looking identity for links |
+| `rollout_n` | number | Unique-within-file rollout number. Legacy `?rollout=` links resolve through it; must be UNIQUE per file or links are ambiguous |
+| `sample_index` | number | The problem/group the rollout belongs to (e.g. GRPO group id). NOT a unique id |
+| `step` | number | Training step that produced this rollout |
+| `reward` | number | Actual reward. **Never write 0 as a placeholder** — omit instead |
+| `data_source` | string | Task category (e.g. `"coding/test_cases"`) |
+| `experiment_name` | string | Experiment run name |
 
-#### `timestamp` (required)
-ISO 8601 formatted timestamp string (e.g., `"2026-01-16T11:33:10.744140"`).
+`validate` (boolean) is deprecated: the backend renames it to `is_validate` for legacy files, but no producer sets it meaningfully — omit it.
 
-### Example
+#### `timestamp` (optional)
+ISO 8601 string. The writer library fills it automatically when absent.
 
-```jsonl
-{"messages": [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": "Hello!"}, {"role": "assistant", "content": "<think>\nLet me think about this...\n</think>\n\nHi there! How can I help you today?"}], "attributes": {"sample_index": 0, "step": 1, "rollout_n": 42, "reward": 1.5, "data_source": "conversation/greeting", "experiment_name": "my_experiment", "validate": false}, "timestamp": "2026-01-16T11:33:10.744140"}
-{"messages": [{"role": "system", "content": "You are a coding assistant."}, {"role": "user", "content": "Write hello world"}, {"role": "assistant", "content": "print('Hello, World!')"}], "attributes": {"sample_index": 1, "step": 1, "rollout_n": 43, "reward": 2.0, "data_source": "coding/basic", "experiment_name": "my_experiment", "validate": false}, "timestamp": "2026-01-16T11:33:11.000000"}
-```
+#### `grades` (optional — written by the app, not by producers)
+`{metric_name: [GradeEntry, ...]}`. The lists are **append-only**: the grading UI and the human-annotation surfaces only ever append, so a metric's list is its full history (successive judge runs, then human verdicts/audits, oldest first).
 
-### Reasoning/Thinking Blocks
-
-The visualizer automatically detects and renders `<think>...</think>` blocks in assistant messages as collapsible "reasoning" sections with special styling. This is useful for chain-of-thought or scratchpad content.
+The reserved `comments` metric holds per-rollout free-text human notes (`grade_type: "freeform"`, text in `grade`, `model: "human:<name>"`, `prompt_version: "comment-v1"`). Because nothing is ever removed from the log, **deleting a comment appends a tombstone** instead:
 
 ```json
 {
-  "role": "assistant",
-  "content": "<think>\nStep 1: Analyze the problem\nStep 2: Consider edge cases\n</think>\n\nHere is my final answer..."
+  "grade": "", "grade_type": "freeform", "quotes": [],
+  "explanation": "deleted comment by human:ada from 2026-08-08T07:26:08.671Z",
+  "model": "human:grace",
+  "prompt_version": "comment-delete-v1",
+  "timestamp": "2026-08-09T11:02:44.108Z",
+  "deletes": {"model": "human:ada", "timestamp": "2026-08-08T07:26:08.671Z"}
 }
 ```
 
+A machine consumer reading `comments` must filter the list the way the app's `visibleComments()` does (`frontend/src/utils/humanGrades.ts`): drop every entry that is a tombstone (`prompt_version == "comment-delete-v1"` **or** a `deletes` field is present), and every entry whose `(model, timestamp)` pair equals some tombstone's `deletes`. Entries sharing one `(model, timestamp)` pair are indistinguishable, so a single tombstone retracts all of them. A tombstone with no matching target is inert.
+
+### Canonical links
+
+The canonical deep link to one sample is **`?file=<path>&index=<n>`**, where `index` is the sample's line position in the file (0-based). `?rollout=<rollout_n>` remains supported forever for old links, but new producers should emit `index` links — the writer library returns them from every write.
+
+### Reasoning/Thinking Blocks
+
+The visualizer automatically detects and renders `<think>...</think>` blocks, ChatML (`<|im_start|>...`), and raw GPT-OSS Harmony decodes (`<|channel|>analysis<|message|>...`) in assistant messages as collapsible "reasoning" sections and structured tool calls. Logging the raw token decode is fine — the viewer parses it.
+
 ---
 
-## Python Logging Helper
+## Writing Files: the `viz_writer` Library
 
-Here's a Python class to help log rollout traces in the correct format:
+**Do not hand-roll JSONL + boto3.** The `viz_writer` package (in this repo, installed editable in the shared venv at `/home/ubuntu/reward_seeker/venv`) is the one blessed writer. It validates permissively, passes unknown fields through losslessly, stamps `attributes.viz_id`, never fabricates training fields, writes local or `s3://` destinations, and returns clickable canonical URLs.
 
 ```python
-import json
-from datetime import datetime
-from typing import List, Dict, Any, Optional
-from dataclasses import dataclass, asdict
-import os
+from viz_writer import write_rollouts
 
-@dataclass
-class Message:
-    role: str  # "system", "user", "assistant", or "tool"
-    content: str
-
-@dataclass
-class SampleAttributes:
-    sample_index: int
-    step: int
-    rollout_n: int
-    reward: float
-    data_source: str
-    experiment_name: str
-    validate: bool = False
-
-@dataclass
-class RolloutSample:
-    messages: List[Message]
-    attributes: SampleAttributes
-    timestamp: str = None
-    
-    def __post_init__(self):
-        if self.timestamp is None:
-            self.timestamp = datetime.now().isoformat()
-    
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "messages": [asdict(m) for m in self.messages],
-            "attributes": asdict(self.attributes),
-            "timestamp": self.timestamp
-        }
-    
-    def to_json(self) -> str:
-        return json.dumps(self.to_dict())
-
-
-class RolloutLogger:
-    """Logger for rollout traces in JSONL format."""
-    
-    def __init__(self, file_path: str):
-        self.file_path = file_path
-        # Ensure directory exists
-        os.makedirs(os.path.dirname(file_path) or ".", exist_ok=True)
-    
-    def log(self, sample: RolloutSample):
-        """Append a single sample to the JSONL file."""
-        with open(self.file_path, 'a') as f:
-            f.write(sample.to_json() + '\n')
-    
-    def log_rollout(
-        self,
-        messages: List[Dict[str, str]],
-        rollout_n: int,
-        reward: float,
-        step: int = 1,
-        sample_index: int = 0,
-        data_source: str = "unknown",
-        experiment_name: str = "experiment",
-        validate: bool = False
-    ):
-        """Convenience method to log a rollout with minimal boilerplate."""
-        sample = RolloutSample(
-            messages=[Message(**m) for m in messages],
-            attributes=SampleAttributes(
-                sample_index=sample_index,
-                step=step,
-                rollout_n=rollout_n,
-                reward=reward,
-                data_source=data_source,
-                experiment_name=experiment_name,
-                validate=validate
-            )
-        )
-        self.log(sample)
-
-
-# Usage example
-if __name__ == "__main__":
-    logger = RolloutLogger("rollouts/my_experiment.jsonl")
-    
-    # Log a rollout
-    logger.log_rollout(
-        messages=[
-            {"role": "system", "content": "You are a helpful assistant."},
+samples = [
+    {
+        "messages": [
             {"role": "user", "content": "What is 2+2?"},
-            {"role": "assistant", "content": "<think>\nSimple arithmetic: 2+2=4\n</think>\n\nThe answer is 4."}
+            {"role": "assistant", "content": "<think>2+2=4</think>\n\nThe answer is 4."},
         ],
-        rollout_n=1,
-        reward=1.0,
-        step=100,
-        data_source="math/arithmetic",
-        experiment_name="math_training_v1"
-    )
+        "attributes": {"experiment_name": "math_training_v1", "data_source": "math/arithmetic", "reward": 1.0},
+    },
+]
+
+result = write_rollouts(samples, "s3://rewardseeker/logs_jsonl/my_experiment/run_1.jsonl")
+print(result.url)             # file-level rollout_viz link
+print(result.sample_urls[0])  # deep link to the first sample (?file=...&index=0)
+
+# Appending to an existing file:
+write_rollouts(more_samples, result.uri, mode="append")
 ```
+
+Set `VIZ_BASE_URL` when the viewer is tunneled or remote (default `http://localhost:3000`).
+
+### Canonical bucket layout
+
+`viz_writer.dest_for(kind, name)` returns the one blessed destination for a NEW trace
+file — producers must not invent prefixes:
+
+| kind | destination |
+|---|---|
+| `session` | `s3://rewardseeker/logs_jsonl/cli_sessions/<date>/<name>.jsonl` |
+| `probe` | `s3://rewardseeker/logs_jsonl/target_probes/<date>/<name>.jsonl` |
+| `debug` | `s3://rewardseeker/logs_jsonl/debug_traces/<date>/<name>.jsonl` |
+| `chat` / `online_chat` | `s3://rewardseeker/logs_jsonl/chats|online_chats/<date>/<name>.jsonl` |
+| `eval` | `s3://rewardseeker/logs_jsonl/auto_eval/<date>/<name>.jsonl` |
+| `training_run` | `s3://rewardseeker/logs_jsonl/rollout_traces_tinker/<date>/<name>.jsonl` |
+
+**Historical files are never moved.** The canonical sample identity is
+`(file path, line index)` — every share link, results.md, and eval config points at a
+path, and viz/ grade sidecars are aligned to their originals positionally. Legacy
+prefixes (root-level `cli_sessions/`, `target_probes/`, `debug_traces/`) stay where
+their links point; the viewer's Library lists both old and new locations for each kind.
+
+## Reading Rollouts: the Fetch API
+
+Machine consumers should read rollouts through `GET /api/rollout` instead of fetching S3 directly — it resolves the graded `viz/` overlay (raw fetches silently miss grades):
+
+```
+GET /api/rollout?url=<encoded rollout_viz link>            → canonical JSON
+GET /api/rollout?file=<path>&index=<n>&format=plaintext    → fixed plaintext transcript
+Authorization: Bearer <VIZ_API_TOKEN from ~/.env>
+```
+
+There is exactly one plaintext format and truncation policy — per-caller formatting options are deliberately not offered.
 
 ---
 

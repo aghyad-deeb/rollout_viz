@@ -11,18 +11,45 @@ import { useApi } from './hooks/useApi';
 import { useMarkedFiles } from './hooks/useMarkedFiles';
 import { useDarkMode } from './hooks/useDarkMode';
 import { useUrlState } from './hooks/useUrlState';
+import { useServerConfig } from './hooks/useServerConfig';
+import { LibraryView } from './components/Library';
 import { useGrading } from './hooks/useGrading';
 import { loadCaptureWidth, saveCaptureWidth, loadCaptureFontSize, saveCaptureFontSize } from './utils/captureImage';
+import { buildPageTitle } from './utils/pageTitle';
 import { messageToPresentationDraft, type PresentationMessageDraft, type PresentationMessageDrafts } from './utils/presentationDraft';
-import type { Sample, SearchCondition, SearchLogic, ExportWidth, FontSize } from './types';
+import {
+  COMMENTS_METRIC,
+  COMMENT_PROMPT_VERSION,
+  TRIAGE_METRIC,
+  TRIAGE_VERDICTS,
+  buildCommentTombstone,
+  buildHumanEntry,
+  fileLocationOf,
+  latestHumanEntry,
+  loadAnnotator,
+  mergeAppendOnlyGrades,
+  saveAnnotator,
+  saveHumanGrade,
+} from './utils/humanGrades';
+import { TriageBar } from './components/TriageBar';
+import type { Sample, SearchCondition, SearchLogic, ExportWidth, FontSize, GradeEntry, ViewMode } from './types';
 
 // Helper to generate unique IDs
 const generateId = () => Math.random().toString(36).substring(2, 9);
+
+// Files whose combined sample count exceeds this skip bulk message hydration
+// (phase 2) — 12k-rollout eval files stall the tab otherwise. The selected
+// sample hydrates individually; a banner offers the full load.
+const FULL_HYDRATION_MAX_SAMPLES = 2000;
+// …and a byte gate: 767 long agentic rollouts can weigh 400MB+, which the
+// sample-count threshold alone misses.
+const FULL_HYDRATION_MAX_BYTES = 100 * 1024 * 1024;
 
 function LoginOverlay({ isDarkMode, onLogin }: { isDarkMode: boolean; onLogin: () => void }) {
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const passwordRef = useRef<HTMLInputElement>(null);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -39,9 +66,13 @@ function LoginOverlay({ isDarkMode, onLogin }: { isDarkMode: boolean; onLogin: (
       } else {
         const data = await res.json();
         setError(data.detail || 'Invalid password');
+        // The disabled submit drops focus to <body>; put the user back in
+        // the field with the wrong value selected, ready to retype.
+        passwordRef.current?.select();
       }
     } catch {
       setError('Connection failed');
+      passwordRef.current?.select();
     } finally {
       setLoading(false);
     }
@@ -52,9 +83,12 @@ function LoginOverlay({ isDarkMode, onLogin }: { isDarkMode: boolean; onLogin: (
       <form onSubmit={handleSubmit} className={`p-8 rounded-xl shadow-lg w-80 ${isDarkMode ? 'bg-gray-900 text-gray-100' : 'bg-white text-gray-900'}`}>
         <h2 className="text-lg font-semibold mb-4">Rollout Visualizer</h2>
         <input
+          ref={passwordRef}
           type="password"
+          name="password"
+          autoComplete="current-password"
           value={password}
-          onChange={e => setPassword(e.target.value)}
+          onChange={e => { setPassword(e.target.value); if (error) setError(''); }}
           placeholder="Enter password"
           autoFocus
           className={`w-full px-3 py-2 rounded-lg border mb-3 outline-none focus:ring-2 focus:ring-blue-500 ${isDarkMode ? 'bg-gray-800 border-gray-700 text-gray-100' : 'bg-white border-gray-300 text-gray-900'}`}
@@ -77,6 +111,7 @@ function SharedBanner({ isDarkMode, onLogin }: { isDarkMode: boolean; onLogin: (
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const passwordRef = useRef<HTMLInputElement>(null);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -93,9 +128,11 @@ function SharedBanner({ isDarkMode, onLogin }: { isDarkMode: boolean; onLogin: (
       } else {
         const data = await res.json();
         setError(data.detail || 'Invalid password');
+        passwordRef.current?.select();
       }
     } catch {
       setError('Connection failed');
+      passwordRef.current?.select();
     } finally {
       setLoading(false);
     }
@@ -119,9 +156,12 @@ function SharedBanner({ isDarkMode, onLogin }: { isDarkMode: boolean; onLogin: (
     <div className={`text-center text-xs font-medium py-2 px-4 flex items-center justify-center gap-2 ${isDarkMode ? 'bg-gray-800 text-gray-200' : 'bg-amber-100 text-amber-900'}`}>
       <form onSubmit={handleSubmit} className="flex items-center gap-2">
         <input
+          ref={passwordRef}
           type="password"
+          name="password"
+          autoComplete="current-password"
           value={password}
-          onChange={e => setPassword(e.target.value)}
+          onChange={e => { setPassword(e.target.value); if (error) setError(''); }}
           placeholder="Password"
           autoFocus
           className={`px-2 py-1 rounded text-xs w-40 outline-none border ${isDarkMode ? 'bg-gray-700 border-gray-600 text-gray-100' : 'bg-white border-amber-300 text-gray-900'}`}
@@ -165,6 +205,7 @@ function App() {
   selectedSampleIdRef.current = selectedSampleId;
   const [experimentName, setExperimentName] = useState<string>('');
   const [filePaths, setFilePaths] = useState<string[]>([]);
+  const [hydrationSkipped, setHydrationSkipped] = useState(false);
   const [isFileBrowserOpen, setIsFileBrowserOpen] = useState(false);
   const [searchConditions, setSearchConditions] = useState<SearchCondition[]>([
     { id: generateId(), field: 'chat', operator: 'contains', term: '' }
@@ -175,6 +216,11 @@ function App() {
   const [highlightedText, setHighlightedText] = useState<string | null>(null);
   const [selectedGradeMetric, setSelectedGradeMetric] = useState<string | undefined>(undefined);
   const [isGradingPanelOpen, setIsGradingPanelOpen] = useState(false);
+  // Once opened, the grading panel stays mounted (hidden) so closing the
+  // modal — Escape, backdrop, X — never discards a half-written custom
+  // metric prompt. The latch also keeps the lazy chunk unloaded until the
+  // first open.
+  const [gradingPanelMounted, setGradingPanelMounted] = useState(false);
   // Presentation Mode is owned here so the left panel can swap in a live
   // capture preview; `presentationPreview` holds the rendered PNG's object
   // URL (for display) and the Blob itself (for a reliable copy / download).
@@ -182,7 +228,29 @@ function App() {
   // "Discuss this rollout" chat — replaces the left panel when open. Mutually
   // exclusive with Presentation Mode.
   const [isRolloutChatOpen, setIsRolloutChatOpen] = useState(false);
+  // Comments drawer. Owned here (not in RightPanel) for one reason: the
+  // floating grading cluster below is `fixed` and would otherwise sit on top
+  // of the drawer's Post button and swallow its clicks.
+  const [isCommentsOpen, setIsCommentsOpen] = useState(false);
+  // Right-panel view (chat / analysis / evidence / …). Owned here so global
+  // keyboard handling can coordinate with the Evidence view's own keys.
+  const [viewMode, setViewMode] = useState<ViewMode>('chat');
+  // Triage Mode: record human verdicts as first-class grade entries.
+  const [isTriageMode, setIsTriageMode] = useState(false);
+  const [annotator, setAnnotator] = useState<string>(loadAnnotator);
+  const [noteDraft, setNoteDraft] = useState('');
+  const [triageSaveError, setTriageSaveError] = useState<string | null>(null);
   const [presentationPreview, setPresentationPreview] = useState<{ url: string; blob: Blob } | null>(null);
+  // True while the preview image is behind the latest edits (debounce +
+  // re-render in flight) — the preview panel dims and holds Copy/Download.
+  const [previewPending, setPreviewPending] = useState(false);
+  // Stable identity is load-bearing: ChatView's preview effect lists this in
+  // its deps, so an inline arrow here would re-trigger the effect after every
+  // completed capture (new App render → new identity) and re-capture in an
+  // endless loop, pinning "Updating preview…" on forever.
+  const handlePresentationPreview = useCallback((url: string | null, blob?: Blob | null) => {
+    setPresentationPreview(url && blob ? { url, blob } : null);
+  }, []);
   // Capture settings — lifted here so the left-panel preview can host them.
   // Width + font-size are restored from the user's last session; image
   // theme always starts light (a capture defaults to light by design).
@@ -205,16 +273,32 @@ function App() {
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
       e.preventDefault();
+      setIsTriageMode(false);
       setIsPresentationMode(true);
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [isPresentationMode]);
-  const { loading, error, loadSamples, loadFilesProgressively, loadMultipleSamplesFull, loadSingleSample, messagesLoaded } = useApi(shareToken);
+  // Escape closes the grading modal. Safe even mid-typing: the panel stays
+  // mounted (gradingPanelMounted), so the draft survives and reopening
+  // restores it. Skipped while the file browser is open so one Escape
+  // never closes two layers.
+  useEffect(() => {
+    if (!isGradingPanelOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || isFileBrowserOpen) return;
+      setIsGradingPanelOpen(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [isGradingPanelOpen, isFileBrowserOpen]);
+  const { loading, error, loadWarnings, clearLoadWarnings, loadSamples, loadFilesProgressively, loadMultipleSamplesFull, loadSingleSample, messagesLoaded } = useApi(shareToken);
   const { markedFiles, toggleMark } = useMarkedFiles();
   const { isDarkMode, toggleDarkMode } = useDarkMode();
   const { getUrlState, setUrlState, generateLink } = useUrlState();
   const isSharedMode = authState === 'shared';
+  // Cross-app wiring (web_chat base URL) — fetched once after full auth.
+  const serverConfig = useServerConfig(authState === 'ready');
   const grading = useGrading(authState === 'ready');
   const initialLoadDone = useRef(false);
 
@@ -307,9 +391,9 @@ function App() {
     const urlState = getUrlState();
     if (urlState.file) {
       setFilePaths([urlState.file]);
-    } else {
-      setFilePaths(['sample_rollout_traces.jsonl']);
     }
+    // No ?file param → leave filePaths empty; the Library renders as the
+    // landing view instead of force-loading the demo file.
     if (urlState.message !== undefined) {
       setHighlightedMessageIndex(urlState.message);
     }
@@ -317,6 +401,35 @@ function App() {
       setHighlightedText(urlState.highlight);
     }
   }, [getUrlState]);
+
+  // Full message hydration for every loaded file, preserving the current
+  // selection across the sample-array replacement.
+  // NOTE: uses selectedSampleIdRef (not selectedSampleId) to avoid a stale
+  // closure — the user may have changed selection since the load started.
+  const hydrateAllFiles = useCallback((paths: string[]) => {
+    setHydrationSkipped(false);
+    return loadMultipleSamplesFull(paths).then((fullData) => {
+        if (!fullData) return;
+        setSamples(prev => {
+          const currentId = selectedSampleIdRef.current;
+          const currentlySelected = currentId !== null ? prev.find(s => s.id === currentId) : null;
+          const newSamples = fullData.samples;
+          // Re-find the selected sample in the new dataset by index within its file
+          // (rollout_n + step + source_file is NOT unique — multiple samples can share these)
+          if (currentlySelected) {
+            const sourceFile = currentlySelected.attributes.source_file || '';
+            const oldFileSamples = prev.filter(s => (s.attributes.source_file || '') === sourceFile);
+            const indexInFile = oldFileSamples.findIndex(s => s.id === currentlySelected.id);
+            const newFileSamples = newSamples.filter(s => (s.attributes.source_file || '') === sourceFile);
+            const match = indexInFile >= 0 ? newFileSamples[indexInFile] : undefined;
+            if (match) {
+              setSelectedSampleId(match.id);
+            }
+          }
+          return newSamples;
+        });
+      });
+  }, [loadMultipleSamplesFull]);
 
   // Load samples when file paths change (only after authenticated or in shared mode)
   // In shared mode: single GET request for the authorized file (filtered server-side).
@@ -368,8 +481,14 @@ function App() {
     const urlState = getUrlState();
     let firstFileHandled = false;
 
+    setHydrationSkipped(false);
+    let loadedCount = 0;
+    let loadedBytes = 0;
+
     // Phase 1: progressive per-file metadata loading
-    loadFilesProgressively(filePaths, (fileSamples) => {
+    loadFilesProgressively(filePaths, (fileSamples, _loadedPath, rawBytes) => {
+      loadedCount += fileSamples.length;
+      loadedBytes += rawBytes;
       // Called as each file completes — append samples with sequential IDs
       setSamples(prev => {
         const nextId = prev.length;
@@ -443,34 +562,17 @@ function App() {
         });
       }
 
-      // Phase 2: full load in background → hydrate messages
-      // Preserve currently selected sample across the replacement
-      // NOTE: Use selectedSampleIdRef (not selectedSampleId) to avoid stale closure —
-      // selectedSampleId was null when this effect created, but user may have selected
-      // a sample during Phase 1 by the time this .then() fires.
-      loadMultipleSamplesFull(filePaths).then((fullData) => {
-        if (!fullData) return;
-        setSamples(prev => {
-          const currentId = selectedSampleIdRef.current;
-          const currentlySelected = currentId !== null ? prev.find(s => s.id === currentId) : null;
-          const newSamples = fullData.samples;
-          // Re-find the selected sample in the new dataset by index within its file
-          // (rollout_n + step + source_file is NOT unique — multiple samples can share these)
-          if (currentlySelected) {
-            const sourceFile = currentlySelected.attributes.source_file || '';
-            const oldFileSamples = prev.filter(s => (s.attributes.source_file || '') === sourceFile);
-            const indexInFile = oldFileSamples.findIndex(s => s.id === currentlySelected.id);
-            const newFileSamples = newSamples.filter(s => (s.attributes.source_file || '') === sourceFile);
-            const match = indexInFile >= 0 ? newFileSamples[indexInFile] : undefined;
-            if (match) {
-              setSelectedSampleId(match.id);
-            }
-          }
-          return newSamples;
-        });
-      });
+      // Phase 2: full load in background → hydrate messages. Skipped above
+      // the sample threshold — selected samples hydrate individually and the
+      // banner in LeftPanel offers the full load.
+      if (loadedCount > FULL_HYDRATION_MAX_SAMPLES || loadedBytes > FULL_HYDRATION_MAX_BYTES) {
+        setHydrationSkipped(true);
+        return;
+      }
+      hydrateAllFiles(filePaths);
     });
-  }, [filePaths, authState, isSharedMode, shareInfo, loadSamples, loadFilesProgressively, loadMultipleSamplesFull, getUrlState]);
+  }, [filePaths, authState, isSharedMode, shareInfo, loadSamples, loadFilesProgressively, hydrateAllFiles, getUrlState]);
+
 
   // On-demand message loading: when user selects a sample that has empty messages
   // and background full load hasn't completed yet, fetch that single sample's messages
@@ -495,20 +597,35 @@ function App() {
       if (!singleSample) return;
       setSamples(prev => prev.map(s =>
         s.id === targetId
-          ? { ...s, messages: singleSample.messages, grades: singleSample.grades ?? s.grades }
+          // Merge, don't replace: a comment/tombstone appended while this
+          // hydration request was in flight must survive the stale response.
+          ? { ...s, messages: singleSample.messages, grades: mergeAppendOnlyGrades(s.grades, singleSample.grades) }
           : s
       ));
     });
   }, [selectedSampleId, messagesLoaded, samples, filePaths, loadSingleSample]);
 
+  // True while the rollout-chat panel holds a conversation worth protecting.
+  // A ref (not state) — it changes on every streamed token batch and nothing
+  // needs to re-render on it; the confirm gates below just read it.
+  const chatDirtyRef = useRef(false);
+
   // Select a sample and clear highlights (used when user clicks a sample)
-  const handleSelectSample = (id: number) => {
+  const handleSelectSample = useCallback((id: number) => {
+    // Switching samples remounts the rollout chat (keyed by sample id) and
+    // silently destroys the conversation — confirm first when one exists.
+    if (
+      isRolloutChatOpen &&
+      chatDirtyRef.current &&
+      id !== selectedSampleIdRef.current &&
+      !window.confirm('Switching rollouts clears the current discussion. Continue?')
+    ) return;
     setSelectedSampleId(id);
     // Clear any highlights and grade selection when user manually changes sample
     setHighlightedMessageIndex(null);
     setHighlightedText(null);
     setSelectedGradeMetric(undefined);
-  };
+  }, [isRolloutChatOpen]);
 
   // Update URL whenever the selected sample changes (skip in shared mode — keep ?share= URL)
   useEffect(() => {
@@ -532,6 +649,18 @@ function App() {
   }, [isSharedMode, filePaths, primaryFilePath, selectedSampleId, samples, setUrlState, highlightedMessageIndex, highlightedText]);
 
   const selectedSample = samples.find(s => s.id === selectedSampleId) || null;
+
+  // Keep the browser tab title in sync with what's loaded, so multiple viz
+  // tabs (a common flow when sharing links) are distinguishable.
+  useEffect(() => {
+    const rolloutN = selectedSample ? Number(selectedSample.attributes.rollout_n) : NaN;
+    document.title = buildPageTitle({
+      experimentName,
+      sourceFile: selectedSample?.attributes.source_file || primaryFilePath || undefined,
+      rolloutN: Number.isFinite(rolloutN) ? rolloutN : undefined,
+      isSharedMode,
+    });
+  }, [experimentName, selectedSample, primaryFilePath, isSharedMode]);
 
   useEffect(() => {
     setPresentationActiveIndex(null);
@@ -628,7 +757,7 @@ function App() {
     return generateLink({ ...options, index: selectedIndexInFile });
   }, [selectedIndexInFile, generateLink]);
 
-  const handleNavigate = (direction: 'first' | 'prev' | 'next' | 'last') => {
+  const handleNavigate = useCallback((direction: 'first' | 'prev' | 'next' | 'last') => {
     // Navigate through filtered samples if filtering is active, otherwise all samples
     const navSamples = filteredSamples.length > 0 ? filteredSamples : samples;
     if (navSamples.length === 0) return;
@@ -652,7 +781,197 @@ function App() {
     }
 
     handleSelectSample(navSamples[newIndex].id);
-  };
+  }, [filteredSamples, samples, selectedSampleId, handleSelectSample]);
+
+  // J / K step to the next / previous sample — the core triage loop should
+  // not require clicking 28px arrow buttons. Disabled while typing, while a
+  // modal is open, in Presentation Mode / rollout chat (where a stray
+  // sample change would discard capture drafts or the chat), and in the
+  // Evidence view (which owns J/K for its own card cursor).
+  useEffect(() => {
+    if (isPresentationMode || isRolloutChatOpen || isGradingPanelOpen || isFileBrowserOpen || viewMode === 'evidence') return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const k = e.key.toLowerCase();
+      if (k !== 'j' && k !== 'k') return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+      e.preventDefault();
+      handleNavigate(k === 'j' ? 'next' : 'prev');
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [isPresentationMode, isRolloutChatOpen, isGradingPanelOpen, isFileBrowserOpen, viewMode, handleNavigate]);
+
+  // ── Triage Mode: human verdicts as first-class grade entries ─────────────
+
+  const handleAnnotatorChange = useCallback((name: string) => {
+    setAnnotator(name);
+    saveAnnotator(name);
+  }, []);
+
+  // Reviewed counts over the filtered scope (latest human entry wins).
+  const triageStats = useMemo(() => {
+    let reviewed = 0;
+    const counts: Record<string, number> = {};
+    for (const v of TRIAGE_VERDICTS) counts[v] = 0;
+    for (const s of filteredSamples) {
+      const hv = latestHumanEntry(s.grades?.[TRIAGE_METRIC]);
+      if (hv) {
+        reviewed++;
+        const g = String(hv.grade);
+        counts[g] = (counts[g] ?? 0) + 1;
+      }
+    }
+    return { reviewed, counts };
+  }, [filteredSamples]);
+
+  // Persist one human grade entry and mirror it into local state so grade
+  // columns / filters / Analysis update without a reload.
+  const applyHumanGrade = useCallback(async (sampleId: number, metric: string, entry: GradeEntry): Promise<boolean> => {
+    const sample = samples.find(s => s.id === sampleId);
+    if (!sample) return false;
+    const loc = fileLocationOf(sample, samples, primaryFilePath);
+    if (!loc) return false;
+    const ok = await saveHumanGrade(loc.filePath, loc.indexInFile, metric, entry);
+    if (ok) {
+      setSamples(prev => prev.map(s => s.id === sampleId
+        ? { ...s, grades: { ...(s.grades ?? {}), [metric]: [...(s.grades?.[metric] ?? []), entry] } }
+        : s));
+    }
+    return ok;
+  }, [samples, primaryFilePath]);
+
+  // A comment is a freeform human entry on the reserved `comments` metric —
+  // same append-only rails as the verdicts, so it lands in viz/<file>.jsonl
+  // and mirrors into local state without a reload. Returns false when the
+  // write failed, so the panel can keep the user's draft.
+  const handleAddComment = useCallback(async (sampleId: number, text: string): Promise<boolean> => {
+    const body = text.trim();
+    if (!body) return false;
+    const entry = buildHumanEntry({
+      grade: body,
+      gradeType: 'freeform',
+      annotator,
+      promptVersion: COMMENT_PROMPT_VERSION,
+    });
+    return applyHumanGrade(sampleId, COMMENTS_METRIC, entry);
+  }, [annotator, applyHumanGrade]);
+
+  // Deleting a comment is a SOFT delete: the append-only log can't drop a row,
+  // so we append a signed tombstone naming the retracted entry. Every reader
+  // goes through visibleComments(), so the comment disappears everywhere while
+  // the raw JSONL keeps both it and the deletion record.
+  const handleDeleteComment = useCallback(async (sampleId: number, target: GradeEntry): Promise<boolean> => {
+    if (!annotator.trim()) return false;
+    const tombstone = buildCommentTombstone(target, annotator.trim());
+    return applyHumanGrade(sampleId, COMMENTS_METRIC, tombstone);
+  }, [annotator, applyHumanGrade]);
+
+  const handleJumpToUnreviewed = useCallback(() => {
+    const next = filteredSamples.find(s => !latestHumanEntry(s.grades?.[TRIAGE_METRIC]));
+    if (next) handleSelectSample(next.id);
+  }, [filteredSamples, handleSelectSample]);
+
+  const handleTriageVerdict = useCallback(async (verdict: string) => {
+    const current = selectedSampleIdRef.current;
+    if (current === null || !annotator) return;
+    const entry = buildHumanEntry({
+      grade: verdict,
+      gradeType: 'categorical',
+      annotator,
+      note: noteDraft.trim() || undefined,
+    });
+    const ok = await applyHumanGrade(current, TRIAGE_METRIC, entry);
+    if (!ok) {
+      setTriageSaveError('Save failed — verdict not recorded');
+      return;
+    }
+    setTriageSaveError(null);
+    setNoteDraft('');
+    // Advance to the next unreviewed sample after this one, wrapping around.
+    // filteredSamples still holds pre-save grades; the just-verdicted sample
+    // is excluded by id so it can't be re-visited.
+    const idx = filteredSamples.findIndex(s => s.id === current);
+    for (let step = 1; step <= filteredSamples.length; step++) {
+      const cand = filteredSamples[(Math.max(0, idx) + step) % filteredSamples.length];
+      if (cand.id === current) break;
+      if (!latestHumanEntry(cand.grades?.[TRIAGE_METRIC])) {
+        handleSelectSample(cand.id);
+        return;
+      }
+    }
+  }, [annotator, noteDraft, applyHumanGrade, filteredSamples, handleSelectSample]);
+
+  // Number keys 1-N record verdicts while triaging (guarded like J/K; also
+  // inactive in the Evidence view, which records audits with its own keys).
+  useEffect(() => {
+    if (!isTriageMode || isPresentationMode || isRolloutChatOpen || isGradingPanelOpen || isFileBrowserOpen || viewMode === 'evidence') return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+      const n = parseInt(e.key, 10);
+      if (n >= 1 && n <= TRIAGE_VERDICTS.length) {
+        e.preventDefault();
+        handleTriageVerdict(TRIAGE_VERDICTS[n - 1]);
+      } else if (e.key.toLowerCase() === 'u') {
+        e.preventDefault();
+        handleJumpToUnreviewed();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [isTriageMode, isPresentationMode, isRolloutChatOpen, isGradingPanelOpen, isFileBrowserOpen, viewMode, handleTriageVerdict, handleJumpToUnreviewed]);
+
+  const handleToggleTriageMode = useCallback(() => {
+    setIsTriageMode(prev => {
+      if (!prev) {
+        // Entering: presentation mode and the rollout chat both conflict
+        // with verdict hotkeys and auto-advance.
+        if (isRolloutChatOpen && chatDirtyRef.current && !window.confirm('Entering Triage Mode closes the discussion. Continue?')) return prev;
+        chatDirtyRef.current = false;
+        setIsPresentationMode(false);
+        setIsRolloutChatOpen(false);
+      }
+      return !prev;
+    });
+    setTriageSaveError(null);
+  }, [isRolloutChatOpen]);
+
+  // ── Evidence view plumbing ────────────────────────────────────────────────
+
+  // Jump from an evidence card into the chat at the quoted span, reusing the
+  // deep-link highlight mechanics.
+  const handleOpenQuote = useCallback((sampleId: number, messageIndex: number | null, highlightText: string | null) => {
+    handleSelectSample(sampleId);
+    setViewMode('chat');
+    if (messageIndex !== null) setHighlightedMessageIndex(messageIndex);
+    if (highlightText) setHighlightedText(highlightText);
+  }, [handleSelectSample]);
+
+  // Record a human confirm/dispute of a judge's bool grade: appended to the
+  // SAME metric list, so the human call becomes the latest (displayed) grade
+  // while the judge's entry stays in the run history.
+  const handleAudit = useCallback((sampleId: number, metric: string, action: 'confirm' | 'dispute', judgeEntry: GradeEntry) => {
+    if (!annotator) return;
+    const grade = judgeEntry.grade_type === 'bool'
+      ? (action === 'confirm' ? Boolean(judgeEntry.grade) : !judgeEntry.grade)
+      : judgeEntry.grade;
+    const entry = buildHumanEntry({
+      grade,
+      gradeType: judgeEntry.grade_type,
+      annotator,
+      note: `${action === 'confirm' ? 'confirmed' : 'disputed'} ${judgeEntry.model}`,
+      promptVersion: 'audit-v1',
+    });
+    applyHumanGrade(sampleId, metric, entry);
+  }, [annotator, applyHumanGrade]);
+
+  // Latest human verdict on the selected sample (drives the TriageBar).
+  const selectedTriageEntry = selectedSample
+    ? latestHumanEntry(selectedSample.grades?.[TRIAGE_METRIC])
+    : undefined;
 
   // Reload samples after grading to pick up the viz/ version with grades
   const handleGradingComplete = useCallback(() => {
@@ -664,6 +983,30 @@ function App() {
       }
     });
   }, [filePaths, loadMultipleSamplesFull]);
+
+  // Reattach to an in-progress server-side grading job after a page reload, so
+  // the progress bar resumes advancing. Completed grades already load from viz/.
+  const reattachedRef = useRef(false);
+  useEffect(() => {
+    if (authState !== 'ready' || filePaths.length === 0) return;
+    if (reattachedRef.current || grading.progress.isRunning) return;
+    reattachedRef.current = true;
+    grading.listGradeJobs(filePaths).then(jobs => {
+      const active = jobs.find(j => j.status === 'running');
+      if (active) grading.attachToJob(active.job_id);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authState, filePaths, grading.progress.isRunning]);
+
+  // When a grading job finishes (including one reattached to with the panel
+  // closed), refresh samples so the final grades appear.
+  const lastGradeStatusRef = useRef(grading.progress.status);
+  useEffect(() => {
+    if (grading.progress.status === 'complete' && lastGradeStatusRef.current !== 'complete') {
+      handleGradingComplete();
+    }
+    lastGradeStatusRef.current = grading.progress.status;
+  }, [grading.progress.status, handleGradingComplete]);
 
   if (authState === 'loading') {
     return (
@@ -709,12 +1052,42 @@ function App() {
         }} />
       )}
 
+      {/* Triage bar — record human verdicts with 1-4 while reading */}
+      {!isSharedMode && isTriageMode && (
+        <TriageBar
+          isDarkMode={isDarkMode}
+          annotator={annotator}
+          onAnnotatorChange={handleAnnotatorChange}
+          verdicts={TRIAGE_VERDICTS}
+          currentVerdict={selectedTriageEntry ? String(selectedTriageEntry.grade) : null}
+          currentNote={selectedTriageEntry?.explanation ?? ''}
+          noteDraft={noteDraft}
+          onNoteDraftChange={setNoteDraft}
+          reviewedCount={triageStats.reviewed}
+          totalCount={filteredSamples.length}
+          verdictCounts={triageStats.counts}
+          hasSelection={selectedSample !== null}
+          onVerdict={handleTriageVerdict}
+          onJumpToUnreviewed={handleJumpToUnreviewed}
+          saveError={triageSaveError}
+          onClose={handleToggleTriageMode}
+        />
+      )}
+
+      {authState === 'ready' && filePaths.length === 0 ? (
+        <LibraryView
+          isDarkMode={isDarkMode}
+          onOpenFile={setFilePaths}
+          onOpenFileBrowser={() => setIsFileBrowserOpen(true)}
+        />
+      ) : (
       <PanelGroup orientation="horizontal" className="flex-1 min-h-0">
         <Panel id="left" defaultSize="35%" minSize="10%" maxSize="90%">
           {isPresentationMode ? (
             <PresentationPreviewPanel
               imageUrl={presentationPreview?.url ?? null}
               imageBlob={presentationPreview?.blob ?? null}
+              isPending={previewPending}
               isDarkMode={isDarkMode}
               imageTheme={imageTheme}
               exportWidth={exportWidth}
@@ -723,7 +1096,12 @@ function App() {
               onExportWidthChange={setExportWidth}
               onFontSizeChange={setFontSize}
               activeMessageIndex={presentationActiveIndex}
-              messageCount={selectedSample?.messages.length ?? 0}
+              messageLabels={selectedSample?.messages.map((m, i) =>
+                presentationDrafts[i]?.displayLabel || presentationDrafts[i]?.role || m.role
+              ) ?? []}
+              exportBaseName={selectedSample && presentationActiveIndex !== null
+                ? `rollout-${selectedSample.attributes.rollout_n}-step${selectedSample.attributes.step}-msg${presentationActiveIndex + 1}`
+                : undefined}
               activeDraft={activePresentationDraft}
               activeDraftDirty={activePresentationDraftDirty}
               draftCount={Object.keys(presentationDrafts).length}
@@ -737,7 +1115,12 @@ function App() {
               key={selectedSample?.id ?? 'no-sample'}
               sample={selectedSample}
               isDarkMode={isDarkMode}
-              onClose={() => setIsRolloutChatOpen(false)}
+              onDirtyChange={(dirty) => { chatDirtyRef.current = dirty; }}
+              onClose={() => {
+                if (chatDirtyRef.current && !window.confirm('Close the discussion? The conversation will be lost.')) return;
+                chatDirtyRef.current = false;
+                setIsRolloutChatOpen(false);
+              }}
             />
           ) : (
           <LeftPanel
@@ -754,12 +1137,16 @@ function App() {
             onSearchLogicChange={setSearchLogic}
             loading={loading}
             error={error}
+            loadWarnings={loadWarnings}
+            onDismissLoadWarnings={clearLoadWarnings}
             isDarkMode={isDarkMode}
             onToggleDarkMode={toggleDarkMode}
             onFilteredSamplesChange={setFilteredSamples}
             onCurrentOccurrenceIndexChange={setCurrentOccurrenceIndex}
             messagesLoaded={messagesLoaded}
             isSharedMode={isSharedMode}
+            hydrationSkipped={hydrationSkipped}
+            onLoadAllMessages={() => hydrateAllFiles(filePaths)}
           />
           )}
         </Panel>
@@ -771,13 +1158,15 @@ function App() {
             sample={selectedSample}
             filteredSamples={filteredSamples}
             experimentName={experimentName}
-            totalSamples={samples.length}
+            viewMode={viewMode}
+            onViewModeChange={setViewMode}
             onNavigate={handleNavigate}
             searchConditions={searchConditions}
             currentOccurrenceIndex={currentOccurrenceIndex}
             isDarkMode={isDarkMode}
             filePath={getFilePathForSample(selectedSample)}
             generateLink={generateLinkWithIndex}
+            webChatBaseUrl={serverConfig?.web_chat_base_url ?? null}
             highlightedMessageIndex={highlightedMessageIndex}
             highlightedText={highlightedText}
             onClearHighlight={() => {
@@ -790,10 +1179,36 @@ function App() {
             shareToken={shareToken}
             selectedIndexInFile={selectedIndexInFile}
             isPresentationMode={isPresentationMode}
-            onTogglePresentationMode={() => { setIsRolloutChatOpen(false); setIsPresentationMode((v) => !v); }}
+            onTogglePresentationMode={() => {
+              // Entering Presentation Mode closes the rollout chat — confirm
+              // before silently discarding a live discussion.
+              if (isRolloutChatOpen && chatDirtyRef.current && !window.confirm('Entering Presentation Mode closes the discussion. Continue?')) return;
+              if (isRolloutChatOpen) chatDirtyRef.current = false;
+              setIsRolloutChatOpen(false);
+              setIsTriageMode(false);
+              setIsPresentationMode((v) => !v);
+            }}
+            onExitPresentationMode={() => setIsPresentationMode(false)}
+            isTriageMode={isTriageMode}
+            onToggleTriageMode={handleToggleTriageMode}
+            annotator={annotator}
+            onAnnotatorChange={handleAnnotatorChange}
+            onOpenQuote={handleOpenQuote}
+            onAudit={handleAudit}
+            onAddComment={isSharedMode ? undefined : handleAddComment}
+            onDeleteComment={isSharedMode ? undefined : handleDeleteComment}
+            isCommentsOpen={isCommentsOpen}
+            onToggleComments={() => setIsCommentsOpen(v => !v)}
             isRolloutChatOpen={isRolloutChatOpen}
-            onToggleRolloutChat={() => { setIsPresentationMode(false); setIsRolloutChatOpen((v) => !v); }}
-            onPresentationPreview={(url, blob) => setPresentationPreview(url && blob ? { url, blob } : null)}
+            onToggleRolloutChat={() => {
+              if (isRolloutChatOpen && chatDirtyRef.current && !window.confirm('Close the discussion? The conversation will be lost.')) return;
+              if (isRolloutChatOpen) chatDirtyRef.current = false;
+              setIsPresentationMode(false);
+              setIsTriageMode(false);
+              setIsRolloutChatOpen((v) => !v);
+            }}
+            onPresentationPreview={handlePresentationPreview}
+            onPreviewPending={setPreviewPending}
             imageTheme={imageTheme}
             exportWidth={exportWidth}
             fontSize={fontSize}
@@ -803,6 +1218,7 @@ function App() {
           />
         </Panel>
       </PanelGroup>
+      )}
 
       {/* File Browser Modal — hidden in shared mode */}
       {!isSharedMode && (
@@ -819,15 +1235,28 @@ function App() {
         />
       )}
 
-      {/* Grading Panel Modal — hidden in shared mode */}
-      {!isSharedMode && isGradingPanelOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-          <div className={`relative w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto rounded-xl shadow-2xl ${isDarkMode ? 'bg-gray-900' : 'bg-white'}`}>
+      {/* Grading Panel Modal — hidden in shared mode. Stays mounted once
+          opened (visibility toggled with CSS) so drafted metric config
+          survives Escape / backdrop / X dismissal. */}
+      {!isSharedMode && gradingPanelMounted && (
+        <div
+          className={`fixed inset-0 z-50 items-center justify-center bg-black/50 ${isGradingPanelOpen ? 'flex' : 'hidden'}`}
+          onClick={() => setIsGradingPanelOpen(false)}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="LLM grading"
+            onClick={(e) => e.stopPropagation()}
+            className={`relative w-full max-w-xl mx-4 max-h-[90vh] overflow-y-auto custom-scrollbar rounded-xl shadow-2xl ${isDarkMode ? 'bg-gray-900' : 'bg-white'}`}
+          >
             <button
               onClick={() => setIsGradingPanelOpen(false)}
+              aria-label="Close grading panel"
+              title="Close (Esc)"
               className={`absolute top-3 right-3 p-1 rounded-lg ${isDarkMode ? 'hover:bg-gray-700 text-gray-400' : 'hover:bg-gray-100 text-gray-500'}`}
             >
-              <span className="material-symbols-outlined">close</span>
+              <span className="material-symbols-outlined" aria-hidden="true">close</span>
             </button>
             <div className="p-4">
               <Suspense fallback={
@@ -847,9 +1276,20 @@ function App() {
         </div>
       )}
 
-      {/* Floating Grade Button — hidden in shared mode */}
+      {/* Floating Grade Button — hidden in shared mode.
+          While the comments drawer is open the cluster slides left of it
+          (24rem drawer + the usual 1.5rem gutter): it used to sit on top of
+          the drawer's Post button and eat its clicks. It shifts rather than
+          hides because it also carries Cancel grading, which must stay
+          reachable for the whole length of a run. Below sm the drawer is a
+          full-width overlay with no free gutter, so the cluster hides there
+          — nothing behind the overlay is actionable anyway. */}
       {!isSharedMode && samples.length > 0 && (
-        <div className="fixed bottom-6 right-6 z-40 flex items-center gap-2">
+        <div
+          className={`fixed bottom-6 right-6 z-40 items-center gap-2 ${
+            isCommentsOpen ? 'hidden sm:flex sm:right-[25.5rem]' : 'flex'
+          }`}
+        >
           {grading.progress.isRunning && (
             <button
               onClick={(e) => {
@@ -863,7 +1303,7 @@ function App() {
             </button>
           )}
           <button
-            onClick={() => setIsGradingPanelOpen(true)}
+            onClick={() => { setGradingPanelMounted(true); setIsGradingPanelOpen(true); }}
             className={`rounded-full shadow-lg transition-all flex items-center gap-2
               ${grading.progress.isRunning 
                 ? 'bg-blue-600 text-white px-4 py-3'

@@ -199,12 +199,19 @@ function buildDiagnostics(messages: AutoEvalPrefillMessage[]): ExactPrefillEnvel
 
 export function toExactPrefillEnvelope(sample: Sample, source: Record<string, unknown> = {}): ExactPrefillEnvelope {
   const messages = toAutoEvalPrefill(sample.messages);
-  const jsonlEntry = sample.raw_jsonl_entry ?? {
-    messages: sample.messages,
-    attributes: sample.attributes,
-    timestamp: sample.timestamp,
-    grades: sample.grades,
-  };
+  // raw_jsonl_entry is a load-time snapshot: grades appended this session
+  // (comments, deletion tombstones) exist only in sample.grades. Overlay the
+  // live grades so the exported raw entry is never missing a deletion record
+  // — nothing is removed here, the archival copy stays complete.
+  const rawEntry = sample.raw_jsonl_entry;
+  const jsonlEntry = rawEntry
+    ? (sample.grades ? { ...(rawEntry as Record<string, unknown>), grades: sample.grades } : rawEntry)
+    : {
+        messages: sample.messages,
+        attributes: sample.attributes,
+        timestamp: sample.timestamp,
+        grades: sample.grades,
+      };
   return {
     schema_version: 2,
     kind: 'exact_prefill',

@@ -39,14 +39,14 @@ This project follows **Red/Green TDD**: write a failing test with timing/behavio
 ```bash
 # Backend (pytest + pytest-benchmark + moto for S3 mocking)
 source venv/bin/activate
-pytest tests/ -v                                    # Full suite (~160 tests)
+pytest tests/ -v                                    # Full suite (~450 tests)
 pytest tests/test_performance.py -v                 # Performance benchmarks
 pytest tests/test_llm_providers.py -v               # LLM provider unit tests
 pytest tests/test_performance.py -k "s3_client" -v  # Run specific test class
 
 # Frontend (vitest + @testing-library/react)
 cd frontend
-npx vitest run                                      # Full suite (~120 tests)
+npx vitest run                                      # Full suite (~780 tests)
 npx vitest run src/hooks/useDebouncedValue.test.ts   # Single file
 npx vitest run src/components/LeftPanel/             # Directory
 npx vitest                                          # Watch mode
@@ -136,6 +136,12 @@ FastAPI auto-docs available at `http://localhost:8000/docs`.
 | `/api/grade` | POST | Non-streaming grade (legacy, unused by frontend) |
 | `/api/grade-stream` | POST | SSE streaming grade (used by frontend) |
 | `/api/save-graded` | POST | Merge new grades into `viz/` file |
+| `/api/rollout` | GET | Canonical single-rollout fetch for machine consumers (`url=` or `file=`+`index=`/`rollout=`; `format=plaintext` has exactly ONE format/truncation policy — per-caller options are refused by design). Resolves the viz/ overlay. Lives in `backend/fetch_api.py` |
+| `/api/config` | GET | Non-secret cross-app wiring (`web_chat_base_url`) |
+| `/api/library` | GET | Landing-page corpus index: kinds→groups→files from ONE cached S3 listing (900s TTL, stale-while-revalidate, boot warmup; no crawler/daemon). `backend/library_api.py` |
+| `/api/library/preview` | GET | Lazy first-line preview of one file (256KB ranged GET) |
+| `/api/companion` | GET | Companion files (plan.md/summary.json/execution.jsonl) next to a loaded file. `backend/companion_api.py` |
+| `/api/raw` | GET | Raw text of a companion file (2MB cap, extension allowlist, traversal-guarded) |
 
 ## Configuration
 
@@ -148,6 +154,11 @@ OPENAI_API_KEY=...
 ANTHROPIC_API_KEY=...
 GOOGLE_API_KEY=...
 OPENROUTER_API_KEY=...
+VIZ_API_TOKEN=...          # Machine auth: Authorization: Bearer <token> == full access (web_chat/auto_eval/skills call the fetch API with it)
+VIZ_FILE_CACHE_MB=4096     # Byte budget for the parsed-file cache (raw bytes; default 4096)
+VIZ_LIBRARY_BUCKET=...     # Bucket the Library landing view lists (default rewardseeker)
+VIZ_LIBRARY_WARMUP=1       # Boot-time background Library scan (default on)
+WEB_CHAT_BASE_URL=...      # Enables the "Open in web_chat" action (unset = hidden)
 AWS_ACCESS_KEY_ID=...      # For S3 file browsing
 AWS_SECRET_ACCESS_KEY=...
 AWS_DEFAULT_REGION=...
@@ -156,6 +167,11 @@ AWS_DEFAULT_REGION=...
 ## Important Patterns
 
 ### Backend
+- **viz_writer package** (`viz_writer/`, editable-installed in the shared venv): THE blessed writer for producers — permissive validation, lossless passthrough, stamps `attributes.viz_id`, never fabricates reward/step/sample_index, returns canonical `?file&index` URLs. Single-writer-per-file contract for S3 append (conditional puts turn races into loud errors).
+- **Machine auth**: `Authorization: Bearer <VIZ_API_TOKEN>` == full access (checked in auth_middleware step 1.5, bytes compare_digest, case-insensitive scheme, explicit 401 on mismatch). Consumers discover the token from `ROLLOUT_VIZ_TOKEN` env or the `VIZ_API_TOKEN` line in `~/.env`.
+- **File cache is byte-capped**: `_cache_put()` centralizes insert+evict (FIFO, 20 entries AND `VIZ_FILE_CACHE_MB` raw bytes) under a lock — loaders run in threadpools, unlocked eviction raced. Reads use `.get()` (atomic), entries are `(validator, data, nbytes)` 3-tuples.
+- **New routers go in new modules** (`fetch_api.py`, `library_api.py`, `companion_api.py`), included at the BOTTOM of main.py BEFORE the static-file catch-all (routes registered after it are dead). They import `backend.main` at call time, not module level (import-order trap).
+- **Library is listing-derived only**: one S3 listing pass (≈90s cold on the real bucket → 900s TTL + stale-while-revalidate + boot warmup + single-flight). No crawler, no daemon, no per-file HEADs. Hardcoded prefix→kind map.
 - **S3 client singleton**: `_get_s3_client()` lazily creates one `boto3.client('s3')` and reuses it across all S3 operations. Call `_reset_s3_client()` in tests to force re-creation (e.g., inside `mock_aws` context). All 5 S3 functions use this — never call `boto3.client('s3')` directly.
 - **GZip compression**: `GZipMiddleware(minimum_size=1000)` compresses API responses over 1KB. Added after CORS middleware.
 - **File loading cache**: `load_jsonl_from_file()` caches parsed results keyed by `(path, mtime)`. FIFO eviction at 20 entries. Call `_clear_file_cache()` in tests. Invalidates automatically when file mtime changes.
@@ -187,9 +203,26 @@ AWS_DEFAULT_REGION=...
 - **Auth cookie**: `secure` flag is auto-set based on whether the request comes from localhost (HTTP) or not (HTTPS).
 - **Tunnel hosts**: When adding a new tunnel service, add its domain pattern to `server.allowedHosts` in `frontend/vite.config.ts`.
 - **LocalStorage keys**: `rollout_viz_api_keys`, `rollout_viz_last_provider`, `rollout_viz_last_model`, `rollout_viz_dark_mode`, `rollout_viz_marked_files`.
+- **Keyboard shortcuts**: `J`/`K` next/prev sample (global, suppressed while typing / in modals / presentation mode / rollout chat), `ArrowUp`/`ArrowDown` in the focused sample table, `Ctrl+F` in-chat search, `P` enters presentation mode (then per-card capture), `Escape` closes modals (FileBrowser, GradingPanel, capture preview) and exits Presentation Mode. The grading modal stays mounted after first open so Escape/backdrop dismissal never loses a drafted custom metric.
+- **Degenerate ID column**: when every loaded sample shares one `sample_index` but `rollout_n` varies, the table's first column switches to `Rollout` (computed over the full sample list in `LeftPanel/index.tsx` as `idColumnKey`, so filtering never flips it).
+- **Callback identity discipline**: ChatView's preview-capture effect reads its callbacks through refs, and object-valued optional props use hoisted module-level defaults (`EMPTY_DRAFTS`, `EMPTY_WRAP_SET`) — an inline `= {}` default or an unstable callback in that effect's deps re-arms a capture loop ("Updating preview…" forever). Regression-tested in `ChatView.test.tsx` ("live preview pipeline").
+- **Rollout chat protection**: `RolloutChatPanel` reports dirtiness via `onDirtyChange`; App gates sample switches, chat close, and presentation-mode entry behind `window.confirm` while a discussion exists (the panel is keyed by sample id and remounts on switch).
+- **Partial load failures**: the batch endpoint returns per-file `errors`; `useApi` exposes them as `loadWarnings` and LeftPanel shows a dismissible amber banner alongside the loaded samples (full-screen `error` is reserved for nothing-loaded).
+- **Page title**: `utils/pageTitle.ts` `buildPageTitle()` keeps `document.title` in sync with the loaded experiment/file and selected rollout (wired in `App.tsx`).
+- **Library landing view**: with no `?file` param the app renders `components/Library` instead of force-loading the demo file (kinds→groups→files, lazy previews on expand, "Load all" ≤20 files via multi-file loading). FileBrowser stays reachable via "Browse all files…".
+- **Hidden default columns**: columns constant across ALL loaded samples AND equal to the schema default (reward 0, step 0/1, data_source "unknown") are hidden behind a visible "N columns hidden" pill (never silently); computed over the full sample list like `idColumnKey` so filtering can't flip it.
+- **Hydration threshold**: bulk phase-2 message loading is skipped above 2,000 samples or 100MB raw (`total_raw_bytes` from the batch endpoint); a blue banner offers "Load all messages"; selected samples hydrate individually. Search only covers loaded messages until then.
+- **Diag pill**: sample-level `diagnostics[]` (producer notes) pass through the backend and render as an amber "diag" pill in NavigationBar.
+- **Open in web_chat**: NavigationBar shows a forum icon linking `${web_chat_base_url}/?chat=<s3key>&branch=<branch_id>` when the sample has `chat_id`, the file is under `s3://rewardseeker/`, and `/api/config` provides the base URL (`useServerConfig`, auth-gated fetch).
+- **Run files drawer**: folder icon in NavigationBar → `CompanionDrawer` (companion list + inline md/json rendering; companion .jsonl files link OUT to a new viewer tab).
+- **Canonical links**: `?file&index` is canonical (index-first resolution in App.tsx, share tokens carry index, copy-link dual-emits index+rollout+step); `?rollout=` stays supported forever for legacy links.
+- **Human verdicts (Triage Mode)**: human annotations are ordinary `GradeEntry` rows appended to the same per-metric lists as LLM judges, distinguished by `model: "human:<name>"` (`utils/humanGrades.ts`; saved via the existing `POST /api/save-graded` merge — zero backend changes). Triage Mode (checklist toggle in NavigationBar) records verdicts under the `human_verdict` metric with keys 1-4 + optional note, auto-advancing to the next unreviewed sample in the filtered scope; annotator name persists in localStorage (`rollout_viz_annotator`). Judge-vs-human helpers: `latestHumanEntry` / `latestJudgeEntry`.
+- **Comments**: per-rollout free-text comments ride the same human-annotation rails — `GradeEntry` rows with `grade_type: 'freeform'` (text in `grade`, `model: "human:<name>"`, `prompt_version: 'comment-v1'`) under the reserved `comments` metric (`COMMENTS_METRIC` in `utils/humanGrades.ts`), persisted via `applyHumanGrade` → `POST /api/save-graded` (append-only; no edit). UI: `RightPanel/CommentsPanel.tsx` drawer with the `sticky_note_2` glyph (never `forum`, which is the LLM discussion chat), toggled from NavigationBar (count badge + amber attention dot for an unposted draft / failed save, via the panel's `onAttentionChange`; hidden in shared mode). Open state is owned by **App** (`isCommentsOpen`) because the `fixed bottom-6 right-6` grading cluster must shift left of the 24rem drawer (`sm:right-[25.5rem]`, hidden below sm) or it swallows the Post button's clicks; RightPanel keeps the mounted latch (drawer hides, never unmounts, so per-sample drafts and Escape/X focus-return to the toggle survive) and lays the drawer out as a **flex sibling** of the content column (`sm:static sm:w-[24rem] sm:shrink-0`), so the transcript shrinks instead of being covered — full-width absolute overlay only below sm. `post()` consumes only the snapshot it sent, keeping text typed mid-flight. `comments` is a reserved NON-judgement metric: excluded from GradesDisplay, `buildGradeSummary` (hence Analysis tiles/count/inspector), and SampleTable's grade columns — the table gets a dedicated sortable `comment_count` column instead. It stays queryable in the filter mini-language.
+- **Comment soft-delete (tombstones)**: the log is append-only, so deleting a comment appends a *tombstone* to the same `comments` list — `prompt_version: 'comment-delete-v1'`, empty `grade`, signed `model: "human:<deleter>"`, and a new optional `GradeEntry.deletes: {model, timestamp}` naming the retracted entry (one tombstone hides EVERY entry matching that pair; a tombstone with no target is inert). `visibleComments()` in `utils/humanGrades.ts` is **the one true reader** — the drawer list/header count, NavigationBar badge, SampleTable `comment_count` (count, tooltip, and column-presence), LeftPanel's sort case, and the filter mini-language's `comments` field all go through it; anything reading a comments list raw is a bug. Wired as `App.handleDeleteComment` → `buildCommentTombstone` → `applyHumanGrade`, threaded to CommentsPanel as `onDeleteComment` (undefined in shared mode). No backend change — `save-graded` passes the extra `deletes` key through. Per-card hover/focus delete button, `window.confirm` guard, requires a non-empty annotator (the tombstone is signed), no undo (history lives in the raw log).
+- **Evidence view**: right-panel mode (`viewMode === 'evidence'`, view state owned by App) that renders every grader quote for one metric across the loaded corpus (`utils/evidence.ts` `buildEvidenceIndex`), with audit flags — `noEvidence` (judge saved no quotes) and `quoteNotFound` (quote text absent from the referenced message, i.e. possibly fabricated evidence) sort first. Confirm/Dispute on bool metrics appends a human entry to the SAME metric list (judge entry stays in run history). J/K in this view move the card cursor, so App's global J/K sample navigation is suppressed while it's active.
 
 ### Unimplemented UI
-Several buttons are placeholders: Cut/Edit on MessageCard, Download in NavigationBar, Eval/Meta view modes (show "coming soon"). Only `chat` and `analysis` view modes are functional.
+Eval/Meta view modes are disabled in the view-mode switcher ("Coming soon"); only `chat` and `analysis` view modes are functional. The former placeholder controls (Cut/Edit on MessageCard, the favourite star column, the inert LeftPanel header tabs) have been removed.
 
 ## JSONL Data Format
 

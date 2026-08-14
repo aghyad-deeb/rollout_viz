@@ -1,10 +1,55 @@
 import { useState, useMemo, useCallback, useEffect } from 'react';
 import type { Sample, SortColumn, SortOrder, SearchCondition, SearchLogic } from '../../types';
-import { SampleTable } from './SampleTable';
+
+// Build a random permutation rank (sample id → position) via Fisher–Yates.
+// Module-level so the (impure) Math.random call never runs during render — it's
+// invoked only from the shuffle event handler. Session-only: nothing persisted.
+function buildRandomRank(samples: Sample[]): Map<number, number> {
+  const ids = samples.map(s => s.id);
+  for (let i = ids.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [ids[i], ids[j]] = [ids[j], ids[i]];
+  }
+  const rank = new Map<number, number>();
+  ids.forEach((id, idx) => rank.set(id, idx));
+  return rank;
+}
+import { SampleTable, COMMENT_COUNT_COLUMN } from './SampleTable';
 import { FilterBar } from './FilterBar';
+import { COMMENTS_METRIC, visibleComments } from '../../utils/humanGrades';
 import { MetadataHeader } from './MetadataHeader';
 import { useDebouncedValue } from '../../hooks/useDebouncedValue';
 import { normalizeAssistantMessage, countMessageOccurrences } from '../../utils/parseContent';
+
+// Helper to generate unique IDs (same pattern as FilterBar's search conditions)
+const generateId = () => Math.random().toString(36).substring(2, 9);
+
+// Hoisted empty set for the no-columns-hidden case (identity discipline).
+const NO_HIDDEN_COLUMNS: ReadonlySet<string> = new Set();
+
+// Human labels for the hidden-columns pill tooltip.
+const HIDDEN_COLUMN_LABELS: Record<string, string> = {
+  reward: 'Reward',
+  step: 'Step',
+  data_source: 'Source',
+};
+
+// Regex a filter condition must match: field operator value.
+// Kept in sync with evaluateCondition inside the filteredSamples memo.
+const FILTER_CONDITION_REGEX = /^(\w+)\s*(==|!=|>=|<=|>|<|contains)\s*(.+)$/i;
+
+// Base filter fields for expression validation. Keep in sync with
+// BASE_FILTER_FIELDS in FilterBar.tsx (react-refresh forbids exporting
+// constants from component files, hence the duplication).
+const BASE_FILTER_FIELD_NAMES = [
+  'reward',
+  'step',
+  'sample_index',
+  'rollout_n',
+  'data_source',
+  'is_validate',
+  'experiment_name',
+];
 
 interface LeftPanelProps {
   samples: Sample[];
@@ -20,12 +65,18 @@ interface LeftPanelProps {
   onSearchLogicChange: (logic: SearchLogic) => void;
   loading: boolean;
   error: string | null;
+  /** Per-file load failures that didn't block other files from loading. */
+  loadWarnings?: string[];
+  onDismissLoadWarnings?: () => void;
   isDarkMode: boolean;
   onToggleDarkMode: () => void;
   onFilteredSamplesChange?: (samples: Sample[]) => void;
   onCurrentOccurrenceIndexChange?: (index: number) => void;
   messagesLoaded?: boolean;
   isSharedMode?: boolean;
+  /** Bulk message hydration was skipped (huge file) — banner offers it. */
+  hydrationSkipped?: boolean;
+  onLoadAllMessages?: () => void;
 }
 
 export function LeftPanel({
@@ -42,21 +93,80 @@ export function LeftPanel({
   onSearchLogicChange,
   loading,
   error,
+  loadWarnings = [],
+  onDismissLoadWarnings,
   isDarkMode,
   onToggleDarkMode,
   onFilteredSamplesChange,
   onCurrentOccurrenceIndexChange,
   messagesLoaded = true,
   isSharedMode = false,
+  hydrationSkipped = false,
+  onLoadAllMessages,
 }: LeftPanelProps) {
   const [sortColumn, setSortColumn] = useState<SortColumn>('sample_index');
   const [sortOrder, setSortOrder] = useState<SortOrder>('asc');
   const [filterExpression, setFilterExpression] = useState('');
+  // Session-only random ordering (id → rank). Held in state, set only by the
+  // shuffle handler; never persisted to the URL or localStorage, so a reload
+  // restores the natural order. Selection and deep links resolve by sample id /
+  // attributes, not display position, so shuffling never breaks links.
+  const [randomRank, setRandomRank] = useState<Map<number, number>>(() => new Map());
   const [currentOccurrenceIndex, setCurrentOccurrenceIndex] = useState(0); // Which occurrence within current sample
 
   // Debounce search/filter inputs to avoid re-filtering on every keystroke
   const debouncedSearchConditions = useDebouncedValue(searchConditions, 150);
   const debouncedFilterExpression = useDebouncedValue(filterExpression, 150);
+
+  // When every loaded sample shares one sample_index (e.g. many rollouts of a
+  // single prompt) the ID column is useless — show rollout_n instead, provided
+  // it actually varies. Computed over the FULL sample list (not the filtered
+  // one) so narrowing a filter never flips the column.
+  const idColumnKey = useMemo<'sample_index' | 'rollout_n'>(
+    () =>
+      samples.length > 1 &&
+      samples.every(s => s.attributes.sample_index === samples[0].attributes.sample_index) &&
+      !samples.every(s => s.attributes.rollout_n === samples[0].attributes.rollout_n)
+        ? 'rollout_n'
+        : 'sample_index',
+    [samples],
+  );
+
+  // Columns that are constant across ALL loaded samples AND equal to the
+  // schema default carry no information — producers historically faked them
+  // (reward: 0, step: 1) just to satisfy the viewer. Hidden behind a visible
+  // pill, never silently. Computed over the FULL sample list (like
+  // idColumnKey) so filtering can't flip column visibility mid-search.
+  const hiddenDefaultColumns = useMemo<ReadonlySet<string>>(() => {
+    if (samples.length === 0) return NO_HIDDEN_COLUMNS;
+    const hidden = new Set<string>();
+    if (samples.every(s => Number(s.attributes.reward) === 0)) hidden.add('reward');
+    const firstStep = Number(samples[0].attributes.step);
+    if (
+      (firstStep === 0 || firstStep === 1) &&
+      samples.every(s => Number(s.attributes.step) === firstStep)
+    ) {
+      hidden.add('step');
+    }
+    if (samples.every(s => (s.attributes.data_source || 'unknown') === 'unknown')) {
+      hidden.add('data_source');
+    }
+    return hidden.size > 0 ? hidden : NO_HIDDEN_COLUMNS;
+  }, [samples]);
+
+  const [showHiddenColumns, setShowHiddenColumns] = useState(false);
+  const effectiveHiddenColumns = showHiddenColumns ? NO_HIDDEN_COLUMNS : hiddenDefaultColumns;
+
+  // Loading a different file (not just new grades on the same samples) drops any
+  // session shuffle so the order is predictable on load. Done as an in-render state
+  // adjustment (React's recommended alternative to an effect) keyed on the file list.
+  const fileKey = filePaths.join('|');
+  const [shuffledFileKey, setShuffledFileKey] = useState(fileKey);
+  if (shuffledFileKey !== fileKey) {
+    setShuffledFileKey(fileKey);
+    setRandomRank(new Map());
+    setSortColumn(c => (c === 'random' ? 'sample_index' : c));
+  }
 
   // Filter and sort samples
   const filteredSamples = useMemo(() => {
@@ -178,7 +288,7 @@ export function LeftPanel({
           attrs: Record<string, unknown>
         ): boolean => {
           // Match: field operator value (supports contains operator)
-          const match = condition.trim().match(/^(\w+)\s*(==|!=|>=|<=|>|<|contains)\s*(.+)$/i);
+          const match = condition.trim().match(FILTER_CONDITION_REGEX);
           if (!match) return true; // Invalid condition passes
           
           const [, field, operator, valueStr] = match;
@@ -239,7 +349,14 @@ export function LeftPanel({
           
           // Add metric values to attrs
           if (sample.grades) {
-            for (const [metricName, grades] of Object.entries(sample.grades)) {
+            for (const [metricName, rawGrades] of Object.entries(sample.grades)) {
+              // `comments` is append-only and carries deletion tombstones —
+              // querying it must see the latest VISIBLE comment, never a
+              // tombstone's empty grade. All comments deleted → the field is
+              // absent, exactly as if nothing was ever written.
+              const grades = metricName === COMMENTS_METRIC
+                ? visibleComments(rawGrades)
+                : rawGrades;
               if (grades.length > 0) {
                 const grade = grades[grades.length - 1].grade;
                 // Convert bool to number for comparison
@@ -268,6 +385,15 @@ export function LeftPanel({
 
     // Sort
     result.sort((a, b) => {
+      // Session-only random order: rank lookup by id (stable until reshuffle).
+      // Ids not in the current shuffle (e.g. transiently after a data change)
+      // fall to the end in natural order — a consistent total order either way.
+      if (sortColumn === 'random') {
+        const ra = randomRank.has(a.id) ? randomRank.get(a.id)! : 1e9 + a.attributes.sample_index;
+        const rb = randomRank.has(b.id) ? randomRank.get(b.id)! : 1e9 + b.attributes.sample_index;
+        return ra - rb;
+      }
+
       let aVal: number | string;
       let bVal: number | string;
 
@@ -299,6 +425,10 @@ export function LeftPanel({
             aVal = a.attributes.sample_index;
             bVal = b.attributes.sample_index;
             break;
+          case 'rollout_n':
+            aVal = a.attributes.rollout_n;
+            bVal = b.attributes.rollout_n;
+            break;
           case 'step':
             aVal = a.attributes.step;
             bVal = b.attributes.step;
@@ -314,6 +444,14 @@ export function LeftPanel({
           case 'num_messages':
             aVal = a.messages.length || a.message_count || 0;
             bVal = b.messages.length || b.message_count || 0;
+            break;
+          // Dedicated comments column: sorts by how many notes a rollout has,
+          // not by the text of the newest one (the grade path would do that).
+          case COMMENT_COUNT_COLUMN:
+            // Deleted comments are still in the log (append-only) but must
+            // not count — visibleComments drops them and their tombstones.
+            aVal = visibleComments(a.grades?.[COMMENTS_METRIC]).length;
+            bVal = visibleComments(b.grades?.[COMMENTS_METRIC]).length;
             break;
           default:
             aVal = a.id;
@@ -333,7 +471,43 @@ export function LeftPanel({
     });
 
     return result;
-  }, [samples, debouncedSearchConditions, searchLogic, debouncedFilterExpression, sortColumn, sortOrder]);
+  }, [samples, debouncedSearchConditions, searchLogic, debouncedFilterExpression, sortColumn, sortOrder, randomRank]);
+
+  // Known field names for filter-expression validation: base filter fields,
+  // grade metric names, and every attribute key seen on any sample (attributes
+  // include injected keys like source_file, so the static list alone is not enough).
+  const knownFilterFields = useMemo(() => {
+    const fields = new Set<string>(BASE_FILTER_FIELD_NAMES);
+    for (const sample of samples) {
+      for (const key of Object.keys(sample.attributes)) {
+        fields.add(key);
+      }
+      if (sample.grades) {
+        for (const metricName of Object.keys(sample.grades)) {
+          fields.add(metricName);
+        }
+      }
+    }
+    return fields;
+  }, [samples]);
+
+  // Validate the filter expression so malformed conditions (which silently pass
+  // everything) and unknown fields (which silently empty the table) get surfaced.
+  const filterError = useMemo((): string | null => {
+    const expr = debouncedFilterExpression.trim();
+    if (!expr) return null;
+    const conditions = expr
+      .split(/\s+OR\s+/i)
+      .flatMap(orGroup => orGroup.split(/\s+AND\s+/i));
+    for (const condition of conditions) {
+      const trimmed = condition.trim();
+      if (!trimmed) continue;
+      const match = trimmed.match(FILTER_CONDITION_REGEX);
+      if (!match) return `Unrecognized condition: "${trimmed}"`;
+      if (!knownFilterFields.has(match[1])) return `Unknown field: "${match[1]}"`;
+    }
+    return null;
+  }, [debouncedFilterExpression, knownFilterFields]);
 
   const handleSort = (column: SortColumn) => {
     if (sortColumn === column) {
@@ -343,6 +517,20 @@ export function LeftPanel({
       setSortOrder('asc');
     }
   };
+
+  // Reset both search conditions and the filter expression to their empty state.
+  const handleClearFilters = useCallback(() => {
+    onSearchConditionsChange([{ id: generateId(), field: 'chat', operator: 'contains', term: '' }]);
+    setFilterExpression('');
+  }, [onSearchConditionsChange]);
+
+  // Shuffle into a fresh session-only random order (or reshuffle if already random).
+  // Picking any column header exits random order via handleSort.
+  const handleShuffle = useCallback(() => {
+    setRandomRank(buildRandomRank(samples));
+    setSortColumn('random');
+    setSortOrder('asc');
+  }, [samples]);
 
   const handleSelectSample = useCallback((id: number) => {
     setCurrentOccurrenceIndex(0);
@@ -359,15 +547,16 @@ export function LeftPanel({
     onCurrentOccurrenceIndexChange?.(currentOccurrenceIndex);
   }, [currentOccurrenceIndex, onCurrentOccurrenceIndexChange]);
 
-  // Calculate current match index based on selected sample
+  // Calculate current match index based on selected sample.
+  // Explicit null check: sample id 0 is a valid (and default) selection.
   const currentMatchIndex = useMemo(() => {
-    if (!selectedSampleId || filteredSamples.length === 0) return -1;
+    if (selectedSampleId === null || filteredSamples.length === 0) return -1;
     return filteredSamples.findIndex(s => s.id === selectedSampleId);
   }, [selectedSampleId, filteredSamples]);
 
   // Count occurrences in the current sample (uses same normalized text + field scoping as MessageCard)
   const matchesInCurrentSample = useMemo(() => {
-    if (!selectedSampleId) return 0;
+    if (selectedSampleId === null) return 0;
     
     const sample = samples.find(s => s.id === selectedSampleId);
     if (!sample) return 0;
@@ -430,36 +619,28 @@ export function LeftPanel({
 
   return (
     <div className={`h-full flex flex-col ${isDarkMode ? 'bg-[#1a1a2e] text-gray-200' : 'bg-white text-gray-900'}`}>
-      {/* Header with tabs */}
+      {/* Header with toolbar buttons */}
       <div className={`flex border-b ${isDarkMode ? 'border-gray-700' : 'border-gray-200'}`}>
-        <a 
-          className={`flex items-center px-3 py-2 transition-colors border-r ${isDarkMode ? 'border-gray-700 hover:bg-gray-800' : 'border-gray-200 hover:bg-sky-50'}`}
-          href="/"
-          title="Go to main page"
+        {/* Static app-title mark — intentionally non-interactive (a link to "/"
+            here silently reloaded the page and destroyed session state) */}
+        <div
+          className={`flex items-center px-3 py-2 border-r ${isDarkMode ? 'border-gray-700' : 'border-gray-200'}`}
+          title="Rollout Visualizer"
         >
-          <span className={`material-symbols-outlined ${isDarkMode ? 'text-gray-400' : 'text-gray-600'}`} style={{ fontSize: 20 }}>
+          <span className={`material-symbols-outlined ${isDarkMode ? 'text-gray-400' : 'text-gray-600'}`} style={{ fontSize: 20 }} aria-hidden="true">
             analytics
           </span>
-        </a>
+        </div>
         <div className={`flex overflow-hidden flex-1 ${isDarkMode ? 'bg-[#1a1a2e]' : 'bg-white'}`}>
           {!isSharedMode && (
             <button
               onClick={onOpenFileBrowser}
-              className={`flex items-center px-3 py-2 border-b-2 border-transparent ${isDarkMode ? 'text-gray-400 hover:text-gray-200 hover:bg-gray-800' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-50'}`}
+              className={`flex items-center px-3 py-2 ${isDarkMode ? 'text-gray-400 hover:text-gray-200 hover:bg-gray-800' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-50'}`}
               title="Browse files"
             >
-              <span className="material-symbols-outlined" style={{ fontSize: 24 }}>folder</span>
+              <span className="material-symbols-outlined" style={{ fontSize: 20 }}>folder</span>
             </button>
           )}
-          <button className={`flex items-center px-3 py-2 border-b-2 border-transparent ${isDarkMode ? 'text-gray-400 hover:text-gray-200 hover:bg-gray-800' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-50'}`}>
-            <span className="material-symbols-outlined" style={{ fontSize: 24 }}>description</span>
-          </button>
-          <button className={`flex items-center px-3 py-2 border-b-2 ${isDarkMode ? 'text-blue-400 border-blue-400 bg-blue-500/20' : 'text-blue-600 border-blue-600 bg-blue-500/10'}`}>
-            <span className="material-symbols-outlined" style={{ fontSize: 24 }}>list</span>
-          </button>
-          <button className={`flex items-center px-3 py-2 border-b-2 border-transparent ${isDarkMode ? 'text-gray-400 hover:text-gray-200 hover:bg-gray-800' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-50'}`}>
-            <span className="material-symbols-outlined" style={{ fontSize: 24 }}>graph_1</span>
-          </button>
         </div>
         {/* Dark mode toggle */}
         <button
@@ -483,6 +664,8 @@ export function LeftPanel({
           filteredCount={filteredSamples.length}
           isDarkMode={isDarkMode}
           isSharedMode={isSharedMode}
+          isRandomOrder={sortColumn === 'random'}
+          onShuffle={handleShuffle}
         />
 
         <FilterBar
@@ -492,6 +675,7 @@ export function LeftPanel({
           onSearchLogicChange={onSearchLogicChange}
           filterExpression={filterExpression}
           onFilterChange={setFilterExpression}
+          filterError={filterError}
           onNavigateNextOccurrence={handleNavigateNextOccurrence}
           onNavigateNextSample={handleNavigateNextSample}
           onNavigatePrevSample={handleNavigatePrevSample}
@@ -517,6 +701,30 @@ export function LeftPanel({
           ) : null;
         })()}
 
+        {/* Partial load failures — some files loaded, these didn't. Shown
+            alongside the table (unlike `error`, which replaces it). */}
+        {loadWarnings.length > 0 && (
+          <div className={`px-3 py-2 text-xs flex items-start gap-2 border-b ${isDarkMode ? 'text-amber-300 bg-amber-900/20 border-amber-900/40' : 'text-amber-800 bg-amber-50 border-amber-200'}`}>
+            <span className="material-symbols-outlined shrink-0" style={{ fontSize: 14 }} aria-hidden="true">warning</span>
+            <div className="flex-1 min-w-0">
+              <div className="font-medium">{loadWarnings.length} file{loadWarnings.length !== 1 ? 's' : ''} failed to load</div>
+              {loadWarnings.map((w, i) => (
+                <div key={i} className="truncate" title={w}>{w}</div>
+              ))}
+            </div>
+            {onDismissLoadWarnings && (
+              <button
+                onClick={onDismissLoadWarnings}
+                aria-label="Dismiss load warnings"
+                title="Dismiss"
+                className={`shrink-0 p-0.5 rounded ${isDarkMode ? 'hover:bg-amber-900/40' : 'hover:bg-amber-100'}`}
+              >
+                <span className="material-symbols-outlined" style={{ fontSize: 14 }} aria-hidden="true">close</span>
+              </button>
+            )}
+          </div>
+        )}
+
         {/* Loading/Error states */}
         {loading && (
           <div className={`p-4 text-center ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>
@@ -532,17 +740,86 @@ export function LeftPanel({
           </div>
         )}
 
-        {/* Sample table */}
+        {/* Sample table / empty states */}
         {!loading && !error && (
-          <SampleTable
-            samples={filteredSamples}
-            selectedSampleId={selectedSampleId}
-            onSelectSample={handleSelectSample}
-            sortColumn={sortColumn}
-            sortOrder={sortOrder}
-            onSort={handleSort}
-            isDarkMode={isDarkMode}
-          />
+          samples.length === 0 ? (
+            <div className={`flex-1 flex items-center justify-center ${isDarkMode ? 'text-gray-500' : 'text-gray-400'}`}>
+              <div className="text-center">
+                <span className="material-symbols-outlined" style={{ fontSize: 48 }}>folder_open</span>
+                <p className="mt-2">No samples loaded</p>
+                {!isSharedMode && (
+                  <button
+                    onClick={onOpenFileBrowser}
+                    className="mt-3 px-3 py-1.5 text-sm rounded-md text-white bg-blue-600 hover:bg-blue-700"
+                  >
+                    Browse files
+                  </button>
+                )}
+              </div>
+            </div>
+          ) : filteredSamples.length === 0 ? (
+            <div className={`flex-1 flex items-center justify-center ${isDarkMode ? 'text-gray-500' : 'text-gray-400'}`}>
+              <div className="text-center">
+                <span className="material-symbols-outlined" style={{ fontSize: 48 }}>search_off</span>
+                <p className="mt-2">No samples match your search or filter</p>
+                <button
+                  onClick={handleClearFilters}
+                  className="mt-3 px-3 py-1.5 text-sm rounded-md text-white bg-blue-600 hover:bg-blue-700"
+                >
+                  Clear filters
+                </button>
+              </div>
+            </div>
+          ) : (
+            <>
+              {hydrationSkipped && (
+                <div className={`px-2 py-1.5 text-xs border-b flex items-center gap-2 ${
+                  isDarkMode ? 'border-gray-700 bg-blue-900/20 text-blue-300' : 'border-gray-200 bg-blue-50 text-blue-800'
+                }`}>
+                  <span className="material-symbols-outlined flex-shrink-0" style={{ fontSize: 14 }}>bolt</span>
+                  <span className="min-w-0 truncate" title="Large file: only metadata was loaded up front. The selected sample's messages load on demand; text search only covers messages that are loaded.">
+                    Metadata-only load — messages hydrate per selected sample; search needs the full load.
+                  </span>
+                  <button
+                    onClick={onLoadAllMessages}
+                    className={`ml-auto flex-shrink-0 px-2 py-0.5 rounded-md font-medium ${
+                      isDarkMode ? 'bg-blue-800/60 hover:bg-blue-700 text-blue-200' : 'bg-blue-600 hover:bg-blue-700 text-white'
+                    }`}
+                  >
+                    Load all messages
+                  </button>
+                </div>
+              )}
+              {hiddenDefaultColumns.size > 0 && (
+                <div className={`px-2 py-1 text-xs border-b flex items-center ${isDarkMode ? 'border-gray-700' : 'border-gray-200'}`}>
+                  <button
+                    onClick={() => setShowHiddenColumns(v => !v)}
+                    className={`px-2 py-0.5 rounded-full transition-colors ${
+                      isDarkMode
+                        ? 'bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-gray-200'
+                        : 'bg-gray-100 text-gray-500 hover:bg-gray-200 hover:text-gray-700'
+                    }`}
+                    title={`${[...hiddenDefaultColumns].map(k => HIDDEN_COLUMN_LABELS[k] ?? k).join(', ')} — every loaded sample has the default value`}
+                  >
+                    {showHiddenColumns
+                      ? 'Re-hide default columns'
+                      : `${hiddenDefaultColumns.size} column${hiddenDefaultColumns.size === 1 ? '' : 's'} hidden (all default values)`}
+                  </button>
+                </div>
+              )}
+              <SampleTable
+                samples={filteredSamples}
+                selectedSampleId={selectedSampleId}
+                onSelectSample={handleSelectSample}
+                sortColumn={sortColumn}
+                sortOrder={sortOrder}
+                onSort={handleSort}
+                isDarkMode={isDarkMode}
+                idColumnKey={idColumnKey}
+                hiddenColumns={effectiveHiddenColumns}
+              />
+            </>
+          )
         )}
       </div>
     </div>

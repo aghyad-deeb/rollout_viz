@@ -41,6 +41,11 @@ export interface SampleAttributes {
   experiment_name: string;
   is_validate: boolean;
   source_file?: string; // Which file this sample came from (for multi-file loading)
+  /** Stable per-rollout id stamped by viz_writer / producers. */
+  viz_id?: string;
+  /** Set by web_chat saves — enables the "Open in web_chat" round trip. */
+  chat_id?: string;
+  branch_id?: string;
 }
 
 // Grading types
@@ -81,6 +86,18 @@ export interface GradeEntry {
   model: string;
   prompt_version: string;
   timestamp: string;
+  /**
+   * Soft-delete marker. The per-metric grade lists are append-only (the
+   * backend merge only ever appends), so a deletion is itself an entry: a
+   * "tombstone" naming the entry it retracts by its (model, timestamp) pair.
+   * Used today only by the reserved `comments` metric, whose tombstones also
+   * carry `prompt_version: 'comment-delete-v1'`.
+   *
+   * Readers must filter — see `visibleComments()` in utils/humanGrades.ts,
+   * the one true reader. The raw log keeps both the comment and its deletion
+   * record forever.
+   */
+  deletes?: { model: string; timestamp: string };
 }
 
 export interface SampleGrades {
@@ -94,6 +111,8 @@ export interface Sample {
   attributes: SampleAttributes;
   timestamp: string;
   grades?: SampleGrades;
+  /** Producer-written diagnostics (e.g. "display reconstruction from …"). */
+  diagnostics?: string[] | null;
   raw_messages?: unknown[];
   raw_jsonl_entry?: unknown;
   [key: string]: unknown;
@@ -283,7 +302,7 @@ export type SearchField =
   | 'timestamp' 
   | 'experiment_name';
 
-export type ViewMode = 'eval' | 'meta' | 'chat' | 'analysis';
+export type ViewMode = 'eval' | 'meta' | 'chat' | 'analysis' | 'evidence';
 
 export type SearchOperator = 'contains' | 'not_contains';
 

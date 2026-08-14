@@ -97,3 +97,41 @@ describe('rolloutChat', () => {
     expect(loadChatModel()).toBe(DEFAULT_CHAT_MODEL);
   });
 });
+
+describe('rolloutChat comment tombstones', () => {
+  // Deleted comments are hidden in the UI; they must not reach the
+  // discussion model's context either.
+  const entry = (grade: string, model: string, timestamp: string, extra: object = {}) => ({
+    grade, grade_type: 'freeform' as const, quotes: [], explanation: '',
+    model, prompt_version: 'comment-v1', timestamp, ...extra,
+  });
+
+  it('excludes deleted comments and tombstones from the prompt', () => {
+    const doomed = entry('embarrassing hot take', 'human:ada', 't1');
+    const tombstone = entry('', 'human:ada', 't2', {
+      prompt_version: 'comment-delete-v1',
+      explanation: 'deleted comment by human:ada from t1',
+      deletes: { model: 'human:ada', timestamp: 't1' },
+    });
+    const sample = makeSample({
+      messages: [makeMessage('user', 'q')],
+      grades: { comments: [doomed, entry('kept note', 'human:grace', 't3'), tombstone] },
+    });
+    const txt = formatRolloutForChat(sample);
+    expect(txt).toContain('kept note');
+    expect(txt).not.toContain('embarrassing hot take');
+    expect(txt).not.toContain('deleted comment by');
+  });
+
+  it('omits the comments metric entirely once every comment is deleted', () => {
+    const doomed = entry('gone', 'human:ada', 't1');
+    const tombstone = entry('', 'human:ada', 't2', { deletes: { model: 'human:ada', timestamp: 't1' } });
+    const sample = makeSample({
+      messages: [makeMessage('user', 'q')],
+      grades: { comments: [doomed, tombstone] },
+    });
+    const txt = formatRolloutForChat(sample);
+    expect(txt).not.toContain('comments:');
+    expect(txt).toContain('(none)');
+  });
+});

@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useMemo } from 'react';
 import type { SearchField, Sample, SearchCondition, SearchLogic, SearchOperator } from '../../types';
+import { COMMENTS_METRIC, visibleComments } from '../../utils/humanGrades';
 
 const SEARCH_FIELD_OPTIONS: { value: SearchField; label: string }[] = [
   { value: 'chat', label: 'All messages' },
@@ -25,6 +26,7 @@ const SEARCH_OPERATORS: { value: SearchOperator; label: string }[] = [
 const generateId = () => Math.random().toString(36).substring(2, 9);
 
 // Base field definitions with types
+// Keep in sync with BASE_FILTER_FIELD_NAMES in LeftPanel/index.tsx (filter validation).
 const BASE_FILTER_FIELDS: { name: string; type: 'number' | 'string' | 'boolean' }[] = [
   { name: 'reward', type: 'number' },
   { name: 'step', type: 'number' },
@@ -91,6 +93,7 @@ interface FilterBarProps {
   onSearchLogicChange: (logic: SearchLogic) => void;
   filterExpression: string;
   onFilterChange: (value: string) => void;
+  filterError?: string | null; // Validation message for the filter expression (null = valid)
   onNavigateNextOccurrence: () => void; // Enter: next occurrence in sample, or next sample
   onNavigateNextSample: () => void; // Shift+Enter: next sample
   onNavigatePrevSample: () => void; // Arrow left: previous sample
@@ -109,6 +112,7 @@ export function FilterBar({
   onSearchLogicChange,
   filterExpression,
   onFilterChange,
+  filterError = null,
   onNavigateNextOccurrence,
   onNavigateNextSample,
   onNavigatePrevSample,
@@ -150,7 +154,13 @@ export function FilterBar({
       
       // Add metric values
       if (sample.grades) {
-        for (const [metricName, grades] of Object.entries(sample.grades)) {
+        for (const [metricName, rawGrades] of Object.entries(sample.grades)) {
+          // Comments: suggest from visible entries only — a deleted comment's
+          // text (or a tombstone's blank grade) must not leak into
+          // autocomplete; a fully deleted thread behaves as an absent metric.
+          const isComments = metricName === COMMENTS_METRIC;
+          const grades = isComments ? visibleComments(rawGrades) : rawGrades;
+          if (isComments && grades.length === 0) continue;
           if (!values[metricName]) values[metricName] = new Set();
           if (grades.length > 0) {
             const grade = grades[grades.length - 1].grade;
@@ -419,6 +429,11 @@ export function FilterBar({
 
   const hasMatches = matchCount > 0;
 
+  // The match counter and prev/next-chat navigation only make sense while a
+  // search term is actually entered — otherwise the counter just mirrors the
+  // table row count and the arrows step through unfiltered samples.
+  const searchActive = searchConditions.some(c => c.term.trim());
+
   // Search condition helpers
   const updateCondition = (id: string, updates: Partial<SearchCondition>) => {
     onSearchConditionsChange(
@@ -473,7 +488,7 @@ export function FilterBar({
   };
 
   return (
-    <div className={`p-3 border-b space-y-2 ${isDarkMode ? 'border-gray-700' : ''}`}>
+    <div className={`p-3 border-b space-y-2 ${isDarkMode ? 'border-gray-700' : 'border-gray-200'}`}>
       {/* Filter expression */}
       <div className="flex items-center gap-1 relative">
         <div className="cursor-pointer flex items-center" title="Filter samples">
@@ -490,16 +505,20 @@ export function FilterBar({
             onChange={(e) => onFilterChange(e.target.value)}
             onFocus={() => setShowFilterSuggestions(true)}
             onKeyDown={handleFilterKeyDown}
-            className={`w-full px-2 py-1 text-sm border rounded-md focus:outline-none focus:ring focus:ring-blue-500 focus:border-blue-500 ${isDarkMode ? 'bg-gray-800 border-gray-600 text-gray-200 placeholder-gray-500' : 'border-gray-300'}`}
+            className={`w-full px-2 py-1 text-sm border rounded-md focus:outline-none focus:ring focus:ring-blue-500 focus:border-blue-500 ${isDarkMode ? 'bg-gray-800 text-gray-200 placeholder-gray-500' : ''} ${
+              filterError
+                ? (isDarkMode ? 'border-amber-500' : 'border-amber-400')
+                : (isDarkMode ? 'border-gray-600' : 'border-gray-300')
+            }`}
           />
           
           {/* Filter suggestions dropdown */}
           {showFilterSuggestions && suggestions.length > 0 && (
             <div
               ref={suggestionsRef}
-              className={`absolute top-full left-0 right-0 mt-1 border rounded-md shadow-lg z-50 max-h-72 overflow-y-auto ${isDarkMode ? 'bg-gray-800 border-gray-600' : 'bg-white border-gray-300'}`}
+              className={`absolute top-full left-0 right-0 mt-1 border rounded-md shadow-lg z-50 max-h-72 overflow-y-auto custom-scrollbar ${isDarkMode ? 'bg-gray-800 border-gray-600' : 'bg-white border-gray-300'}`}
             >
-              <div className={`px-3 py-1.5 border-b flex items-center gap-2 ${isDarkMode ? 'bg-gray-700 border-gray-600' : 'bg-gray-50'}`}>
+              <div className={`px-3 py-1.5 border-b flex items-center gap-2 ${isDarkMode ? 'bg-gray-700 border-gray-600' : 'bg-gray-50 border-gray-200'}`}>
                 <span className={`material-symbols-outlined text-sm ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>
                   {getSuggestionIcon(parseContext.type)}
                 </span>
@@ -536,7 +555,7 @@ export function FilterBar({
                   </button>
                 ))}
               </div>
-              <div className={`px-3 py-1.5 border-t text-xs ${isDarkMode ? 'bg-gray-700 border-gray-600 text-gray-500' : 'bg-gray-50 text-gray-400'}`}>
+              <div className={`px-3 py-1.5 border-t text-xs ${isDarkMode ? 'bg-gray-700 border-gray-600 text-gray-500' : 'bg-gray-50 border-gray-200 text-gray-400'}`}>
                 <span className="mr-3">↑↓ navigate</span>
                 <span className="mr-3">↵ select</span>
                 <span>esc close</span>
@@ -549,14 +568,24 @@ export function FilterBar({
             help
           </span>
         </div>
-        <button 
-          className="flex items-center justify-center w-7 h-7 rounded-md text-white bg-blue-600 hover:bg-blue-700"
-          title="Apply filter"
-          onClick={() => setShowFilterSuggestions(false)}
-        >
-          <span className="material-symbols-outlined" style={{ fontSize: 17 }}>search</span>
-        </button>
+        {filterExpression && (
+          <button
+            className={`flex items-center justify-center w-7 h-7 rounded-md ${isDarkMode ? 'text-gray-400 hover:text-gray-200 hover:bg-gray-700' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-100'}`}
+            title="Clear filter"
+            onClick={() => onFilterChange('')}
+          >
+            <span className="material-symbols-outlined" style={{ fontSize: 17 }}>close</span>
+          </button>
+        )}
       </div>
+
+      {/* Filter expression validation warning */}
+      {filterError && (
+        <div className={`flex items-center gap-1 pl-6 text-xs ${isDarkMode ? 'text-amber-400' : 'text-amber-600'}`}>
+          <span className="material-symbols-outlined" style={{ fontSize: 14 }}>warning</span>
+          {filterError}
+        </div>
+      )}
 
       {/* Search conditions */}
       <div className="space-y-1.5">
@@ -634,26 +663,28 @@ export function FilterBar({
             {/* Navigation and count (only on first row) */}
             {index === 0 && (
               <>
-                {hasMatches && (
+                {searchActive && (
                   <span className={`text-xs whitespace-nowrap ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>
-                    {matchesInCurrentSample > 1 
-                      ? `${currentOccurrenceIndex + 1}/${matchesInCurrentSample} in chat ${currentMatchIndex + 1}/${matchCount}`
-                      : `${currentMatchIndex + 1}/${matchCount}`
+                    {matchCount === 0
+                      ? '0 matches'
+                      : matchesInCurrentSample > 1
+                        ? `${currentOccurrenceIndex + 1}/${matchesInCurrentSample} in chat ${currentMatchIndex + 1}/${matchCount}`
+                        : `${currentMatchIndex + 1}/${matchCount}`
                     }
                   </span>
                 )}
-                <button 
+                <button
                   className={`flex items-center justify-center w-6 h-6 rounded-md disabled:opacity-50 disabled:cursor-not-allowed ${isDarkMode ? 'text-gray-300 bg-gray-700 hover:bg-gray-600' : 'text-gray-600 bg-gray-200 hover:bg-gray-300'}`}
                   title="Previous chat"
-                  disabled={!hasMatches}
+                  disabled={!searchActive || !hasMatches}
                   onClick={onNavigatePrevSample}
                 >
                   <span className="material-symbols-outlined" style={{ fontSize: 16 }}>arrow_left</span>
                 </button>
-                <button 
+                <button
                   className={`flex items-center justify-center w-6 h-6 rounded-md disabled:opacity-50 disabled:cursor-not-allowed ${isDarkMode ? 'text-gray-300 bg-gray-700 hover:bg-gray-600' : 'text-gray-600 bg-gray-200 hover:bg-gray-300'}`}
                   title="Next occurrence (Enter) / Next chat (Shift+Enter)"
-                  disabled={!hasMatches}
+                  disabled={!searchActive || !hasMatches}
                   onClick={onNavigateNextOccurrence}
                 >
                   <span className="material-symbols-outlined" style={{ fontSize: 16 }}>arrow_right</span>
