@@ -371,3 +371,73 @@ class TestBatchMetadataOnly:
             assert "message_count" in sample
             assert sample["message_count"] == len(sample["messages"])
         await client.aclose()
+
+
+class TestDiagnosticsPassthrough:
+    """Producers write sample-level diagnostics[] (e.g. 'display reconstruction
+    from samples.jsonl...'); the viewer must surface them, not drop them."""
+
+    async def test_samples_endpoint_passes_diagnostics_through(self, app_no_auth, patch_project_root):
+        import json as _json
+        entry = {
+            "messages": [{"role": "user", "content": "hi"}],
+            "attributes": {"rollout_n": 1},
+            "diagnostics": ["Display reconstruction; raw arrays under raw.sample_jsonl_entry."],
+            "timestamp": "2026-06-06T00:00:00",
+        }
+        p = patch_project_root / "diag.jsonl"
+        p.write_text(_json.dumps(entry) + "\n")
+
+        client = await app_no_auth()
+        resp = await client.get("/api/samples", params={"file": "diag.jsonl"})
+        assert resp.status_code == 200
+        sample = resp.json()["samples"][0]
+        assert sample["diagnostics"] == entry["diagnostics"]
+        await client.aclose()
+
+    async def test_absent_diagnostics_is_null(self, app_no_auth, patch_project_root):
+        import json as _json
+        entry = {"messages": [{"role": "user", "content": "hi"}], "attributes": {}, "timestamp": ""}
+        p = patch_project_root / "nodiag.jsonl"
+        p.write_text(_json.dumps(entry) + "\n")
+
+        client = await app_no_auth()
+        resp = await client.get("/api/samples", params={"file": "nodiag.jsonl"})
+        sample = resp.json()["samples"][0]
+        assert sample.get("diagnostics") is None
+        await client.aclose()
+
+    async def test_fetch_api_includes_diagnostics(self, app_no_auth, patch_project_root):
+        import json as _json
+        entry = {
+            "messages": [{"role": "user", "content": "hi"}],
+            "attributes": {"rollout_n": 1},
+            "diagnostics": ["truncated at 10 turns"],
+            "timestamp": "",
+        }
+        p = patch_project_root / "diag2.jsonl"
+        p.write_text(_json.dumps(entry) + "\n")
+
+        client = await app_no_auth()
+        resp = await client.get("/api/rollout", params={"file": "diag2.jsonl", "index": 0})
+        assert resp.json()["sample"]["diagnostics"] == ["truncated at 10 turns"]
+        await client.aclose()
+
+
+class TestBatchRawBytes:
+    async def test_batch_metadata_reports_total_raw_bytes(self, app_no_auth, patch_project_root):
+        """The frontend size-gates bulk hydration on this — a sample-count
+        threshold alone misses few-but-huge agentic rollouts."""
+        import json as _json
+        p = patch_project_root / "sized.jsonl"
+        entry = {"messages": [{"role": "user", "content": "x" * 500}], "attributes": {}, "timestamp": ""}
+        p.write_text((_json.dumps(entry) + "\n") * 3)
+
+        client = await app_no_auth()
+        resp = await client.post(
+            "/api/samples/batch", json={"files": ["sized.jsonl"], "metadata_only": True}
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total_raw_bytes"] == p.stat().st_size
+        await client.aclose()

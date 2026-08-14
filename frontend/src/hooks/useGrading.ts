@@ -20,7 +20,48 @@ interface GradingProgress {
   isRunning: boolean;
   status: GradingStatus;
   statusMessage: string;
+  jobId: string | null;     // server-side job id (for reattach + cancel)
 }
+
+type SSEEvent = { type: string; [key: string]: unknown };
+
+// Shared SSE reader: parse `data:` lines, invoke onEvent per event. Used by both
+// the initial grade stream and the reattach stream. Comment/heartbeat lines and
+// partial JSON are ignored; a non-syntax error thrown by onEvent propagates.
+async function consumeSSE(
+  response: Response,
+  signal: AbortSignal | undefined,
+  onEvent: (ev: SSEEvent) => void,
+): Promise<void> {
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error('Failed to get response stream');
+  const decoder = new TextDecoder();
+  let buffer = '';
+  const handle = (raw: string) => {
+    try { onEvent(JSON.parse(raw) as SSEEvent); }
+    catch (e) { if (!(e instanceof SyntaxError)) throw e; }
+  };
+  try {
+    while (true) {
+      if (signal?.aborted) break;
+      const { done, value } = await reader.read();
+      if (done) { buffer += decoder.decode(); break; }
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        if (line.startsWith('data: ')) handle(line.slice(6));
+      }
+    }
+    const tail = buffer.trim();
+    if (tail.startsWith('data: ')) handle(tail.slice(6));
+  } finally {
+    try { reader.cancel(); } catch { /* ignore */ }
+  }
+}
+
+// Sessionstorage key for the active job id (so a reload can rediscover it).
+const ACTIVE_JOB_STORAGE_KEY = 'rollout_viz_active_grade_job';
 
 interface StoredAPIKeys {
   [provider: string]: string;
@@ -39,6 +80,7 @@ export function useGrading(enabled = true) {
     isRunning: false,
     status: 'idle',
     statusMessage: '',
+    jobId: null,
   });
   const [error, setError] = useState<string | null>(null);
   const [presetMetrics, setPresetMetrics] = useState<Record<string, PresetMetric>>({});
@@ -67,19 +109,30 @@ export function useGrading(enabled = true) {
 
   // Abort controller for cancellation
   const abortControllerRef = useRef<AbortController | null>(null);
+  // Current server-side job id (for cancel + reattach).
+  const jobIdRef = useRef<string | null>(null);
 
-  // Cancel current grading job
+  // Cancel current grading job. The job is server-side now, so cancellation
+  // must hit the cancel endpoint (aborting the reader alone would leave the job
+  // running). The reader is also aborted to stop tailing.
   const cancelGrading = useCallback(() => {
+    const jobId = jobIdRef.current;
+    if (jobId) {
+      fetch(`/api/grade-jobs/${jobId}/cancel`, { method: 'POST' }).catch(() => { /* best effort */ });
+    }
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
     }
-    setError(null); // Clear any errors from cancelled request
+    jobIdRef.current = null;
+    try { sessionStorage.removeItem(ACTIVE_JOB_STORAGE_KEY); } catch { /* ignore */ }
+    setError(null);
     setProgress(prev => ({
       ...prev,
       isRunning: false,
       status: 'cancelled',
       statusMessage: 'Grading cancelled',
+      jobId: null,
     }));
   }, []);
 
@@ -176,6 +229,7 @@ export function useGrading(enabled = true) {
       isRunning: true,
       status: 'connecting',
       statusMessage: `Validating ${provider} connection...`,
+      jobId: null,
     });
 
     try {
@@ -285,7 +339,12 @@ export function useGrading(enabled = true) {
               try {
                 const eventData = JSON.parse(line.slice(6));
 
-                if (eventData.type === 'progress') {
+                if (eventData.type === 'started') {
+                  jobIdRef.current = eventData.job_id;
+                  try { sessionStorage.setItem(ACTIVE_JOB_STORAGE_KEY, eventData.job_id); } catch { /* ignore */ }
+                  setProgress(prev => ({ ...prev, jobId: eventData.job_id, total: eventData.total ?? prev.total }));
+                } else if (eventData.type === 'progress' || eventData.type === 'snapshot') {
+                  errorCount = eventData.errors ?? errorCount;
                   setProgress(prev => ({
                     ...prev,
                     completed: eventData.completed,
@@ -369,6 +428,7 @@ export function useGrading(enabled = true) {
           isRunning: false,
           status: 'error',
           statusMessage: `All ${finalResult.errors.length} samples failed`,
+          jobId: null,
         });
         return finalResult;
       }
@@ -381,6 +441,7 @@ export function useGrading(enabled = true) {
         isRunning: false,
         status: 'complete',
         statusMessage: `Graded ${finalResult.graded_count} sample${finalResult.graded_count !== 1 ? 's' : ''}${finalResult.errors.length > 0 ? ` (${finalResult.errors.length} error${finalResult.errors.length !== 1 ? 's' : ''})` : ''}`,
+        jobId: null,
       });
 
       // Save preferences
@@ -405,8 +466,82 @@ export function useGrading(enabled = true) {
       return null;
     } finally {
       abortControllerRef.current = null;
+      jobIdRef.current = null;
+      try { sessionStorage.removeItem(ACTIVE_JOB_STORAGE_KEY); } catch { /* ignore */ }
     }
   }, [getApiKey, serverApiKeys, saveLastProvider, saveLastModel]);
+
+  // Reattach to an already-running server-side job (e.g. after a page reload):
+  // seed progress from the snapshot, then tail live progress to completion.
+  const attachToJob = useCallback(async (jobId: string): Promise<void> => {
+    jobIdRef.current = jobId;
+    try { sessionStorage.setItem(ACTIVE_JOB_STORAGE_KEY, jobId); } catch { /* ignore */ }
+    abortControllerRef.current = new AbortController();
+    const signal = abortControllerRef.current.signal;
+    setError(null);
+    setProgress(prev => ({
+      ...prev, isRunning: true, status: 'grading', jobId,
+      statusMessage: 'Reattaching to grading job...',
+    }));
+    try {
+      const response = await fetch(`/api/grade-jobs/${jobId}/stream`, { signal });
+      if (!response.ok) throw new Error(`Reattach failed: ${response.status}`);
+      let errorCount = 0;
+      let terminal: SSEEvent | null = null;
+      await consumeSSE(response, signal, (ev) => {
+        if (ev.type === 'snapshot' || ev.type === 'progress') {
+          errorCount = (ev.errors as number) ?? errorCount;
+          setProgress(prev => ({
+            ...prev, isRunning: true, status: 'grading', jobId,
+            completed: ev.completed as number, total: ev.total as number, errors: errorCount,
+            statusMessage: `Grading... ${ev.completed}/${ev.total} samples`,
+          }));
+        } else if (ev.type === 'complete') {
+          terminal = ev;
+        } else if (ev.type === 'error') {
+          throw new Error((ev.message as string) || 'Grading failed');
+        }
+      });
+      if (terminal) {
+        const ev = terminal as SSEEvent;
+        const errs = (ev.errors as Array<{ error: string }>) || [];
+        setProgress({
+          total: (ev.total as number) ?? 0,
+          completed: (ev.graded_count as number) ?? 0,
+          errors: errs.length,
+          errorDetails: [...new Set(errs.map(e => e.error))],
+          isRunning: false,
+          status: (ev.status as string) === 'cancelled' ? 'cancelled' : 'complete',
+          statusMessage: (ev.status as string) === 'cancelled'
+            ? `Cancelled — ${ev.graded_count} graded so far`
+            : `Graded ${ev.graded_count} sample${ev.graded_count !== 1 ? 's' : ''}${errs.length ? ` (${errs.length} error${errs.length !== 1 ? 's' : ''})` : ''}`,
+          jobId: null,
+        });
+      }
+    } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') return;
+      setError(err instanceof Error ? err.message : 'Reattach failed');
+      setProgress(prev => ({ ...prev, isRunning: false, status: 'error', statusMessage: 'Grading failed', jobId: null }));
+    } finally {
+      abortControllerRef.current = null;
+      jobIdRef.current = null;
+      try { sessionStorage.removeItem(ACTIVE_JOB_STORAGE_KEY); } catch { /* ignore */ }
+    }
+  }, []);
+
+  // List active/recent server-side jobs, optionally filtered to given files.
+  const listGradeJobs = useCallback(async (filePaths?: string[]): Promise<Array<{ job_id: string; file_path: string; status: string; completed: number; total: number }>> => {
+    try {
+      const res = await fetch('/api/grade-jobs');
+      if (!res.ok) return [];
+      const jobs = await res.json();
+      if (!filePaths || filePaths.length === 0) return jobs;
+      const set = new Set(filePaths);
+      return jobs.filter((j: { file_path: string }) => set.has(j.file_path));
+    } catch {
+      return [];
+    }
+  }, []);
 
   // Save graded samples to viz/ directory
   const saveGradedSamples = useCallback(async (
@@ -461,7 +596,10 @@ export function useGrading(enabled = true) {
       maxQuoteRetries?: number;
     },
   ): Promise<GradeResponse | null> => {
-    const gradeResult = await gradeSamples(
+    // Grades are now persisted incrementally server-side (the job writes to
+    // viz/ as it goes), so there is no separate client-side save step — the
+    // final progress state is set by gradeSamples itself.
+    return gradeSamples(
       filePath,
       sampleIds,
       metricName,
@@ -473,46 +611,7 @@ export function useGrading(enabled = true) {
       advancedSettings,
       quoteSettings,
     );
-
-    if (!gradeResult || gradeResult.graded_count === 0) {
-      return gradeResult;
-    }
-
-    // Show saving status
-    setProgress(prev => ({
-      ...prev,
-      isRunning: true,
-      status: 'saving',
-      statusMessage: 'Saving grades to file...',
-    }));
-
-    // Convert grades to the save format
-    const gradesToSave: { [sampleId: number]: { [metricName: string]: GradeEntry } } = {};
-    for (const [sampleIdStr, grade] of Object.entries(gradeResult.grades)) {
-      const sampleId = parseInt(sampleIdStr, 10);
-      gradesToSave[sampleId] = { [metricName]: grade };
-    }
-
-    const saved = await saveGradedSamples(filePath, gradesToSave);
-    if (!saved) {
-      setError('Grades computed but failed to save');
-      setProgress(prev => ({
-        ...prev,
-        isRunning: false,
-        status: 'error',
-        statusMessage: 'Failed to save grades',
-      }));
-    } else {
-      setProgress(prev => ({
-        ...prev,
-        isRunning: false,
-        status: 'complete',
-        statusMessage: `Successfully graded and saved ${gradeResult.graded_count} sample${gradeResult.graded_count !== 1 ? 's' : ''}!`,
-      }));
-    }
-
-    return gradeResult;
-  }, [gradeSamples, saveGradedSamples]);
+  }, [gradeSamples]);
 
   // Get latest grade for a sample and metric
   const getLatestGrade = useCallback((
@@ -610,6 +709,8 @@ export function useGrading(enabled = true) {
     gradeSamples,
     saveGradedSamples,
     gradeAndSave,
+    attachToJob,
+    listGradeJobs,
     cancelGrading,
     saveApiKey,
     getApiKey,

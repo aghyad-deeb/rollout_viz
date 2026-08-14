@@ -14,6 +14,11 @@ interface RolloutChatPanelProps {
   sample: Sample | null;
   isDarkMode: boolean;
   onClose: () => void;
+  /**
+   * Notified whenever the discussion has content worth preserving — true as
+   * soon as there are turns or a stream is in flight, false otherwise.
+   */
+  onDirtyChange?: (dirty: boolean) => void;
 }
 
 // Generic starter questions for the empty state — one click sends them.
@@ -32,7 +37,7 @@ const EXAMPLE_QUESTIONS = [
  * Chat turns render through `ChatMessageCard`, which shares the right-panel
  * MessageCard styling, and the assistant reply streams in token-by-token.
  */
-export function RolloutChatPanel({ sample, isDarkMode, onClose }: RolloutChatPanelProps) {
+export function RolloutChatPanel({ sample, isDarkMode, onClose, onDirtyChange }: RolloutChatPanelProps) {
   const [model, setModel] = useState<string>(loadChatModel);
   const [turns, setTurns] = useState<ChatTurn[]>([]);
   const [input, setInput] = useState('');
@@ -41,6 +46,9 @@ export function RolloutChatPanel({ sample, isDarkMode, onClose }: RolloutChatPan
   const abortRef = useRef<AbortController | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  // True while the view is pinned near the bottom of the list — only then
+  // does streaming auto-scroll. Scrolling up detaches; sending re-sticks.
+  const stickToBottomRef = useRef(true);
 
   // The chat is always about the *currently selected* rollout. App gives this
   // panel a `key` tied to the sample id, so changing rollout remounts it and
@@ -49,27 +57,66 @@ export function RolloutChatPanel({ sample, isDarkMode, onClose }: RolloutChatPan
   // Abort any in-flight stream on unmount.
   useEffect(() => () => abortRef.current?.abort(), []);
 
-  // Keep the newest message in view as it streams.
+  // Tell the parent when the chat holds state worth a confirm-before-discard.
+  // The callback is mirrored into a ref so an unstable prop identity can't
+  // retrigger the notify effect (it must fire only when `dirty` flips).
+  const onDirtyChangeRef = useRef(onDirtyChange);
+  useEffect(() => {
+    onDirtyChangeRef.current = onDirtyChange;
+  }, [onDirtyChange]);
+  const dirty = turns.length > 0 || streaming;
+  useEffect(() => {
+    onDirtyChangeRef.current?.(dirty);
+  }, [dirty]);
+
+  // Keep the newest message in view as it streams — but only while the user
+  // is at (or near) the bottom, so scrolling up to re-read isn't fought.
   useEffect(() => {
     const el = listRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (el && stickToBottomRef.current) el.scrollTop = el.scrollHeight;
   }, [turns]);
+
+  const handleListScroll = () => {
+    const el = listRef.current;
+    if (el) stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  };
+
+  // Drop a trailing assistant turn that never received content or reasoning —
+  // used when a stream errors out or is stopped before the first token, so no
+  // "(no response)" bubble lingers.
+  const dropEmptyTrailingAssistant = useCallback(() => {
+    setTurns((prev) => {
+      const last = prev[prev.length - 1];
+      return last && last.role === 'assistant' && !last.content && !last.reasoning
+        ? prev.slice(0, -1)
+        : prev;
+    });
+  }, []);
 
   // Send a message — `textOverride` lets the empty-state chips fire directly.
   const send = useCallback(
     (textOverride?: string) => {
       const text = (textOverride ?? input).trim();
       if (!text || !sample || streaming) return;
+      // Stamp the reply with the *current* model's label at creation so a
+      // later picker switch never relabels earlier bubbles.
+      const label = CHAT_MODELS.find((m) => m.id === model)?.label ?? 'Model';
       const history: ChatTurn[] = [...turns, { role: 'user', content: text }];
-      setTurns([...history, { role: 'assistant', content: '' }]);
+      stickToBottomRef.current = true; // a fresh user message always re-sticks
+      setTurns([...history, { role: 'assistant', content: '', model: label }]);
       setInput('');
       if (inputRef.current) inputRef.current.style.height = 'auto';
       setError(null);
       setStreaming(true);
 
+      // Outbound payload is {role, content} only — the model stamp stays
+      // client-side, and contentless assistant turns (e.g. reasoning-only
+      // aborted replies, still visible in the UI) are never re-sent.
       const messages = [
         { role: 'system', content: buildSystemPrompt(sample) },
-        ...history.map((t) => ({ role: t.role, content: t.content })),
+        ...history
+          .filter((t) => t.role !== 'assistant' || t.content)
+          .map((t) => ({ role: t.role, content: t.content })),
       ];
       const ctrl = new AbortController();
       abortRef.current = ctrl;
@@ -99,13 +146,7 @@ export function RolloutChatPanel({ sample, isDarkMode, onClose }: RolloutChatPan
             setError(msg);
             setStreaming(false);
             abortRef.current = null;
-            // Drop the trailing assistant bubble if nothing streamed into it.
-            setTurns((prev) => {
-              const last = prev[prev.length - 1];
-              return last && last.role === 'assistant' && !last.content && !last.reasoning
-                ? prev.slice(0, -1)
-                : prev;
-            });
+            dropEmptyTrailingAssistant();
           },
           onDone: () => {
             setStreaming(false);
@@ -115,13 +156,14 @@ export function RolloutChatPanel({ sample, isDarkMode, onClose }: RolloutChatPan
         ctrl.signal,
       );
     },
-    [input, sample, streaming, turns, model],
+    [input, sample, streaming, turns, model, dropEmptyTrailingAssistant],
   );
 
   const stop = () => {
     abortRef.current?.abort();
     abortRef.current = null;
     setStreaming(false);
+    dropEmptyTrailingAssistant();
   };
 
   const newChat = () => {
@@ -206,36 +248,42 @@ export function RolloutChatPanel({ sample, isDarkMode, onClose }: RolloutChatPan
         </div>
         {/* Rollout context — what the model is being asked about. */}
         {a && (
-          <div
-            className={`flex items-center gap-1.5 px-3 pb-2 text-[11px] ${
-              isDarkMode ? 'text-gray-400' : 'text-gray-500'
-            }`}
-          >
-            <span className="truncate font-medium">{a.experiment_name || 'rollout'}</span>
-            <span className="shrink-0">· rollout {a.rollout_n}</span>
-            <span className="shrink-0">· step {a.step}</span>
-            <span className="shrink-0">
-              · reward{' '}
-              <span
-                className={
-                  a.reward >= 0
-                    ? isDarkMode
-                      ? 'text-green-400'
-                      : 'text-green-600'
-                    : isDarkMode
-                      ? 'text-red-400'
-                      : 'text-red-600'
-                }
-              >
-                {a.reward}
+          <div className={`px-3 pb-2 text-[11px] ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>
+            <div className="flex items-center gap-1.5">
+              <span className="truncate font-medium">{a.experiment_name || 'rollout'}</span>
+              <span className="shrink-0">· rollout {a.rollout_n}</span>
+              <span className="shrink-0">· step {a.step}</span>
+              <span className="shrink-0">
+                · reward{' '}
+                <span
+                  className={
+                    a.reward >= 0
+                      ? isDarkMode
+                        ? 'text-green-400'
+                        : 'text-green-600'
+                      : isDarkMode
+                        ? 'text-red-400'
+                        : 'text-red-600'
+                  }
+                >
+                  {a.reward}
+                </span>
               </span>
-            </span>
+            </div>
+            <div className={`mt-0.5 truncate ${isDarkMode ? 'text-gray-500' : 'text-gray-400'}`}>
+              Discussion resets when you switch or close this rollout.
+            </div>
           </div>
         )}
       </div>
 
       {/* Message list */}
-      <div ref={listRef} className="flex-1 overflow-y-auto custom-scrollbar p-4 space-y-3">
+      <div
+        ref={listRef}
+        onScroll={handleListScroll}
+        data-testid="chat-message-list"
+        className="flex-1 overflow-y-auto custom-scrollbar p-4 space-y-3"
+      >
         {!sample ? (
           <div
             className={`h-full flex items-center justify-center text-center text-sm px-6 ${
@@ -294,7 +342,7 @@ export function RolloutChatPanel({ sample, isDarkMode, onClose }: RolloutChatPan
               content={t.content}
               reasoning={t.reasoning}
               isDarkMode={isDarkMode}
-              modelLabel={modelLabel}
+              modelLabel={t.model ?? modelLabel}
               isStreaming={streaming && i === turns.length - 1 && t.role === 'assistant'}
             />
           ))

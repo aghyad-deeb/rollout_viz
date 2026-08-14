@@ -80,7 +80,7 @@ export function CapturePreviewModal({
           </button>
         </div>
 
-        <div className="overflow-auto p-4 flex items-center justify-center" style={CHECKER}>
+        <div className="overflow-auto custom-scrollbar p-4 flex items-center justify-center" style={CHECKER}>
           <img
             src={imageUrl}
             alt="Capture preview"

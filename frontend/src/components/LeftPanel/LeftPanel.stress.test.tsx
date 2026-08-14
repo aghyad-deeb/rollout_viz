@@ -77,6 +77,25 @@ function generate5000SamplesForSearch(): Sample[] {
   });
 }
 
+/**
+ * Small sample set for behavior (non-stress) tests: filter validation,
+ * empty states, clear-filters.
+ */
+function makeSmallSamples(count = 10): Sample[] {
+  return Array.from({ length: count }, (_, i) =>
+    makeSample({
+      id: i,
+      attributes: {
+        ...makeAttributes(),
+        sample_index: i,
+        rollout_n: i,
+        step: i,
+        reward: i * 0.1,
+      },
+    }),
+  );
+}
+
 function makeDefaultProps(overrides: Partial<Parameters<typeof LeftPanel>[0]> = {}) {
   return {
     samples: [] as Sample[],
@@ -430,5 +449,213 @@ describe('LeftPanel stress (5,000 samples)', () => {
       // The re-renders themselves should be fast since filtering is deferred
       expect(elapsed).toBeLessThan(50);
     });
+  });
+});
+
+describe('LeftPanel filter expression validation', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('shows a warning for an unknown field in the filter expression', () => {
+    const samples = makeSmallSamples();
+    render(<LeftPanel {...makeDefaultProps({ samples })} />);
+
+    const input = screen.getByPlaceholderText(/Filter samples/);
+    fireEvent.change(input, { target: { value: 'rewrd > 0' } });
+    act(() => { vi.advanceTimersByTime(200); });
+
+    expect(screen.getByText('Unknown field: "rewrd"')).toBeInTheDocument();
+  });
+
+  it('warns about malformed conditions but still shows all samples', () => {
+    const samples = makeSmallSamples();
+    const onFiltered = vi.fn();
+    render(<LeftPanel {...makeDefaultProps({ samples, onFilteredSamplesChange: onFiltered })} />);
+
+    const input = screen.getByPlaceholderText(/Filter samples/);
+    fireEvent.change(input, { target: { value: 'this is not a filter' } });
+    act(() => { vi.advanceTimersByTime(200); });
+
+    // Malformed conditions pass everything in evaluateCondition — the warning
+    // surfaces the problem while the table keeps showing all samples.
+    expect(screen.getByText('Unrecognized condition: "this is not a filter"')).toBeInTheDocument();
+    const lastCall = onFiltered.mock.calls[onFiltered.mock.calls.length - 1][0];
+    expect(lastCall).toHaveLength(10);
+  });
+
+  it('shows no warning for a valid filter expression', () => {
+    const samples = makeSmallSamples();
+    render(<LeftPanel {...makeDefaultProps({ samples })} />);
+
+    const input = screen.getByPlaceholderText(/Filter samples/);
+    fireEvent.change(input, { target: { value: 'reward > 0 AND step == 1' } });
+    act(() => { vi.advanceTimersByTime(200); });
+
+    expect(screen.queryByText(/Unknown field|Unrecognized condition/)).not.toBeInTheDocument();
+  });
+
+  it('shows a clear button only when a filter expression is set, and clears it', () => {
+    const samples = makeSmallSamples();
+    render(<LeftPanel {...makeDefaultProps({ samples })} />);
+
+    const input = screen.getByPlaceholderText(/Filter samples/) as HTMLInputElement;
+    expect(screen.queryByTitle('Clear filter')).not.toBeInTheDocument();
+
+    fireEvent.change(input, { target: { value: 'reward > 0' } });
+    const clearButton = screen.getByTitle('Clear filter');
+    fireEvent.click(clearButton);
+
+    expect(input.value).toBe('');
+    expect(screen.queryByTitle('Clear filter')).not.toBeInTheDocument();
+  });
+});
+
+describe('LeftPanel degenerate ID column → Rollout column', () => {
+  /** All samples share one sample_index, but rollout_n varies. */
+  function makeDegenerateSamples(count = 4): Sample[] {
+    return Array.from({ length: count }, (_, i) =>
+      makeSample({
+        id: i,
+        attributes: { ...makeAttributes(), sample_index: 7, rollout_n: 700 + i },
+      }),
+    );
+  }
+
+  it('shows a Rollout column with distinct values when sample_index is degenerate', () => {
+    render(<LeftPanel {...makeDefaultProps({ samples: makeDegenerateSamples() })} />);
+    expect(screen.getByText('Rollout')).toBeInTheDocument();
+    expect(screen.queryByText('ID')).not.toBeInTheDocument();
+    // Cells show the varying rollout_n, not the shared sample_index
+    expect(screen.getByText('700')).toBeInTheDocument();
+    expect(screen.getByText('703')).toBeInTheDocument();
+  });
+
+  it('keeps the ID column when sample_index values are distinct', () => {
+    render(<LeftPanel {...makeDefaultProps({ samples: makeSmallSamples() })} />);
+    expect(screen.getByText('ID')).toBeInTheDocument();
+    expect(screen.queryByText('Rollout')).not.toBeInTheDocument();
+  });
+
+  it('keeps the ID column when both sample_index and rollout_n are degenerate', () => {
+    const samples = Array.from({ length: 3 }, (_, i) =>
+      makeSample({ id: i, attributes: { ...makeAttributes(), sample_index: 7, rollout_n: 7 } }),
+    );
+    render(<LeftPanel {...makeDefaultProps({ samples })} />);
+    expect(screen.getByText('ID')).toBeInTheDocument();
+    expect(screen.queryByText('Rollout')).not.toBeInTheDocument();
+  });
+
+  it('does not flip the column when filtering narrows to equal sample_index (detection uses unfiltered samples)', () => {
+    vi.useFakeTimers();
+    // Non-degenerate overall: two samples share sample_index 5, one differs.
+    const samples = [
+      makeSample({ id: 0, attributes: { ...makeAttributes(), sample_index: 5, rollout_n: 1, reward: 10 } }),
+      makeSample({ id: 1, attributes: { ...makeAttributes(), sample_index: 5, rollout_n: 2, reward: 10 } }),
+      makeSample({ id: 2, attributes: { ...makeAttributes(), sample_index: 6, rollout_n: 3, reward: 0 } }),
+    ];
+    const onFiltered = vi.fn();
+    render(<LeftPanel {...makeDefaultProps({ samples, onFilteredSamplesChange: onFiltered })} />);
+
+    const input = screen.getByPlaceholderText(/Filter samples/);
+    fireEvent.change(input, { target: { value: 'reward > 5' } });
+    act(() => { vi.advanceTimersByTime(200); });
+
+    // Filtered set now only contains sample_index 5 twice...
+    const lastCall = onFiltered.mock.calls[onFiltered.mock.calls.length - 1][0];
+    expect(lastCall).toHaveLength(2);
+    // ...but the identity column must NOT flip to Rollout
+    expect(screen.getByText('ID')).toBeInTheDocument();
+    expect(screen.queryByText('Rollout')).not.toBeInTheDocument();
+    vi.useRealTimers();
+  });
+});
+
+describe('LeftPanel search counter and navigation', () => {
+  it('shows 1/N (not 0/N) when the first sample with id 0 is selected', () => {
+    const samples = makeSmallSamples();
+    // Every fixture sample contains 'Hello' in its user message → all 10 match
+    const searchConditions: SearchCondition[] = [
+      { id: generateId(), field: 'chat', operator: 'contains', term: 'Hello' },
+    ];
+    render(<LeftPanel {...makeDefaultProps({
+      samples,
+      searchConditions,
+      selectedSampleId: 0,
+    })} />);
+    // Regression: id 0 was treated as "no selection" by a falsy check → '0/10'
+    expect(screen.getByText('1/10')).toBeInTheDocument();
+  });
+
+  it('hides the counter and disables navigation arrows when no search term is entered', () => {
+    const samples = makeSmallSamples();
+    render(<LeftPanel {...makeDefaultProps({ samples, selectedSampleId: 0 })} />);
+    expect(screen.queryByText('1/10')).not.toBeInTheDocument();
+    expect(screen.getByTitle('Previous chat')).toBeDisabled();
+    expect(screen.getByTitle(/Next occurrence/)).toBeDisabled();
+  });
+
+  it("shows '0 matches' when an active search matches nothing", () => {
+    vi.useFakeTimers();
+    const samples = makeSmallSamples();
+    const searchConditions: SearchCondition[] = [
+      { id: generateId(), field: 'chat', operator: 'contains', term: 'zzz_no_match_zzz' },
+    ];
+    render(<LeftPanel {...makeDefaultProps({ samples, searchConditions })} />);
+    act(() => { vi.advanceTimersByTime(200); });
+    expect(screen.getByText('0 matches')).toBeInTheDocument();
+    expect(screen.getByTitle('Previous chat')).toBeDisabled();
+    vi.useRealTimers();
+  });
+});
+
+describe('LeftPanel empty states', () => {
+  it('shows "No samples loaded" with a Browse files button when no samples', () => {
+    const onOpenFileBrowser = vi.fn();
+    render(<LeftPanel {...makeDefaultProps({ samples: [], onOpenFileBrowser })} />);
+
+    expect(screen.getByText('No samples loaded')).toBeInTheDocument();
+    fireEvent.click(screen.getByText('Browse files'));
+    expect(onOpenFileBrowser).toHaveBeenCalled();
+  });
+
+  it('hides the Browse files button in shared mode', () => {
+    render(<LeftPanel {...makeDefaultProps({ samples: [], isSharedMode: true })} />);
+
+    expect(screen.getByText('No samples loaded')).toBeInTheDocument();
+    expect(screen.queryByText('Browse files')).not.toBeInTheDocument();
+  });
+
+  it('shows the no-match empty state and Clear filters restores the table', () => {
+    vi.useFakeTimers();
+    const samples = makeSmallSamples();
+    const onSearchConditionsChange = vi.fn();
+    const onFiltered = vi.fn();
+    render(<LeftPanel {...makeDefaultProps({
+      samples,
+      onSearchConditionsChange,
+      onFilteredSamplesChange: onFiltered,
+    })} />);
+
+    // Valid field, but no sample matches → empty table with its own message
+    const input = screen.getByPlaceholderText(/Filter samples/);
+    fireEvent.change(input, { target: { value: 'reward > 999' } });
+    act(() => { vi.advanceTimersByTime(200); });
+    expect(screen.getByText('No samples match your search or filter')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText('Clear filters'));
+    expect(onSearchConditionsChange).toHaveBeenCalledWith([
+      expect.objectContaining({ field: 'chat', operator: 'contains', term: '' }),
+    ]);
+
+    act(() => { vi.advanceTimersByTime(200); });
+    expect(screen.queryByText('No samples match your search or filter')).not.toBeInTheDocument();
+    const lastCall = onFiltered.mock.calls[onFiltered.mock.calls.length - 1][0];
+    expect(lastCall).toHaveLength(10);
+    vi.useRealTimers();
   });
 });

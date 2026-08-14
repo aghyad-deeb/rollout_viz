@@ -106,7 +106,7 @@ describe('SampleTable stress (5,000 samples)', () => {
     expect(elapsed).toBeLessThan(1000);
 
     // Verify grade columns appear in header
-    // The metric names are truncated to 8 chars
+    // The metric names are truncated to 14 chars
     const headers = container.querySelectorAll('[class*="uppercase"]');
     expect(headers.length).toBeGreaterThan(0);
 
@@ -163,7 +163,7 @@ describe('SampleTable stress (5,000 samples)', () => {
     const { container } = render(<SampleTable {...defaultProps} samples={samples} />);
 
     // The header should contain metric column headers
-    // metric_0 through metric_4, truncated to 8 chars: "Metric_…" or "Metric_0" etc.
+    // metric_0 through metric_4 fit within the 14-char truncation: "Metric_0" etc.
     const headerText = container.querySelector('[class*="uppercase"]')?.textContent || '';
     // At least one metric should appear
     expect(headerText.toLowerCase()).toContain('metric');

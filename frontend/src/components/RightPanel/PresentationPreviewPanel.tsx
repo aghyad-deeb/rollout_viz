@@ -20,6 +20,10 @@ interface PresentationPreviewPanelProps {
   /** The capture PNG Blob itself — used for copy / download so they don't
    *  depend on the (revocable) object URL. Null before the first capture. */
   imageBlob: Blob | null;
+  /** True while the shown image is behind the latest edits (a re-render is
+   *  debouncing/in flight) — the preview dims and Copy/Download hold so a
+   *  stale image can't be exported. */
+  isPending?: boolean;
   isDarkMode: boolean;
   imageTheme: 'light' | 'dark';
   exportWidth: ExportWidth;
@@ -28,7 +32,11 @@ interface PresentationPreviewPanelProps {
   onExportWidthChange: (width: ExportWidth) => void;
   onFontSizeChange: (size: FontSize) => void;
   activeMessageIndex: number | null;
-  messageCount: number;
+  /** One label per message card (e.g. its effective role/display label) —
+   *  the card count is derived from this array's length. */
+  messageLabels: string[];
+  /** Base name (no extension) for downloaded / copied captures. */
+  exportBaseName?: string;
   activeDraft: PresentationMessageDraft | null;
   activeDraftDirty: boolean;
   draftCount: number;
@@ -66,6 +74,7 @@ function loadFormat(): DownloadFormat {
 export function PresentationPreviewPanel({
   imageUrl,
   imageBlob,
+  isPending = false,
   isDarkMode,
   imageTheme,
   exportWidth,
@@ -74,7 +83,8 @@ export function PresentationPreviewPanel({
   onExportWidthChange,
   onFontSizeChange,
   activeMessageIndex,
-  messageCount,
+  messageLabels,
+  exportBaseName,
   activeDraft,
   activeDraftDirty,
   draftCount,
@@ -99,7 +109,7 @@ export function PresentationPreviewPanel({
     try {
       const blob = await encodeImage(imageBlob, format);
       const ext = FORMATS.find((f) => f.id === format)?.ext ?? 'png';
-      downloadBlob(blob, `rollout-capture.${ext}`);
+      downloadBlob(blob, `${exportBaseName ?? 'rollout-capture'}.${ext}`);
     } catch { /* ignore */ }
     finally { setBusy(false); }
   };
@@ -112,7 +122,7 @@ export function PresentationPreviewPanel({
     if (!imageBlob || busy) return;
     setBusy(true);
     try {
-      const ok = await copyImageToClipboard(imageBlob, '');
+      const ok = await copyImageToClipboard(imageBlob, '', `${exportBaseName ?? 'rollout-capture'}.png`);
       setCopied(ok ? 'copied' : 'saved');
       setTimeout(() => setCopied(null), 2000);
     } catch { /* ignore */ }
@@ -213,7 +223,9 @@ export function PresentationPreviewPanel({
           </span>
           <span className={`inline-flex items-center gap-2 min-w-0 ${muted}`}>
             <span className="truncate">
-              {activeMessageIndex === null ? 'No card' : `#${activeMessageIndex + 1}`}
+              {activeMessageIndex === null
+                ? 'No card'
+                : `#${activeMessageIndex + 1} · ${messageLabels[activeMessageIndex] ?? ''}`}
             </span>
             {activeDraftDirty && <span className={isDarkMode ? 'text-sky-300' : 'text-sky-700'}>Modified</span>}
           </span>
@@ -247,8 +259,8 @@ export function PresentationPreviewPanel({
                 className={`min-w-0 flex-1 px-1.5 py-0.5 rounded border ${ctrl}`}
               >
                 <option value="">Select a card</option>
-                {Array.from({ length: messageCount }, (_, index) => (
-                  <option key={index} value={index}>#{index + 1}</option>
+                {messageLabels.map((messageLabel, index) => (
+                  <option key={index} value={index}>{`#${index + 1} · ${messageLabel}`}</option>
                 ))}
               </select>
             </label>
@@ -327,13 +339,23 @@ export function PresentationPreviewPanel({
         )}
       </div>
 
-      <div className="flex-1 overflow-auto p-3 flex items-start justify-center">
+      <div className="flex-1 overflow-auto custom-scrollbar p-3 flex items-start justify-center relative">
         {imageUrl ? (
-          <img
-            src={imageUrl}
-            alt="Live capture preview"
-            className="max-w-full h-auto rounded shadow-lg"
-          />
+          <>
+            <img
+              src={imageUrl}
+              alt="Live capture preview"
+              className={`max-w-full h-auto rounded shadow-lg transition-opacity ${isPending ? 'opacity-40' : ''}`}
+            />
+            {isPending && (
+              <div className={`absolute top-4 left-1/2 -translate-x-1/2 flex items-center gap-1.5 px-2 py-1 rounded-full text-xs shadow ${
+                isDarkMode ? 'bg-gray-800 text-gray-300' : 'bg-white text-gray-600'
+              }`}>
+                <span className="material-symbols-outlined animate-spin" style={{ fontSize: 13 }} aria-hidden="true">progress_activity</span>
+                Updating preview…
+              </div>
+            )}
+          </>
         ) : (
           <div
             className={`h-full flex items-center justify-center text-center text-sm px-6 ${
@@ -364,16 +386,17 @@ export function PresentationPreviewPanel({
           </select>
           <button
             onClick={handleDownload}
-            disabled={busy}
+            disabled={busy || isPending}
+            title={isPending ? 'Preview is updating — hold on' : undefined}
             className="flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 rounded text-sm font-medium text-white bg-sky-600 hover:bg-sky-700 disabled:opacity-60"
           >
             <span className="material-symbols-outlined" style={{ fontSize: 17 }}>download</span>
-            {busy ? 'Preparing...' : 'Download'}
+            {busy ? 'Preparing...' : isPending ? 'Updating…' : 'Download'}
           </button>
           <button
             onClick={handleCopy}
-            disabled={busy}
-            title="Copy image to clipboard"
+            disabled={busy || isPending}
+            title={isPending ? 'Preview is updating — hold on' : 'Copy image to clipboard'}
             className={`flex items-center justify-center gap-1.5 px-3 py-1.5 rounded text-sm font-medium disabled:opacity-60 ${
               copied
                 ? 'bg-green-600 text-white'

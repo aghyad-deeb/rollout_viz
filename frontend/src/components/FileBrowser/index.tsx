@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import type { FileInfo } from '../../types';
 
 interface FolderInfo {
@@ -29,6 +29,39 @@ interface FileBrowserProps {
 type SortColumn = 'name' | 'size' | 'last_modified';
 type SortOrder = 'asc' | 'desc';
 
+interface Breadcrumb {
+  label: string;
+  target: string;
+}
+
+// Split a path into clickable breadcrumb segments.
+// S3 targets MUST keep the trailing slash — the s3 contents API lists by
+// prefix + delimiter, so "s3://bucket/a/b" and "s3://bucket/a/b/" differ.
+function buildBreadcrumbs(path: string): Breadcrumb[] {
+  if (path.startsWith('s3://')) {
+    const s3Path = path.slice(5); // Remove 's3://'
+    const slashIndex = s3Path.indexOf('/');
+    const bucket = slashIndex > 0 ? s3Path.slice(0, slashIndex) : s3Path;
+    const prefix = slashIndex > 0 ? s3Path.slice(slashIndex + 1) : '';
+    const segs = prefix.split('/').filter(Boolean);
+    return [
+      { label: `s3://${bucket}`, target: `s3://${bucket}/` },
+      ...segs.map((seg, i) => ({
+        label: seg,
+        target: `s3://${bucket}/${segs.slice(0, i + 1).join('/')}/`,
+      })),
+    ];
+  }
+  const segs = path.split('/').filter(Boolean);
+  return [
+    { label: '/', target: '/' },
+    ...segs.map((seg, i) => ({
+      label: seg,
+      target: '/' + segs.slice(0, i + 1).join('/'),
+    })),
+  ];
+}
+
 export function FileBrowser({
   isOpen,
   onClose,
@@ -49,6 +82,8 @@ export function FileBrowser({
   const [sortColumn, setSortColumn] = useState<SortColumn>('last_modified');
   const [sortOrder, setSortOrder] = useState<SortOrder>('desc');
   const [searchTerm, setSearchTerm] = useState('');
+  const directoryInputRef = useRef<HTMLInputElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
 
   // Fetch contents (folders + files at current level)
   const fetchContents = useCallback(async (path: string) => {
@@ -152,12 +187,34 @@ export function FileBrowser({
   useEffect(() => {
     if (isOpen) {
       setError(null);
+      setSelectedFiles(new Set()); // Clear stale selection from a previous open
       // Auto-fetch if there's a pre-filled path and nothing loaded yet
       if (directoryPath.trim() && folders.length === 0 && files.length === 0 && !currentPath) {
         fetchContents(directoryPath);
       }
     }
   }, [isOpen]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Escape closes the modal — unless focus is in a non-empty text input,
+  // in which case it clears that input first (two-stage Escape).
+  useEffect(() => {
+    if (!isOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      const active = document.activeElement;
+      if (active === searchInputRef.current && searchTerm) {
+        setSearchTerm('');
+        return;
+      }
+      if (active === directoryInputRef.current && directoryPath) {
+        setDirectoryPath('');
+        return;
+      }
+      onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [isOpen, searchTerm, directoryPath, onClose]);
 
   const handleNavigate = () => {
     fetchContents(directoryPath);
@@ -366,7 +423,12 @@ export function FileBrowser({
       {/* Modal — `max-h-full` relies on the outer p-4 gutter; `overflow-hidden`
           clips any stray child so the rounded corners stay clean and the
           inner scroll area is the single scroll surface. */}
-      <div className={`relative rounded-lg shadow-xl w-full max-w-[800px] max-h-full flex flex-col overflow-hidden ${isDarkMode ? 'bg-gray-900' : 'bg-white'}`}>
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label="File browser"
+        className={`relative rounded-lg shadow-xl w-full max-w-[800px] max-h-full flex flex-col overflow-hidden ${isDarkMode ? 'bg-gray-900' : 'bg-white'}`}
+      >
         {/* Header */}
         <div className={`flex items-center justify-between px-4 py-3 border-b ${isDarkMode ? 'border-gray-700' : 'border-gray-200'}`}>
           <h2 className={`text-lg font-semibold flex items-center gap-2 ${isDarkMode ? 'text-gray-200' : 'text-gray-800'}`}>
@@ -375,6 +437,7 @@ export function FileBrowser({
           </h2>
           <button
             onClick={onClose}
+            aria-label="Close file browser"
             className={`p-1 rounded transition-colors ${isDarkMode ? 'hover:bg-gray-800' : 'hover:bg-gray-100'}`}
           >
             <span className={`material-symbols-outlined ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>close</span>
@@ -388,6 +451,7 @@ export function FileBrowser({
           </label>
           <div className="flex gap-2 flex-wrap">
             <input
+              ref={directoryInputRef}
               type="text"
               value={directoryPath}
               onChange={(e) => setDirectoryPath(e.target.value)}
@@ -398,11 +462,7 @@ export function FileBrowser({
             <button
               onClick={handleNavigate}
               disabled={loading || !directoryPath.trim()}
-              className={`px-4 py-2 border rounded-md transition-colors flex items-center gap-1 ${
-                isDarkMode 
-                  ? 'border-gray-600 text-gray-300 hover:bg-gray-700 disabled:bg-gray-800 disabled:text-gray-600' 
-                  : 'border-gray-300 text-gray-700 hover:bg-gray-50 disabled:bg-gray-100 disabled:text-gray-400'
-              } disabled:cursor-not-allowed`}
+              className={`px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors flex items-center gap-1 ${isDarkMode ? 'disabled:bg-gray-700' : 'disabled:bg-gray-300'} disabled:cursor-not-allowed`}
               title="Navigate into folder to see subfolders"
             >
               {loading && browseMode === 'navigate' ? (
@@ -415,7 +475,11 @@ export function FileBrowser({
             <button
               onClick={handleBrowseAll}
               disabled={loading || !directoryPath.trim()}
-              className={`px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors flex items-center gap-1 ${isDarkMode ? 'disabled:bg-gray-700' : 'disabled:bg-gray-300'} disabled:cursor-not-allowed`}
+              className={`px-4 py-2 border rounded-md transition-colors flex items-center gap-1 ${
+                isDarkMode
+                  ? 'border-gray-600 text-gray-300 hover:bg-gray-700 disabled:bg-gray-800 disabled:text-gray-600'
+                  : 'border-gray-300 text-gray-700 hover:bg-gray-50 disabled:bg-gray-100 disabled:text-gray-400'
+              } disabled:cursor-not-allowed`}
               title="Browse all JSONL files recursively"
             >
               {loading && browseMode === 'browse' ? (
@@ -441,13 +505,42 @@ export function FileBrowser({
             >
               <span className="material-symbols-outlined text-sm">arrow_upward</span>
             </button>
-            <span className={`text-sm font-mono truncate ${isDarkMode ? 'text-gray-300' : 'text-gray-600'}`}>
-              {currentPath}
-            </span>
-            {browseMode === 'browse' && (
-              <span className={`text-xs px-2 py-0.5 rounded ${isDarkMode ? 'bg-blue-900 text-blue-300' : 'bg-blue-100 text-blue-700'}`}>
-                recursive
-              </span>
+            {browseMode === 'navigate' ? (
+              <nav
+                aria-label="Breadcrumb"
+                className={`min-w-0 flex-1 overflow-x-auto whitespace-nowrap text-sm font-mono ${isDarkMode ? 'text-gray-300' : 'text-gray-600'}`}
+              >
+                {buildBreadcrumbs(currentPath).map((crumb, i, crumbs) => (
+                  <span key={crumb.target}>
+                    {i > 0 && crumbs[i - 1].label !== '/' && (
+                      <span className={isDarkMode ? 'text-gray-600' : 'text-gray-400'}>/</span>
+                    )}
+                    {i === crumbs.length - 1 ? (
+                      <span>{crumb.label}</span>
+                    ) : (
+                      <button
+                        onClick={() => {
+                          setDirectoryPath(crumb.target);
+                          fetchContents(crumb.target);
+                        }}
+                        className={`hover:underline ${isDarkMode ? 'text-blue-400 hover:text-blue-300' : 'text-blue-600 hover:text-blue-700'}`}
+                        title={`Go to ${crumb.target}`}
+                      >
+                        {crumb.label}
+                      </button>
+                    )}
+                  </span>
+                ))}
+              </nav>
+            ) : (
+              <>
+                <span className={`text-sm font-mono truncate ${isDarkMode ? 'text-gray-300' : 'text-gray-600'}`}>
+                  {currentPath}
+                </span>
+                <span className={`text-xs px-2 py-0.5 rounded ${isDarkMode ? 'bg-blue-900 text-blue-300' : 'bg-blue-100 text-blue-700'}`}>
+                  recursive
+                </span>
+              </>
             )}
           </div>
         )}
@@ -459,6 +552,7 @@ export function FileBrowser({
             <div className={`flex-1 flex items-center gap-2 px-3 py-1.5 border rounded-md ${isDarkMode ? 'bg-gray-900 border-gray-600' : 'bg-white border-gray-300'}`}>
               <span className={`material-symbols-outlined text-sm ${isDarkMode ? 'text-gray-500' : 'text-gray-400'}`}>search</span>
               <input
+                ref={searchInputRef}
                 type="text"
                 value={searchTerm}
                 onChange={(e) => setSearchTerm(e.target.value)}
@@ -535,7 +629,7 @@ export function FileBrowser({
         {/* File list — `min-h-0` lets this flex child shrink below its
             content size so the footer stays visible on short viewports.
             The internal `overflow-auto` provides the scroll. */}
-        <div className="flex-1 overflow-auto min-h-0">
+        <div className="flex-1 overflow-auto min-h-0 custom-scrollbar">
           {error && (
             <div className={`p-4 text-center ${isDarkMode ? 'text-red-400' : 'text-red-500'}`}>
               <span className="material-symbols-outlined">error</span>
@@ -724,7 +818,7 @@ export function FileBrowser({
 
         {/* Footer */}
         <div className={`px-4 py-3 border-t flex items-center justify-between flex-wrap gap-2 ${isDarkMode ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-gray-50'}`}>
-          <p className={`text-xs ${isDarkMode ? 'text-gray-500' : 'text-gray-400'}`}>
+          <p className={`text-xs ${isDarkMode ? 'text-gray-500' : 'text-gray-500'}`}>
             Click to select files, double-click to load single file
           </p>
           <div className="flex gap-2 flex-wrap">

@@ -206,12 +206,20 @@ def reset_rate_limiter():
     main_module._clear_viz_exists_cache()
     main_module._clear_test_provider_cache()
     main_module._clear_abuse_rate_limits()
+    main_module._GRADE_JOBS.clear()
+    main_module._GRADE_JOBS_BY_FILE.clear()
+    from backend.library_api import _clear_library_cache
+    _clear_library_cache()
     yield
     main_module._login_attempts.clear()
     main_module._clear_file_cache()
     main_module._clear_viz_exists_cache()
     main_module._clear_test_provider_cache()
     main_module._clear_abuse_rate_limits()
+    main_module._GRADE_JOBS.clear()
+    main_module._GRADE_JOBS_BY_FILE.clear()
+    from backend.library_api import _clear_library_cache
+    _clear_library_cache()
 
 
 @pytest.fixture

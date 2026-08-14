@@ -120,7 +120,7 @@ export function ElisionPill({
     <>
       <span
         className={`elision-pill inline align-baseline mx-0.5 px-1 rounded border border-dashed text-xs whitespace-normal break-words [overflow-wrap:anywhere] cursor-pointer transition-colors ${pillClass}`}
-        title={`Collapsed: ${preview.slice(0, 120)}${preview.length > 120 ? '...' : ''} (click to expand, right-click for options)`}
+        title={`Click to expand · right-click to edit/hide — collapsed: "${preview.slice(0, 120)}${preview.length > 120 ? '...' : ''}"`}
         onClick={(e) => {
           e.stopPropagation();
           onRemove();

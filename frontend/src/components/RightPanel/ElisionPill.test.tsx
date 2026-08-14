@@ -33,6 +33,13 @@ describe('ElisionPill', () => {
     expect(pill.className).not.toContain('whitespace-nowrap');
   });
 
+  it('tooltip leads with the actions, then the collapsed preview', () => {
+    render(<ElisionPill {...baseProps} text="hidden words here" />);
+    const title = screen.getByText('[...]').getAttribute('title') ?? '';
+    expect(title.startsWith('Click to expand')).toBe(true);
+    expect(title).toBe('Click to expand · right-click to edit/hide — collapsed: "hidden words here"');
+  });
+
   it('left click expands (removes) the collapse', () => {
     const onRemove = vi.fn();
     render(<ElisionPill {...baseProps} onRemove={onRemove} />);

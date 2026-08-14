@@ -1,4 +1,5 @@
 import { memo, useState } from 'react';
+import { renderMarkdownLite } from './markdownLite';
 
 interface ChatMessageCardProps {
   role: 'user' | 'assistant';
@@ -111,7 +112,9 @@ function ChatMessageCardInner({
           <div className={`mx-3 text-sm whitespace-pre-wrap break-words ${textPrimary}`}>
             {content ? (
               <>
-                {content}
+                {/* Only assistant replies get markdown-lite; user turns stay
+                    verbatim. The copy button always copies the raw string. */}
+                {role === 'assistant' ? renderMarkdownLite(content) : content}
                 {isStreaming && caret}
               </>
             ) : isStreaming ? (

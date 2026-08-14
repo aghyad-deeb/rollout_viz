@@ -11,10 +11,18 @@ import { readPngTextChunks, stripPngTextChunks } from '../../utils/pngMetadata';
 import { applyPresentationDraft, type PresentationMessageDrafts } from '../../utils/presentationDraft';
 import { CapturePreviewModal } from './CapturePreviewModal';
 import { buildPublicUrl, safeSameOriginRolloutUrl } from '../../config';
+import { formatTimestamp } from '../../utils/formatTimestamp';
+import { latestJudgeEntry } from '../../utils/humanGrades';
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
+
+// Stable default for the presentationDrafts prop. An inline `= {}` default
+// would mint a new identity on every render, invalidating the
+// displayedMessages memo and re-arming the preview-capture effect in a loop
+// whenever the pending callback triggers a parent re-render.
+const EMPTY_DRAFTS: PresentationMessageDrafts = {};
 
 interface ChatViewProps {
   sample: Sample;
@@ -39,9 +47,16 @@ interface ChatViewProps {
   exportWidth?: ExportWidth;
   fontSize?: FontSize;
   onPresentationPreview?: (url: string | null, blob?: Blob | null) => void;
+  // Fires true while a fresh left-panel preview render is pending (debounce +
+  // capture), false once the preview is current again — lets the preview
+  // panel mark itself stale and hold Copy/Download until the render lands.
+  onPreviewPending?: (pending: boolean) => void;
   presentationDrafts?: PresentationMessageDrafts;
   presentationActiveIndex?: number | null;
   onPresentationActiveIndexChange?: (index: number | null) => void;
+  // Exits Presentation Mode — wired to the toolbar "Exit (Esc)" button and
+  // a window Escape listener (guarded so modals / menus / inputs win).
+  onExitPresentationMode?: () => void;
 }
 
 interface LocalMatch {
@@ -69,21 +84,31 @@ export function ChatView({
   exportWidth = 'paper1',
   fontSize = 'md',
   onPresentationPreview,
-  presentationDrafts = {},
+  onPreviewPending,
+  presentationDrafts = EMPTY_DRAFTS,
   presentationActiveIndex = null,
   onPresentationActiveIndexChange,
+  onExitPresentationMode,
 }: ChatViewProps) {
   // Extract quotes from the selected grade metric
   const gradeQuotes = useMemo((): Quote[] => {
     if (!selectedGradeMetric || !sample.grades || !sample.grades[selectedGradeMetric]) {
       return [];
     }
-    const grades = sample.grades[selectedGradeMetric];
-    if (grades.length === 0) return [];
-    
-    // Get quotes from the latest grade
-    const latestGrade = grades[grades.length - 1];
-    return latestGrade.quotes || [];
+    // Quotes come from the latest JUDGE entry — human confirm/dispute entries
+    // append to the same list but never carry quotes, and must not blank the
+    // judge's evidence.
+    const latestGrade = latestJudgeEntry(sample.grades[selectedGradeMetric]);
+    const quotes = latestGrade?.quotes || [];
+    // Sorted by (message_index, start) — the SAME order GradesDisplay uses
+    // for its quote pager, so a quote's index here is its pager position.
+    // MessageCard stamps that index on each rendered mark, which is what
+    // keeps navigation aligned even when some quote can't be located in the
+    // transcript (inexact judge quoting).
+    return [...quotes].sort((a, b) => {
+      if (a.message_index !== b.message_index) return a.message_index - b.message_index;
+      return a.start - b.start;
+    });
   }, [sample.grades, selectedGradeMetric]);
   // Get active search terms for highlighting (only 'contains' conditions with non-empty terms)
   const activeSearchTerms = useMemo(() => 
@@ -120,6 +145,9 @@ export function ChatView({
   const [localSearchTerm, setLocalSearchTerm] = useState('');
   const [localMatchCursor, setLocalMatchCursor] = useState({ term: '', index: 0 });
   const [isSearchOpen, setIsSearchOpen] = useState(false);
+  // Bulk expand/collapse for all message cards. The version bump tells each
+  // card a new bulk action fired (value alone can repeat).
+  const [expandAllSignal, setExpandAllSignal] = useState({ value: true, version: 0 });
   const [quoteCursor, setQuoteCursor] = useState<{ metric: string | undefined; index: number }>({ metric: undefined, index: 0 });
   // Ephemeral, session-only highlights: not persisted anywhere, cleared
   // whenever the user navigates to a different sample.
@@ -129,8 +157,12 @@ export function ChatView({
   const [wrappedToolCalls, setWrappedToolCalls] = useState<Set<string>>(new Set());
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const messageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+  const searchInputRef = useRef<HTMLInputElement>(null);
   const lastScrolledSampleId = useRef<number | null>(null);
   const lastScrolledSearchTerm = useRef<string>('');
+  // Last local (Ctrl+F) term we auto-scrolled to — mirrors
+  // lastScrolledSearchTerm so typing a term jumps to its first match once.
+  const lastScrolledLocalTerm = useRef<string>('');
 
   // Presentation Mode: session-only collapsed regions, same lifecycle as
   // ephemeral highlights. `collapseUndoRef` is a snapshot stack for Ctrl+Z;
@@ -147,8 +179,26 @@ export function ChatView({
   // live object URL so it can be revoked imperatively — an effect-cleanup
   // revoke fires during StrictMode's mount/cleanup/mount cycle and would
   // kill a URL the <img> still needs.
-  const [preview, setPreview] = useState<{ url: string; blob: Blob; caption: string } | null>(null);
+  const [preview, setPreview] = useState<{ url: string; blob: Blob; caption: string; filename: string } | null>(null);
   const previewUrlRef = useRef<string | null>(null);
+  // Presentation-toolbar "?" shortcuts popover (Escape / outside-click close).
+  const [isHelpOpen, setIsHelpOpen] = useState(false);
+  const helpWrapRef = useRef<HTMLDivElement>(null);
+  // Per-card capture feedback: busy while rendering, then done / fallback /
+  // error for ~2s. Keyed by message index so React.memo skips other cards.
+  // `captureStatusRef` mirrors the state so captureMessage can read the
+  // current value without invalidating its useCallback identity.
+  const [captureStatus, setCaptureStatus] = useState<Record<number, 'busy' | 'done' | 'fallback' | 'error'>>({});
+  const captureStatusRef = useRef(captureStatus);
+  const captureStatusTimersRef = useRef<Map<number, ReturnType<typeof setTimeout>>>(new Map());
+  useEffect(() => {
+    captureStatusRef.current = captureStatus;
+  }, [captureStatus]);
+  // Clear any pending status-reset timers on unmount.
+  useEffect(() => {
+    const timers = captureStatusTimersRef.current;
+    return () => { timers.forEach((t) => clearTimeout(t)); };
+  }, []);
   // The card under the pointer (kept when the pointer leaves, so it falls
   // back to the last one touched) — subject of the left-panel live preview.
   // The message being captured/previewed: index of the card last clicked.
@@ -157,6 +207,17 @@ export function ChatView({
     ? presentationActiveIndex ?? null
     : uncontrolledActiveIndex;
   const leftPreviewUrlRef = useRef<string | null>(null);
+  // The preview effect reads these callbacks through refs instead of listing
+  // them as deps. This is load-bearing: a parent passing inline arrows would
+  // otherwise re-trigger the effect after every completed capture (state
+  // update → new identity → effect re-runs) and loop forever, re-capturing
+  // and pinning the "Updating preview…" badge on.
+  const onPresentationPreviewRef = useRef(onPresentationPreview);
+  const onPreviewPendingRef = useRef(onPreviewPending);
+  useEffect(() => {
+    onPresentationPreviewRef.current = onPresentationPreview;
+    onPreviewPendingRef.current = onPreviewPending;
+  }, [onPresentationPreview, onPreviewPending]);
   const setActivePresentationIndex = useCallback((index: number | null) => {
     if (!onPresentationActiveIndexChange) setUncontrolledActiveIndex(index);
     onPresentationActiveIndexChange?.(index);
@@ -302,6 +363,54 @@ export function ChatView({
     return () => window.removeEventListener('keydown', onKey);
   }, [isPresentationMode, undoCollapse]);
 
+  // The Escape exit calls this prop, which triggers a parent state update —
+  // read it through a ref (synced by its own effect) so an inline arrow from
+  // the parent can't re-arm the listener effect on every render.
+  const onExitPresentationModeRef = useRef(onExitPresentationMode);
+  useEffect(() => {
+    onExitPresentationModeRef.current = onExitPresentationMode;
+  }, [onExitPresentationMode]);
+
+  // Escape exits Presentation Mode. Guards, in order: the capture-preview
+  // modal owns Escape while open (its own listener closes it and does not
+  // stopPropagation); an open elision-pill menu owns Escape; typing contexts
+  // are left alone; the shortcuts popover closes itself first (its own
+  // Escape listener below).
+  useEffect(() => {
+    if (!isPresentationMode) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      if (preview) return;
+      if (document.querySelector('[data-testid="elision-pill-menu"]')) return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      if (isHelpOpen) return;
+      onExitPresentationModeRef.current?.();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [isPresentationMode, preview, isHelpOpen]);
+
+  // Shortcuts popover: Escape or a click outside the "?" button / popover
+  // wrapper dismisses it.
+  useEffect(() => {
+    if (!isHelpOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setIsHelpOpen(false);
+    };
+    const onMouseDown = (e: MouseEvent) => {
+      if (helpWrapRef.current && !helpWrapRef.current.contains(e.target as Node)) {
+        setIsHelpOpen(false);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    document.addEventListener('mousedown', onMouseDown);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      document.removeEventListener('mousedown', onMouseDown);
+    };
+  }, [isHelpOpen]);
+
   // Resolve the chosen font-size preset to a numeric multiplier.
   const fontScale = FONT_SIZE_PRESETS.find((p) => p.id === fontSize)?.scale ?? 1;
 
@@ -321,28 +430,53 @@ export function ChatView({
     const caption =
       `${sample.attributes.experiment_name} · rollout ${sample.attributes.rollout_n}` +
       ` · step ${sample.attributes.step}`;
-    return { png, caption };
+    // Descriptive filename for the download paths (clipboard fallback and
+    // the preview modal's Download button).
+    const filename =
+      `rollout-${sample.attributes.rollout_n}-step${sample.attributes.step}-msg${messageIndex + 1}.png`;
+    return { png, caption, filename };
   }, [captureHost, exportWidth, imageTheme, fontScale, sample.attributes, setActivePresentationIndex]);
 
-  // P / camera button: capture straight to the clipboard.
+  // P / camera button: capture straight to the clipboard. Reports per-card
+  // status (busy → done / fallback / error) so the 0.5-2s render + clipboard
+  // write isn't silent; the status clears itself after ~2s.
   const captureMessage = useCallback(async (messageIndex: number) => {
+    if (captureStatusRef.current[messageIndex] === 'busy') return;
+    const setStatus = (status: 'busy' | 'done' | 'fallback' | 'error') => {
+      setCaptureStatus((prev) => ({ ...prev, [messageIndex]: status }));
+    };
+    setStatus('busy');
     try {
-      const { png, caption } = await buildCapturePng(messageIndex);
-      await copyImageToClipboard(png, caption);
+      const { png, caption, filename } = await buildCapturePng(messageIndex);
+      const copied = await copyImageToClipboard(png, caption, filename);
+      setStatus(copied ? 'done' : 'fallback');
     } catch (err) {
       console.error('[presentation] capture failed', err);
+      setStatus('error');
     }
+    // Clear the terminal status after ~2s (copiedLink-style feedback).
+    const existing = captureStatusTimersRef.current.get(messageIndex);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      captureStatusTimersRef.current.delete(messageIndex);
+      setCaptureStatus((prev) => {
+        const next = { ...prev };
+        delete next[messageIndex];
+        return next;
+      });
+    }, 2000);
+    captureStatusTimersRef.current.set(messageIndex, timer);
   }, [buildCapturePng]);
 
   // Preview button: render the same PNG and open it in a modal so the user
   // can check it before copying.
   const previewMessage = useCallback(async (messageIndex: number) => {
     try {
-      const { png, caption } = await buildCapturePng(messageIndex);
+      const { png, caption, filename } = await buildCapturePng(messageIndex);
       const url = URL.createObjectURL(png);
       if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
       previewUrlRef.current = url;
-      setPreview({ url, blob: png, caption });
+      setPreview({ url, blob: png, caption, filename });
     } catch (err) {
       console.error('[presentation] preview failed', err);
     }
@@ -359,11 +493,22 @@ export function ChatView({
   // preview matches the eventual capture exactly. Debounced so rapid
   // collapses / setting changes coalesce.
   useEffect(() => {
-    if (!isPresentationMode || activeIndex === null || !onPresentationPreview) return;
+    if (!isPresentationMode || activeIndex === null || !onPresentationPreviewRef.current) {
+      // No render scheduled → whatever preview is shown is not "behind".
+      onPreviewPendingRef.current?.(false);
+      return;
+    }
+    // The preview on screen is now stale until this render lands. Cleared on
+    // every completion path below (NOT in the effect cleanup — that runs
+    // before the next body and would flicker on each keystroke).
+    onPreviewPendingRef.current?.(true);
     let cancelled = false;
     const timer = setTimeout(async () => {
       const cardEl = captureHost.firstElementChild as HTMLElement | null;
-      if (!cardEl) return;
+      if (!cardEl) {
+        onPreviewPendingRef.current?.(false);
+        return;
+      }
       try {
         const raw = await captureCardToPng(cardEl, { exportWidth, imageTheme, fontScale });
         const blob = await stripPngTextChunks(raw, ['rollout-viz']);
@@ -371,15 +516,21 @@ export function ChatView({
         const url = URL.createObjectURL(blob);
         if (leftPreviewUrlRef.current) URL.revokeObjectURL(leftPreviewUrlRef.current);
         leftPreviewUrlRef.current = url;
-        onPresentationPreview(url, blob);
-      } catch { /* best-effort — leave the last preview in place */ }
+        onPresentationPreviewRef.current?.(url, blob);
+        onPreviewPendingRef.current?.(false);
+      } catch {
+        /* best-effort — leave the last preview in place */
+        if (!cancelled) onPreviewPendingRef.current?.(false);
+      }
     }, 380);
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [isPresentationMode, activeIndex, displayedMessages, collapsedRegions, ephemeralHighlights, wrappedToolCalls, exportWidth, imageTheme, fontScale, onPresentationPreview, captureHost]);
+  }, [isPresentationMode, activeIndex, displayedMessages, collapsedRegions, ephemeralHighlights, wrappedToolCalls, exportWidth, imageTheme, fontScale, captureHost]);
 
-  // Free the left-panel preview URL on unmount.
+  // Free the left-panel preview URL on unmount; a pending flag must not
+  // outlive the component that would clear it.
   useEffect(() => () => {
     if (leftPreviewUrlRef.current) URL.revokeObjectURL(leftPreviewUrlRef.current);
+    onPreviewPendingRef.current?.(false);
   }, []);
 
   // Drag an exported PNG back onto the chat → read its embedded link and
@@ -460,6 +611,20 @@ export function ChatView({
     return matches;
   }, [displayedMessages, localSearchTerm]);
 
+  // Starting local-match index for each message (cumulative corpus count) —
+  // mirrors messageOccurrenceStarts so MessageCard can style the current
+  // local match distinctly from the other green matches.
+  const localOccurrenceStarts = useMemo(() => {
+    const term = localSearchTerm.trim();
+    const starts: number[] = [];
+    let cumulativeCount = 0;
+    displayedMessages.forEach((message) => {
+      starts.push(cumulativeCount);
+      if (term) cumulativeCount += findAllMatchesCI(buildSearchCorpus(message), term).length;
+    });
+    return starts;
+  }, [displayedMessages, localSearchTerm]);
+
   const currentMatchIndex = localMatches.length === 0
     ? 0
     : Math.min(
@@ -467,17 +632,39 @@ export function ChatView({
       localMatches.length - 1,
     );
 
-  // Scroll to current match
+  // Scroll to the exact current match: the Nth `.local-search-mark` in
+  // document order (MessageCard tags one per match, first segment only) —
+  // mirrors the global-search machinery. Falls back to the containing
+  // message when the mark isn't rendered (e.g. collapsed away).
   const scrollToMatch = useCallback((matchIdx: number) => {
     if (localMatches.length === 0 || matchIdx >= localMatches.length) return;
-    
+
+    const marks = messagesContainerRef.current?.querySelectorAll('mark.local-search-mark');
+    const mark = marks?.[matchIdx];
+    if (mark) {
+      mark.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return;
+    }
+
     const match = localMatches[matchIdx];
     const messageElement = messageRefs.current.get(match.messageIndex);
-    
     if (messageElement) {
       messageElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }
   }, [localMatches]);
+
+  // Jump to the first match as soon as a (new) term has matches — once per
+  // term, without touching the cursor, so Enter still walks from the top.
+  useEffect(() => {
+    const term = localSearchTerm.trim();
+    if (!term) {
+      lastScrolledLocalTerm.current = '';
+      return;
+    }
+    if (localMatches.length === 0 || lastScrolledLocalTerm.current === term) return;
+    lastScrolledLocalTerm.current = term;
+    scrollToMatch(0);
+  }, [localSearchTerm, localMatches, scrollToMatch]);
 
   // Navigate to next/prev match
   const navigateMatch = useCallback((direction: 'next' | 'prev') => {
@@ -509,15 +696,26 @@ export function ChatView({
     }
   };
 
-  // Toggle search with Ctrl/Cmd + F
+  // Toggle search with Ctrl/Cmd + F. When the bar is already open, refocus
+  // and select the input so a second Ctrl+F starts a fresh query. Read via
+  // a ref so the window listener binds once.
+  const isSearchOpenRef = useRef(isSearchOpen);
+  useEffect(() => {
+    isSearchOpenRef.current = isSearchOpen;
+  }, [isSearchOpen]);
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
         e.preventDefault();
-        setIsSearchOpen(true);
+        if (isSearchOpenRef.current) {
+          searchInputRef.current?.focus();
+          searchInputRef.current?.select();
+        } else {
+          setIsSearchOpen(true);
+        }
       }
     };
-    
+
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
@@ -685,9 +883,6 @@ export function ChatView({
     return () => clearTimeout(timeoutId);
   }, [sample.id, sample.messages, primarySearchTerm, currentOccurrenceIndex]);
 
-  // Get the message index for the current match (for highlighting)
-  const currentMatchMessageIndex = localMatches.length > 0 ? localMatches[currentMatchIndex]?.messageIndex : null;
-
   // Register message ref
   const setMessageRef = useCallback((index: number, element: HTMLDivElement | null) => {
     if (element) {
@@ -710,7 +905,8 @@ export function ChatView({
       index={msgIndex}
       searchConditions={opts?.forCapture ? [] : searchConditions}
       localSearchTerm={opts?.forCapture ? '' : localSearchTerm}
-      isCurrentLocalMatch={opts?.forCapture ? false : currentMatchMessageIndex === msgIndex}
+      localOccurrenceStart={localOccurrenceStarts[msgIndex] ?? 0}
+      currentLocalMatchIndex={opts?.forCapture ? -1 : currentMatchIndex}
       isDarkMode={opts?.dark ?? isDarkMode}
       rolloutN={sample.attributes.rollout_n}
       step={sample.attributes.step}
@@ -741,8 +937,18 @@ export function ChatView({
       onCaptureMessage={captureMessage}
       onPreviewMessage={previewMessage}
       onPreviewSelect={handlePreviewSelect}
+      captureStatus={opts?.forCapture ? undefined : captureStatus[msgIndex]}
+      // The !forCapture guard keeps the off-screen portal clone from
+      // double-firing the P-shortcut capture.
+      isPresentationActive={!opts?.forCapture && isPresentationMode && activeIndex === msgIndex}
+      expandAllSignal={opts?.forCapture ? undefined : expandAllSignal}
     />
   );
+
+  // Keycap chip styling for the presentation-toolbar hints.
+  const kbdCls = `px-1 rounded border font-mono text-[10px] ${
+    isDarkMode ? 'border-gray-600 bg-gray-800 text-gray-300' : 'border-gray-300 bg-white text-gray-700'
+  }`;
 
   return (
     <div className="h-full flex flex-col">
@@ -753,6 +959,7 @@ export function ChatView({
             search
           </span>
           <input
+            ref={searchInputRef}
             type="text"
             value={localSearchTerm}
             onChange={(e) => setLocalSearchTerm(e.target.value)}
@@ -776,8 +983,9 @@ export function ChatView({
             disabled={localMatches.length === 0}
             className={`p-1 rounded disabled:opacity-50 ${isDarkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-200'}`}
             title="Previous match (Shift+Enter)"
+            aria-label="Previous match (Shift+Enter)"
           >
-            <span className={`material-symbols-outlined text-lg ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>
+            <span className={`material-symbols-outlined text-lg ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`} aria-hidden="true">
               keyboard_arrow_up
             </span>
           </button>
@@ -786,8 +994,9 @@ export function ChatView({
             disabled={localMatches.length === 0}
             className={`p-1 rounded disabled:opacity-50 ${isDarkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-200'}`}
             title="Next match (Enter)"
+            aria-label="Next match (Enter)"
           >
-            <span className={`material-symbols-outlined text-lg ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>
+            <span className={`material-symbols-outlined text-lg ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`} aria-hidden="true">
               keyboard_arrow_down
             </span>
           </button>
@@ -798,8 +1007,9 @@ export function ChatView({
             }}
             className={`p-1 rounded ${isDarkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-200'}`}
             title="Close search (Esc)"
+            aria-label="Close search (Esc)"
           >
-            <span className={`material-symbols-outlined text-lg ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>
+            <span className={`material-symbols-outlined text-lg ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`} aria-hidden="true">
               close
             </span>
           </button>
@@ -809,7 +1019,7 @@ export function ChatView({
       {/* Presentation Mode toolbar — replaces the search-toggle row. */}
       {isPresentationMode && (
         <div className={`flex flex-wrap justify-between items-center gap-x-3 gap-y-1 px-4 py-1.5 border-b ${isDarkMode ? 'border-gray-700 bg-gray-800/60' : 'border-gray-200 bg-gray-50'}`}>
-          <div className="flex items-center gap-2 text-xs">
+          <div className="flex flex-wrap items-center gap-2 text-xs">
             <span className={`inline-flex items-center gap-1 font-medium ${isDarkMode ? 'text-sky-300' : 'text-sky-700'}`}>
               <span className="material-symbols-outlined" style={{ fontSize: 14 }}>slideshow</span>
               Presentation
@@ -833,43 +1043,64 @@ export function ChatView({
                 >
                   Expand all
                 </button>
+                <span className={isDarkMode ? 'text-gray-500' : 'text-gray-400'}>
+                  right-click [...] to edit/hide
+                </span>
               </>
             )}
-            <span className={isDarkMode ? 'text-gray-500' : 'text-gray-400'}>
-              Select text → Collapse C · Isolate O · Highlight H · Bold B · Italic I · hover + P to capture · drop a PNG
-            </span>
-          </div>
-        </div>
-      )}
-
-      {/* Search toggle button (when search is closed) */}
-      {!isSearchOpen && !isPresentationMode && (
-        <div className={`flex justify-between items-center px-4 py-1 border-b ${isDarkMode ? 'border-gray-700' : 'border-gray-200'}`}>
-          {/* Ephemeral-highlights count + clear (left) — only when any exist */}
-          {ephemeralHighlights.length > 0 ? (
-            <div className="flex items-center gap-2 text-xs">
-              <span className={`inline-flex items-center gap-1 ${isDarkMode ? 'text-fuchsia-300' : 'text-fuchsia-700'}`}>
-                <span className="material-symbols-outlined" style={{ fontSize: 14 }}>ink_highlighter</span>
-                {ephemeralHighlights.length} highlight{ephemeralHighlights.length === 1 ? '' : 's'}
+            <span className={`flex flex-wrap items-center gap-x-2 gap-y-0.5 ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>
+              <span className="whitespace-nowrap">Select text →</span>
+              {([['Collapse', 'C'], ['Isolate', 'O'], ['Highlight', 'H'], ['Bold', 'B'], ['Italic', 'I']] as const).map(([label, key]) => (
+                <span key={key} className="whitespace-nowrap inline-flex items-center gap-1">
+                  {label} <kbd className={kbdCls}>{key}</kbd>
+                </span>
+              ))}
+              <span className="whitespace-nowrap inline-flex items-center gap-1">
+                <kbd className={kbdCls}>P</kbd> capture
               </span>
+            </span>
+            <div ref={helpWrapRef} className="relative presentation-chrome">
               <button
-                onClick={clearEphemeralHighlights}
-                className={`px-1.5 py-0.5 rounded ${isDarkMode ? 'text-gray-400 hover:text-gray-200 hover:bg-gray-700' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-100'}`}
-                title="Clear all highlights (session only)"
+                type="button"
+                aria-label="Presentation shortcuts help"
+                title="Presentation shortcuts help"
+                onClick={() => setIsHelpOpen((o) => !o)}
+                className={`flex items-center justify-center w-5 h-5 rounded-full border text-[10px] font-semibold leading-none ${
+                  isDarkMode
+                    ? 'border-gray-600 text-gray-300 hover:bg-gray-700'
+                    : 'border-gray-300 text-gray-500 hover:bg-gray-200'
+                }`}
               >
-                Clear
+                ?
               </button>
+              {isHelpOpen && (
+                <div
+                  data-testid="presentation-help-popover"
+                  className={`presentation-chrome absolute left-0 top-full mt-1.5 z-50 w-80 rounded-md border p-3 shadow-lg text-xs leading-relaxed ${
+                    isDarkMode ? 'bg-gray-800 border-gray-600 text-gray-200' : 'bg-white border-gray-300 text-gray-700'
+                  }`}
+                >
+                  <ul className="space-y-1 list-disc pl-4">
+                    <li><b>C</b> / <b>O</b> / <b>H</b> / <b>B</b> / <b>I</b> act on the current selection: Collapse, Isolate, Highlight, Bold, Italic.</li>
+                    <li><b>Shift+C</b> isolates. Isolate keeps the selection visible and collapses everything else in the message.</li>
+                    <li><b>P</b> captures the hovered (or active) card to the clipboard.</li>
+                    <li><b>Ctrl+Z</b> undoes the last collapse.</li>
+                    <li>Right-click a <b>[...]</b> pill for label / hide / same-line options.</li>
+                    <li>Drop an exported PNG onto the chat to jump back to its source rollout.</li>
+                  </ul>
+                </div>
+              )}
             </div>
-          ) : <span />}
+          </div>
           <button
-            onClick={() => setIsSearchOpen(true)}
-            className={`flex items-center gap-1 px-2 py-1 text-xs rounded ${
-              isDarkMode ? 'text-gray-400 hover:text-gray-200 hover:bg-gray-700' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-100'
+            type="button"
+            onClick={() => onExitPresentationMode?.()}
+            title="Exit presentation mode (Esc)"
+            className={`presentation-chrome px-2 py-0.5 rounded text-xs ${
+              isDarkMode ? 'text-gray-300 hover:bg-gray-700' : 'text-gray-600 hover:bg-gray-200'
             }`}
-            title="Search in chat (Ctrl+F)"
           >
-            <span className="material-symbols-outlined" style={{ fontSize: 14 }}>search</span>
-            Search chat
+            Exit (Esc)
           </button>
         </div>
       )}
@@ -887,19 +1118,20 @@ export function ChatView({
           requestAnimationFrame(() => requestAnimationFrame(() => {
             const container = messagesContainerRef.current;
             if (!container) return;
-            const marks = container.querySelectorAll<HTMLElement>('mark.grade-quote-mark');
-            if (marks.length > 0) {
-              // Target the specific mark by its index in the sorted quote
-              // list. Falls back to the nearest mark inside the requested
-              // message if the index is out of range.
-              const target = marks[quoteIdx ?? 0];
-              if (target) {
-                target.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                return;
-              }
+            // Marks are stamped with their quote's index in the sorted quote
+            // list (data-quote-idx), so targeting is exact even when OTHER
+            // quotes couldn't be located in the transcript — a positional
+            // marks[i] lookup would silently shift onto the wrong quote.
+            const target = container.querySelector<HTMLElement>(
+              `mark.grade-quote-mark[data-quote-idx="${quoteIdx ?? 0}"]`,
+            );
+            if (target) {
+              target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+              return;
             }
-            // Fallback: no marks rendered (e.g. quote text didn't match) —
-            // at least bring the containing message into view.
+            // Fallback: this quote's text didn't match the transcript (the
+            // judge quoted inexactly) — at least bring the containing
+            // message into view.
             const messageElement = messageRefs.current.get(messageIndex);
             if (messageElement) {
               messageElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -912,18 +1144,82 @@ export function ChatView({
       />
 
       {/* Messages area — in presentation mode it also accepts a dropped PNG
-          (a previously-exported capture) to navigate back to its source. */}
-      <div
-        ref={messagesContainerRef}
-        className="flex-1 overflow-y-auto custom-scrollbar p-4 space-y-4"
-        onDragOver={isPresentationMode ? (e) => e.preventDefault() : undefined}
-        onDrop={isPresentationMode ? handlePngDrop : undefined}
-      >
-        {displayedMessages.map((message, index) => (
-          <div key={index} ref={(el) => setMessageRef(index, el)}>
-            {renderMessageCard(message, index)}
+          (a previously-exported capture) to navigate back to its source.
+          The relative wrapper hosts the floating toolbar cluster as a
+          SIBLING of the scroll container: the Cmd+C handler maps messages
+          via `:scope > div` on the inner div, so nothing else may live
+          inside it. */}
+      <div className="relative flex-1 min-h-0">
+        <div
+          ref={messagesContainerRef}
+          className="h-full overflow-y-auto custom-scrollbar p-4 space-y-4"
+          onDragOver={isPresentationMode ? (e) => e.preventDefault() : undefined}
+          onDrop={isPresentationMode ? handlePngDrop : undefined}
+        >
+          {displayedMessages.map((message, index) => (
+            <div key={index} ref={(el) => setMessageRef(index, el)}>
+              {renderMessageCard(message, index)}
+            </div>
+          ))}
+        </div>
+
+        {/* Floating toolbar cluster — collapse/expand-all + search (and the
+            ephemeral-highlights count) overlaid on the top-right corner
+            instead of spending a full-width row. */}
+        {!isSearchOpen && !isPresentationMode && (
+          <div
+            className={`absolute top-2 right-4 z-10 flex items-center gap-1 px-1.5 py-0.5 rounded-md border backdrop-blur-sm shadow-sm ${
+              isDarkMode ? 'bg-[#111827]/85 border-gray-700' : 'bg-white/85 border-gray-200'
+            }`}
+          >
+            {ephemeralHighlights.length > 0 && (
+              <>
+                <span className={`inline-flex items-center gap-1 text-xs whitespace-nowrap ${isDarkMode ? 'text-fuchsia-300' : 'text-fuchsia-700'}`}>
+                  <span className="material-symbols-outlined" style={{ fontSize: 14 }}>ink_highlighter</span>
+                  {ephemeralHighlights.length} highlight{ephemeralHighlights.length === 1 ? '' : 's'}
+                </span>
+                <button
+                  onClick={clearEphemeralHighlights}
+                  className={`px-1.5 py-0.5 text-xs rounded ${isDarkMode ? 'text-gray-400 hover:text-gray-200 hover:bg-gray-700' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-100'}`}
+                  title="Clear all highlights (session only)"
+                >
+                  Clear
+                </button>
+                <div className={`w-px h-4 ${isDarkMode ? 'bg-gray-700' : 'bg-gray-200'}`} />
+              </>
+            )}
+            <button
+              onClick={() => setExpandAllSignal(s => ({ value: false, version: s.version + 1 }))}
+              className={`p-1 rounded ${
+                isDarkMode ? 'text-gray-400 hover:text-gray-200 hover:bg-gray-700' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-100'
+              }`}
+              title="Collapse all messages"
+              aria-label="Collapse all messages"
+            >
+              <span className="material-symbols-outlined" style={{ fontSize: 16 }} aria-hidden="true">unfold_less</span>
+            </button>
+            <button
+              onClick={() => setExpandAllSignal(s => ({ value: true, version: s.version + 1 }))}
+              className={`p-1 rounded ${
+                isDarkMode ? 'text-gray-400 hover:text-gray-200 hover:bg-gray-700' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-100'
+              }`}
+              title="Expand all messages"
+              aria-label="Expand all messages"
+            >
+              <span className="material-symbols-outlined" style={{ fontSize: 16 }} aria-hidden="true">unfold_more</span>
+            </button>
+            <button
+              onClick={() => setIsSearchOpen(true)}
+              className={`flex items-center gap-1 px-2 py-1 text-xs rounded whitespace-nowrap ${
+                isDarkMode ? 'text-gray-400 hover:text-gray-200 hover:bg-gray-700' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-100'
+              }`}
+              title="Search in chat (Ctrl+F)"
+            >
+              <span className="material-symbols-outlined" style={{ fontSize: 14 }} aria-hidden="true">search</span>
+              Search chat
+            </button>
           </div>
-        ))}
+        )}
       </div>
 
       {/* Off-screen capture card — the active message rendered in the image
@@ -939,16 +1235,13 @@ export function ChatView({
           captureHost,
         )}
 
-      {/* Sample metadata footer */}
-      <div className={`border-t p-3 ${isDarkMode ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-gray-50'}`}>
-        <div className={`flex flex-wrap gap-4 text-xs ${isDarkMode ? 'text-gray-300' : 'text-gray-600'}`}>
-          <div>
-            <span className={`font-medium ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>Step:</span>{' '}
-            <span className="font-semibold">{sample.attributes.step}</span>
-          </div>
+      {/* Sample metadata footer — one compact row. Step is omitted (the
+          navigation bar already shows it); Source flexes and truncates. */}
+      <div className={`border-t px-3 py-1.5 ${isDarkMode ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-gray-50'}`}>
+        <div className={`flex items-center gap-3 text-xs whitespace-nowrap overflow-hidden ${isDarkMode ? 'text-gray-300' : 'text-gray-600'}`}>
           <div>
             <span className={`font-medium ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>Reward:</span>{' '}
-            <span className={`font-semibold ${sample.attributes.reward >= 0 ? (isDarkMode ? 'text-green-400' : 'text-green-600') : (isDarkMode ? 'text-red-400' : 'text-red-600')}`}>
+            <span className={`font-semibold ${sample.attributes.reward >= 0 ? (isDarkMode ? 'text-teal-400' : 'text-teal-700') : (isDarkMode ? 'text-red-400' : 'text-red-600')}`}>
               {sample.attributes.reward}
             </span>
           </div>
@@ -956,13 +1249,17 @@ export function ChatView({
             <span className={`font-medium ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>Rollout:</span>{' '}
             <span className="font-semibold">{sample.attributes.rollout_n}</span>
           </div>
-          <div>
-            <span className={`font-medium ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>Source:</span>{' '}
-            <span className="font-semibold">{sample.attributes.data_source}</span>
+          <div className="min-w-0 flex-1 flex items-center gap-1">
+            <span className={`font-medium ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>Source:</span>
+            <span className="font-semibold truncate min-w-0" title={sample.attributes.data_source}>
+              {sample.attributes.data_source}
+            </span>
           </div>
           <div>
             <span className={`font-medium ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>Timestamp:</span>{' '}
-            <span className="font-semibold">{sample.timestamp}</span>
+            <span className="font-semibold" title={sample.timestamp}>
+              {formatTimestamp(sample.timestamp) ?? sample.timestamp}
+            </span>
           </div>
         </div>
       </div>
@@ -971,8 +1268,8 @@ export function ChatView({
         <CapturePreviewModal
           imageUrl={preview.url}
           isDarkMode={isDarkMode}
-          onCopy={() => { copyImageToClipboard(preview.blob, preview.caption); }}
-          onDownload={() => downloadBlob(preview.blob, 'rollout-capture.png')}
+          onCopy={() => { copyImageToClipboard(preview.blob, preview.caption, preview.filename); }}
+          onDownload={() => downloadBlob(preview.blob, preview.filename)}
           onClose={closePreview}
         />
       )}

@@ -364,13 +364,18 @@ export async function encodeImage(src: Blob, format: DownloadFormat): Promise<Bl
  * `text/plain` part of the same clipboard item, so pasting into a text
  * field yields the citation while pasting into a doc yields the image.
  * Returns true on a real clipboard write; on failure it falls back to
- * downloading the PNG (metadata preserved) and returns false.
+ * downloading the PNG (metadata preserved, saved as `fallbackFilename`) and
+ * returns false.
  *
  * Call this straight from the click handler with the Blob already in hand:
  * `navigator.clipboard.write` must run inside the user-gesture activation,
  * so an intervening `await` (e.g. fetching the image) can make it fail.
  */
-export async function copyImageToClipboard(pngBlob: Blob, caption: string): Promise<boolean> {
+export async function copyImageToClipboard(
+  pngBlob: Blob,
+  caption: string,
+  fallbackFilename = 'rollout-capture.png',
+): Promise<boolean> {
   try {
     const parts: Record<string, Blob> = { 'image/png': pngBlob };
     if (caption) {
@@ -379,7 +384,7 @@ export async function copyImageToClipboard(pngBlob: Blob, caption: string): Prom
     await navigator.clipboard.write([new ClipboardItem(parts)]);
     return true;
   } catch {
-    downloadBlob(pngBlob, 'rollout-capture.png');
+    downloadBlob(pngBlob, fallbackFilename);
     return false;
   }
 }

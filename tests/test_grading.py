@@ -583,6 +583,39 @@ class TestSaveGraded:
         assert len(lines[0]["grades"]["accuracy"]) == 2
         await client.aclose()
 
+    async def test_extra_entry_fields_survive_to_disk(self, app_no_auth, temp_jsonl, patch_project_root, sample_data):
+        """Producer-written extra keys must round-trip losslessly.
+
+        The comments feature's soft-delete tombstones carry a `deletes`
+        field the frontend GradeEntry schema knows but this backend model
+        does not; a default-config Pydantic model silently strips such
+        keys before the merge, which resurrects deleted comments on the
+        next load.
+        """
+        file_path = temp_jsonl(sample_data, "test.jsonl")
+        tombstone = {
+            "grade": "", "grade_type": "freeform", "quotes": [],
+            "explanation": "deleted comment by human:ada from 2026-01-15T10:00:00",
+            "model": "human:grace", "prompt_version": "comment-delete-v1",
+            "timestamp": "2026-01-15T11:00:00",
+            "deletes": {"model": "human:ada", "timestamp": "2026-01-15T10:00:00"},
+            "some_future_key": 42,
+        }
+        client = await app_no_auth()
+        resp = await client.post("/api/save-graded", json={
+            "file_path": str(file_path),
+            "grades": {"0": {"comments": tombstone}},
+        })
+        assert resp.status_code == 200
+
+        viz_path = file_path.parent / "viz" / file_path.name
+        with open(viz_path) as f:
+            lines = [json.loads(l) for l in f if l.strip()]
+        saved = lines[0]["grades"]["comments"][0]
+        assert saved["deletes"] == {"model": "human:ada", "timestamp": "2026-01-15T10:00:00"}
+        assert saved["some_future_key"] == 42
+        await client.aclose()
+
     async def test_never_mutates_original(self, app_no_auth, temp_jsonl, patch_project_root, sample_data):
         file_path = temp_jsonl(sample_data, "test.jsonl")
         original_content = file_path.read_text()

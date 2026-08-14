@@ -152,6 +152,54 @@ describe('MessageCard', () => {
     expect(purpleMark!.className).toContain('grade-quote-mark');
   });
 
+  it('matches grade quotes case-insensitively (judge capitalized a mid-sentence excerpt)', () => {
+    // Regression: a judge quoted "The final grade is done by LLM monitor…"
+    // from a transcript that reads "…But the final grade is done by…" —
+    // case-sensitive matching silently dropped the quote (no purple mark)
+    // and shifted the quote pager onto the wrong marks.
+    const content = 'But the final grade is done by LLM monitor not internal grader.';
+    render(<MessageCard {...defaultProps}
+      message={{ role: 'user', content }}
+      gradeQuotes={[{ message_index: 0, start: 4, end: 55, text: 'The final grade is done by LLM monitor not internal' }]}
+    />);
+    const purpleMark = Array.from(document.querySelectorAll('mark')).find(m => m.className.includes('grade-quote-mark'));
+    expect(purpleMark).toBeDefined();
+    // Renders the ORIGINAL transcript casing, not the judge's.
+    expect(purpleMark!.textContent).toContain('the final grade');
+  });
+
+  it('stamps each quote mark with its index in the quote list (data-quote-idx)', () => {
+    const content = 'alpha section one. beta section two.';
+    render(<MessageCard {...defaultProps}
+      message={{ role: 'user', content }}
+      gradeQuotes={[
+        { message_index: 0, start: 0, end: 5, text: 'alpha' },
+        { message_index: 0, start: 19, end: 23, text: 'beta' },
+      ]}
+    />);
+    const alpha = screen.getByText('alpha');
+    const beta = screen.getByText('beta');
+    expect(alpha.getAttribute('data-quote-idx')).toBe('0');
+    expect(beta.getAttribute('data-quote-idx')).toBe('1');
+  });
+
+  it('keeps quote-idx stamps aligned when an earlier quote cannot be located', () => {
+    // The pager targets marks by data-quote-idx, so an unlocatable quote at
+    // index 0 must not shift quote 1's mark identity.
+    const content = 'only the second quote appears in this transcript.';
+    render(<MessageCard {...defaultProps}
+      message={{ role: 'user', content }}
+      gradeQuotes={[
+        { message_index: 0, start: 0, end: 10, text: 'THIS TEXT WAS PARAPHRASED BY THE JUDGE' },
+        { message_index: 0, start: 9, end: 21, text: 'second quote' },
+      ]}
+    />);
+    expect(document.querySelector('mark[data-quote-idx="0"]')).toBeNull();
+    const mark = document.querySelector('mark[data-quote-idx="1"]');
+    expect(mark).not.toBeNull();
+    expect(mark!.textContent).toBe('second quote');
+  });
+
   it('highlights ephemeral session highlights with fuchsia', () => {
     render(<MessageCard {...defaultProps}
       message={{ role: 'user', content: 'keep this phrase marked' }}
@@ -659,5 +707,358 @@ describe('MessageCard', () => {
     fireEvent.click(screen.getByTestId('capture-message-btn'));
     expect(onCapture).toHaveBeenCalledTimes(1);
     expect(onCapture).toHaveBeenCalledWith(2);
+  });
+
+  it('does not render the placeholder Cut/Edit buttons', () => {
+    render(<MessageCard {...defaultProps} />);
+    expect(screen.queryByTitle('Remove this and all subsequent messages')).not.toBeInTheDocument();
+    expect(screen.queryByTitle('Edit message')).not.toBeInTheDocument();
+  });
+
+  it('hover-revealed buttons stay keyboard reachable via focus-visible', () => {
+    render(<MessageCard {...defaultProps} isPresentationMode={true} />);
+    expect(screen.getByTestId('preview-message-btn').className).toContain('focus-visible:opacity-100');
+    expect(screen.getByTestId('capture-message-btn').className).toContain('focus-visible:opacity-100');
+  });
+
+  it('icon-only header buttons expose aria-labels and hide their icon glyphs', () => {
+    render(<MessageCard {...defaultProps} />);
+    const copyLink = screen.getByLabelText('Copy link to this message');
+    expect(copyLink.querySelector('.material-symbols-outlined')).toHaveAttribute('aria-hidden', 'true');
+    expect(screen.getByLabelText('Share this message (no password needed)')).toBeInTheDocument();
+    expect(screen.getByLabelText('Copy message text (reasoning, content, tool calls)')).toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Local Ctrl+F search — current-match styling by global match index
+// ---------------------------------------------------------------------------
+
+describe('MessageCard current local match styling', () => {
+  it('styles only the current local match with the green ring treatment', () => {
+    const { container } = render(<MessageCard {...defaultProps}
+      message={{ role: 'user', content: 'foo bar foo' }}
+      localSearchTerm="foo"
+      localOccurrenceStart={0}
+      currentLocalMatchIndex={1}
+    />);
+    const marks = container.querySelectorAll('mark.local-search-mark');
+    expect(marks.length).toBe(2);
+    expect(marks[0].className).toContain('bg-green-200');
+    expect(marks[0].className).not.toContain('ring-2');
+    expect(marks[1].className).toContain('bg-green-400');
+    expect(marks[1].className).toContain('ring-2');
+    expect(marks[1].className).toContain('ring-green-500');
+  });
+
+  it('offsets the current-match check by localOccurrenceStart', () => {
+    const { container } = render(<MessageCard {...defaultProps}
+      message={{ role: 'user', content: 'needle here' }}
+      localSearchTerm="needle"
+      localOccurrenceStart={4}
+      currentLocalMatchIndex={4}
+    />);
+    const mark = container.querySelector('mark.local-search-mark');
+    expect(mark).not.toBeNull();
+    expect(mark!.className).toContain('ring-2');
+  });
+
+  it('no match is current when the cursor points at another message', () => {
+    const { container } = render(<MessageCard {...defaultProps}
+      message={{ role: 'user', content: 'needle here' }}
+      localSearchTerm="needle"
+      localOccurrenceStart={4}
+      currentLocalMatchIndex={2}
+    />);
+    const mark = container.querySelector('mark.local-search-mark');
+    expect(mark!.className).not.toContain('ring-2');
+    expect(mark!.className).toContain('bg-green-200');
+  });
+
+  it('advances local match indices across reasoning, content, and tool blocks in render order', () => {
+    // Match order mirrors buildSearchCorpus: reasoning (0), content (1),
+    // tool name (skipped, no match), tool args (2).
+    const { container } = render(<MessageCard {...defaultProps}
+      message={{
+        role: 'assistant',
+        content: '<think>needle in thought</think>needle in answer',
+        tool_calls: [
+          { type: 'function', function: { name: 'bash', arguments: '{"command":"grep needle file"}' } },
+        ],
+      }}
+      localSearchTerm="needle"
+      localOccurrenceStart={0}
+      currentLocalMatchIndex={2}
+    />);
+    const toolMark = container.querySelector('[data-block-kind="tool"] mark.local-search-mark');
+    expect(toolMark).not.toBeNull();
+    expect(toolMark!.className).toContain('ring-2');
+    const reasoningMark = container.querySelector('[data-block-kind="reasoning"] mark.local-search-mark');
+    expect(reasoningMark).not.toBeNull();
+    expect(reasoningMark!.className).not.toContain('ring-2');
+    const contentMark = container.querySelector('[data-block-kind="content"] mark.local-search-mark');
+    expect(contentMark!.className).not.toContain('ring-2');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Bulk expand/collapse signal
+// ---------------------------------------------------------------------------
+
+describe('MessageCard expand-all signal', () => {
+  const gridOf = (text: string) =>
+    screen.getByText(text).closest('[class*="grid"]') as HTMLElement;
+
+  it('does not apply the signal value on initial mount', () => {
+    render(<MessageCard {...defaultProps}
+      message={{ role: 'user', content: 'Signal content' }}
+      expandAllSignal={{ value: false, version: 3 }}
+    />);
+    expect(gridOf('Signal content').className).toContain('grid-rows-[1fr]');
+  });
+
+  it('collapses on a version bump and allows per-card re-expansion afterwards', () => {
+    const message = { role: 'user' as const, content: 'Signal content' };
+    const { rerender } = render(<MessageCard {...defaultProps}
+      message={message}
+      expandAllSignal={{ value: true, version: 0 }}
+    />);
+    rerender(<MessageCard {...defaultProps}
+      message={message}
+      expandAllSignal={{ value: false, version: 1 }}
+    />);
+    expect(gridOf('Signal content').className).toContain('grid-rows-[0fr]');
+
+    // Per-card toggle still works after the bulk collapse.
+    const header = screen.getByText('user').closest('[class*="cursor-pointer"]');
+    fireEvent.click(header!);
+    expect(gridOf('Signal content').className).toContain('grid-rows-[1fr]');
+  });
+
+  it('re-sending the same version is a no-op', () => {
+    const message = { role: 'user' as const, content: 'Signal content' };
+    const { rerender } = render(<MessageCard {...defaultProps}
+      message={message}
+      expandAllSignal={{ value: false, version: 2 }}
+    />);
+    // Same version, new object identity — must not collapse.
+    rerender(<MessageCard {...defaultProps}
+      message={message}
+      expandAllSignal={{ value: false, version: 2 }}
+    />);
+    expect(gridOf('Signal content').className).toContain('grid-rows-[1fr]');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Capture button feedback + P-shortcut parity
+// ---------------------------------------------------------------------------
+
+describe('MessageCard capture status feedback', () => {
+  const iconOf = (btn: HTMLElement) =>
+    btn.querySelector('.material-symbols-outlined')!.textContent;
+
+  it('hides via opacity when idle and not hovered', () => {
+    render(<MessageCard {...defaultProps} isPresentationMode={true} />);
+    const btn = screen.getByTestId('capture-message-btn');
+    expect(btn.className).toContain('opacity-0');
+    expect(iconOf(btn)).toBe('photo_camera');
+  });
+
+  it('shows an hourglass and stays visible while busy', () => {
+    render(<MessageCard {...defaultProps} isPresentationMode={true} captureStatus="busy" />);
+    const btn = screen.getByTestId('capture-message-btn');
+    expect(btn.className).toContain('opacity-100');
+    expect(iconOf(btn)).toBe('hourglass_top');
+  });
+
+  it('shows a check when done', () => {
+    render(<MessageCard {...defaultProps} isPresentationMode={true} captureStatus="done" />);
+    const btn = screen.getByTestId('capture-message-btn');
+    expect(btn.className).toContain('opacity-100');
+    expect(iconOf(btn)).toBe('check');
+  });
+
+  it('shows a download icon and explanatory title when the clipboard fell back', () => {
+    render(<MessageCard {...defaultProps} isPresentationMode={true} captureStatus="fallback" />);
+    const btn = screen.getByTestId('capture-message-btn');
+    expect(btn).toHaveAttribute('title', 'Clipboard unavailable — PNG downloaded');
+    expect(iconOf(btn)).toBe('download');
+  });
+
+  it('shows an error icon on failure', () => {
+    render(<MessageCard {...defaultProps} isPresentationMode={true} captureStatus="error" />);
+    expect(iconOf(screen.getByTestId('capture-message-btn'))).toBe('error');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Long system/tool/file card clamping
+// ---------------------------------------------------------------------------
+//
+// jsdom reports clientHeight/scrollHeight as 0, so the overflow measurement
+// is mocked at the prototype level (configurable, removed after each test).
+
+describe('MessageCard long-card clamping', () => {
+  const longSystem = {
+    role: 'system' as const,
+    content: 'a very long system prompt line. '.repeat(80),
+  };
+  const clampedEl = (container: HTMLElement) =>
+    container.querySelector('[class*="max-h-60"]');
+
+  beforeEach(() => {
+    Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
+      configurable: true,
+      get: () => 240,
+    });
+    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
+      configurable: true,
+      get: () => 1000,
+    });
+  });
+  afterEach(() => {
+    Reflect.deleteProperty(HTMLElement.prototype, 'clientHeight');
+    Reflect.deleteProperty(HTMLElement.prototype, 'scrollHeight');
+  });
+
+  it('clamps a long system card and reveals it via the Show full message button', () => {
+    const { container } = render(<MessageCard {...defaultProps} message={longSystem} />);
+    expect(clampedEl(container)).not.toBeNull();
+
+    const reveal = screen.getByText('Show full message');
+    fireEvent.click(reveal);
+
+    expect(clampedEl(container)).toBeNull();
+    expect(screen.queryByText('Show full message')).not.toBeInTheDocument();
+  });
+
+  it('does not clamp user or assistant cards', () => {
+    const { container } = render(<MessageCard {...defaultProps}
+      message={{ role: 'assistant', content: 'a long answer. '.repeat(80) }}
+    />);
+    expect(clampedEl(container)).toBeNull();
+    expect(screen.queryByText('Show full message')).not.toBeInTheDocument();
+  });
+
+  it('renders no reveal chrome when the body fits within the clamp', () => {
+    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
+      configurable: true,
+      get: () => 240, // equals clientHeight — no overflow
+    });
+    render(<MessageCard {...defaultProps} message={{ role: 'system', content: 'short prompt' }} />);
+    expect(screen.queryByText('Show full message')).not.toBeInTheDocument();
+  });
+
+  it('the expand-all signal unclamps and collapse-all re-clamps', () => {
+    const { container, rerender } = render(<MessageCard {...defaultProps}
+      message={longSystem}
+      expandAllSignal={{ value: true, version: 0 }}
+    />);
+    expect(clampedEl(container)).not.toBeNull();
+
+    rerender(<MessageCard {...defaultProps}
+      message={longSystem}
+      expandAllSignal={{ value: true, version: 1 }}
+    />);
+    expect(clampedEl(container)).toBeNull();
+
+    rerender(<MessageCard {...defaultProps}
+      message={longSystem}
+      expandAllSignal={{ value: false, version: 2 }}
+    />);
+    expect(clampedEl(container)).not.toBeNull();
+  });
+
+  it('never clamps the URL-highlight target card', () => {
+    const { container } = render(<MessageCard {...defaultProps}
+      message={longSystem}
+      isHighlighted={true}
+    />);
+    expect(clampedEl(container)).toBeNull();
+    expect(screen.queryByText('Show full message')).not.toBeInTheDocument();
+  });
+
+  it('unclamps a card that contains the current local search match', () => {
+    const { container } = render(<MessageCard {...defaultProps}
+      message={{ role: 'system', content: 'needle buried in a long prompt' }}
+      localSearchTerm="needle"
+      localOccurrenceStart={0}
+      currentLocalMatchIndex={0}
+    />);
+    expect(clampedEl(container)).toBeNull();
+  });
+
+  it('never clamps in presentation mode', () => {
+    const { container } = render(<MessageCard {...defaultProps}
+      message={longSystem}
+      isPresentationMode={true}
+    />);
+    expect(clampedEl(container)).toBeNull();
+    expect(screen.queryByText('Show full message')).not.toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Hover-revealed header action buttons
+// ---------------------------------------------------------------------------
+
+describe('MessageCard hover-reveal header buttons', () => {
+  const labels = [
+    'Copy link to this message',
+    'Share this message (no password needed)',
+    'Copy message text (reasoning, content, tool calls)',
+  ];
+
+  it('hides the header action buttons via opacity when idle and unhovered', () => {
+    render(<MessageCard {...defaultProps} />);
+    for (const label of labels) {
+      const btn = screen.getByLabelText(label);
+      expect(btn.className).toContain('opacity-0');
+      expect(btn.className).toContain('focus-visible:opacity-100');
+    }
+  });
+
+  it('reveals the header action buttons on hover', () => {
+    const { container } = render(<MessageCard {...defaultProps} />);
+    fireEvent.mouseOver(container.firstChild as Element);
+    for (const label of labels) {
+      const btn = screen.getByLabelText(label);
+      expect(btn.className).toContain('opacity-100');
+      expect(btn.className).not.toContain('opacity-0');
+    }
+  });
+});
+
+describe('MessageCard P shortcut', () => {
+  it('captures the active (selected) card without hover', () => {
+    const onCapture = vi.fn();
+    render(<MessageCard {...defaultProps}
+      index={3}
+      isPresentationMode={true}
+      isPresentationActive={true}
+      onCaptureMessage={onCapture}
+    />);
+    fireEvent.keyDown(window, { key: 'p' });
+    expect(onCapture).toHaveBeenCalledWith(3);
+  });
+
+  it('does not capture when neither hovered nor active', () => {
+    const onCapture = vi.fn();
+    render(<MessageCard {...defaultProps} isPresentationMode={true} onCaptureMessage={onCapture} />);
+    fireEvent.keyDown(window, { key: 'p' });
+    expect(onCapture).not.toHaveBeenCalled();
+  });
+
+  it('still captures the hovered card', () => {
+    const onCapture = vi.fn();
+    const { container } = render(<MessageCard {...defaultProps}
+      index={1}
+      isPresentationMode={true}
+      onCaptureMessage={onCapture}
+    />);
+    fireEvent.mouseOver(container.firstChild as Element);
+    fireEvent.keyDown(window, { key: 'p' });
+    expect(onCapture).toHaveBeenCalledWith(1);
   });
 });

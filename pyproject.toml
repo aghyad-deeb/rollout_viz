@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "viz-writer"
+version = "0.1.0"
+description = "The one blessed writer for rollout_viz JSONL trace files (import as viz_writer)"
+requires-python = ">=3.10"
+# boto3 is only needed for s3:// destinations and is imported lazily; every
+# producer environment that writes to S3 already has it.
+dependencies = []
+
+[tool.setuptools]
+# Only the writer library is a package — the backend/tests/frontend stay
+# app-only and unpackaged.
+packages = ["viz_writer"]

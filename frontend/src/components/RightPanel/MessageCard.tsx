@@ -10,7 +10,8 @@ interface MessageCardProps {
   index: number;
   searchConditions: SearchCondition[]; // Global search conditions
   localSearchTerm?: string; // Local search term for this chat
-  isCurrentLocalMatch?: boolean; // Is this message the current local search match
+  localOccurrenceStart?: number; // Starting index of local matches in this message (0-based global)
+  currentLocalMatchIndex?: number; // Which local match is currently focused
   isDarkMode: boolean;
   rolloutN: number;
   step: number;
@@ -51,6 +52,14 @@ interface MessageCardProps {
   onCaptureMessage?: (messageIndex: number) => void;
   onPreviewMessage?: (messageIndex: number) => void;
   onPreviewSelect?: (messageIndex: number) => void;
+  // Per-card capture feedback from ChatView (busy → done / fallback / error).
+  captureStatus?: 'busy' | 'done' | 'fallback' | 'error';
+  // True when this card is the active presentation card — lets the `P`
+  // shortcut work on the selected card, not just the hovered one.
+  isPresentationActive?: boolean;
+  // Bulk expand/collapse signal from ChatView. The version bump is what
+  // applies the value; per-card toggling still works after a bulk action.
+  expandAllSignal?: { value: boolean; version: number };
 }
 
 const ROLE_CONFIG = {
@@ -119,6 +128,11 @@ function toolCallArgsText(tc: ToolCall): string {
 // new Set on every render when the prop is omitted).
 const EMPTY_WRAP_SET = new Set<string>();
 
+// Roles whose long bodies get clamped to a max height with a fade + reveal
+// button, so a huge system prompt / tool dump doesn't dominate the
+// transcript. Module-level so its identity is stable across renders.
+const CLAMPABLE_ROLES: readonly string[] = ['system', 'tool', 'file'];
+
 interface SelectionPopup {
   show: boolean;
   x: number;
@@ -159,7 +173,8 @@ function MessageCardInner({
   index,
   searchConditions,
   localSearchTerm = '',
-  isCurrentLocalMatch = false,
+  localOccurrenceStart = 0,
+  currentLocalMatchIndex = -1,
   isDarkMode,
   rolloutN,
   step,
@@ -190,6 +205,9 @@ function MessageCardInner({
   onCaptureMessage,
   onPreviewMessage,
   onPreviewSelect,
+  captureStatus,
+  isPresentationActive = false,
+  expandAllSignal,
 }: MessageCardProps) {
   void isSharedMode;
   const [isExpanded, setIsExpanded] = useState(true);
@@ -199,11 +217,30 @@ function MessageCardInner({
   const [copiedSelection, setCopiedSelection] = useState(false);
   const [copiedText, setCopiedText] = useState(false);
   const [sharedMsg, setSharedMsg] = useState(false);
+  // Long-card clamping: `showFull` is the user's "Show full message" reveal;
+  // `isClampOverflowing` records whether the clamped body actually overflows
+  // (measured in a layout effect) — short cards get no fade / button chrome.
+  const [showFull, setShowFull] = useState(false);
+  const [isClampOverflowing, setIsClampOverflowing] = useState(false);
   const cardRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const popupRef = useRef<HTMLDivElement>(null);
 
   const config = ROLE_CONFIG[message.role] || ROLE_CONFIG.user;
+
+  // Apply a bulk collapse/expand from ChatView. Initializing the ref to the
+  // mount-time version guards the initial mount (and re-mounts): only a
+  // version bump after mount applies the value, so per-card toggling still
+  // works after a bulk action.
+  const lastExpandAllVersionRef = useRef(expandAllSignal?.version);
+  useEffect(() => {
+    if (expandAllSignal && expandAllSignal.version !== lastExpandAllVersionRef.current) {
+      lastExpandAllVersionRef.current = expandAllSignal.version;
+      setIsExpanded(expandAllSignal.value);
+      // Expand-all also reveals a clamped long card; collapse-all re-clamps.
+      setShowFull(expandAllSignal.value);
+    }
+  }, [expandAllSignal]);
 
   // Smooth-scroll the card into view when it becomes the URL-shared target.
   useEffect(() => {
@@ -395,7 +432,7 @@ function MessageCardInner({
 
   // Keyboard shortcuts (presentation mode only), while a selection popup is
   // open: `c` collapse, `o` (or `Shift+C`) isolate, `h` highlight, `b` bold,
-  // `i` italic. `p` captures the hovered card.
+  // `i` italic. `p` captures the hovered (or active/selected) card.
   useEffect(() => {
     if (!isPresentationMode) return;
     const onKey = (e: KeyboardEvent) => {
@@ -418,7 +455,7 @@ function MessageCardInner({
       } else if (k === 'i' && selectionPopup.show) {
         e.preventDefault();
         applyFormat('italic');
-      } else if (k === 'p' && !e.shiftKey && isHovered) {
+      } else if (k === 'p' && !e.shiftKey && (isHovered || isPresentationActive)) {
         e.preventDefault();
         captureThisCard();
       }
@@ -426,7 +463,7 @@ function MessageCardInner({
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isPresentationMode, selectionPopup.show, selectionPopup.text, selectionPopup.before, selectionPopup.after, selectionPopup.blockKind, selectionPopup.blockIndex, isHovered, index]);
+  }, [isPresentationMode, selectionPopup.show, selectionPopup.text, selectionPopup.before, selectionPopup.after, selectionPopup.blockKind, selectionPopup.blockIndex, isHovered, isPresentationActive, index]);
 
   const getApplicableSearchTerms = useMemo(() => {
     return (isReasoning: boolean): string[] => {
@@ -478,6 +515,62 @@ function MessageCardInner({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [messageOccurrenceStart, reasoning, mainContent, toolCalls, getApplicableSearchTerms]);
 
+  const countLocalSearchMatches = (text: string): number =>
+    localSearchTerm.trim() !== '' ? findAllMatchesCI(text, localSearchTerm).length : 0;
+
+  // Per-block starting index of local Ctrl+F matches — mirrors
+  // globalOccurrenceStarts, in the same block order as buildSearchCorpus
+  // (reasoning → content → tool name → tool args), so the "current" mark
+  // aligns with ChatView's match cursor.
+  const localSearchStarts = useMemo(() => {
+    const toolNameStarts: number[] = [];
+    const toolArgStarts: number[] = [];
+    let cursor = localOccurrenceStart;
+    const reasoningStart = cursor;
+    if (reasoning) cursor += countLocalSearchMatches(reasoning);
+    const contentStart = cursor;
+    cursor += countLocalSearchMatches(mainContent);
+    toolCalls.forEach((tc) => {
+      toolNameStarts.push(cursor);
+      cursor += countLocalSearchMatches(tc.function.name);
+      toolArgStarts.push(cursor);
+      cursor += countLocalSearchMatches(toolCallArgsText(tc));
+    });
+    // `end` is one past this card's last local match — with
+    // localOccurrenceStart it bounds the card's local-match index range.
+    return { reasoningStart, contentStart, toolNameStarts, toolArgStarts, end: cursor };
+    // countLocalSearchMatches reads only localSearchTerm, covered here.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [localOccurrenceStart, localSearchTerm, reasoning, mainContent, toolCalls]);
+
+  // --- Long-card clamping (system / tool / file roles) ---
+  // Never clamp in presentation mode (the off-screen capture clone renders
+  // with isPresentationMode=true, so it is covered too) or when the card is
+  // the URL-highlight target.
+  const isClampable = CLAMPABLE_ROLES.includes(message.role) && !isPresentationMode && !isHighlighted;
+  // True when ChatView's Ctrl+F cursor points at a match inside this card —
+  // the card owns local-match indices [localOccurrenceStart, end).
+  const hasCurrentLocalMatch = localSearchTerm.trim() !== ''
+    && currentLocalMatchIndex >= localOccurrenceStart
+    && currentLocalMatchIndex < localSearchStarts.end;
+  // A deep link or the current search match must never point into hidden
+  // text — reveal the card. In-render state adjustment (not an effect),
+  // same pattern as GradesDisplay's history reset.
+  if ((isHighlighted || hasCurrentLocalMatch) && !showFull) {
+    setShowFull(true);
+  }
+  const isClamped = isClampable && !showFull;
+
+  // Measure whether the clamped body actually overflows max-h-60, to decide
+  // whether the fade + "Show full message" chrome renders. clientHeight is 0
+  // in jsdom (and while the card is collapsed) — skip rather than misreport.
+  useLayoutEffect(() => {
+    if (!isClamped) return;
+    const el = contentRef.current;
+    if (!el || el.clientHeight === 0) return;
+    setIsClampOverflowing(el.scrollHeight > el.clientHeight);
+  }, [isClamped, isExpanded, message]);
+
   // Highlight compositor. Every strategy contributes ranges, then one
   // renderer splits the original text at all range boundaries and applies
   // every active mark to each segment. Target classes are attached only to
@@ -504,8 +597,8 @@ function MessageCardInner({
 
       // Older grader runs labeled raw Harmony analysis content as channel=text.
       // The UI parser renders that same text in the reasoning block, so allow
-      // an exact text match there instead of hiding an otherwise valid quote.
-      return blockKind === 'reasoning' && findAllMatches(text, quote.text).length > 0;
+      // a text match there instead of hiding an otherwise valid quote.
+      return blockKind === 'reasoning' && findAllMatchesCI(text, quote.text).length > 0;
     };
 
     return (
@@ -514,6 +607,7 @@ function MessageCardInner({
       blockKind?: RenderBlockKind,
       blockIndex = -1,
       occurrenceStart = messageOccurrenceStart,
+      localStart = localOccurrenceStart,
     ): React.ReactNode => {
       if (!text) return text;
 
@@ -563,19 +657,26 @@ function MessageCardInner({
         }
       }
 
-      const quotesForThisMessage = gradeQuotes.filter(q =>
-        q.message_index === index && quoteAppliesToRenderedBlock(q, text, isReasoning, blockKind)
-      );
-      for (const quote of quotesForThisMessage) {
-        for (const m of findAllMatches(text, quote.text)) {
-          addRange('grade-quote', m.start, m.end);
+      // Quote matching is case-INSENSITIVE: judges routinely capitalize the
+      // first word when excerpting mid-sentence ("The final grade…" for a
+      // transcript that reads "…But the final grade…"), and an exact match
+      // silently dropped those quotes. The sourceId carries the quote's
+      // index in the sorted list so the rendered mark can be targeted
+      // exactly by the quote pager (`data-quote-idx`).
+      gradeQuotes.forEach((quote, quoteIdx) => {
+        if (quote.message_index !== index) return;
+        if (!quoteAppliesToRenderedBlock(quote, text, isReasoning, blockKind)) return;
+        for (const m of findAllMatchesCI(text, quote.text)) {
+          addRange('grade-quote', m.start, m.end, { sourceId: `q${quoteIdx}` });
         }
-      }
+      });
 
       if (localSearchTerm.trim() !== '') {
-        for (const m of findAllMatchesCI(text, localSearchTerm)) {
-          addRange('local-search', m.start, m.end, { isCurrent: isCurrentLocalMatch });
-        }
+        findAllMatchesCI(text, localSearchTerm).forEach((m, occurrenceIdx) => {
+          addRange('local-search', m.start, m.end, {
+            isCurrent: localStart + occurrenceIdx === currentLocalMatchIndex,
+          });
+        });
       }
 
       const globalMatches: Array<{ start: number; end: number }> = [];
@@ -661,6 +762,11 @@ function MessageCardInner({
           );
           titles.push('Click to clear highlight');
         }
+        // The quote's index in the sorted quote list, stamped on the mark
+        // that STARTS the range so the quote pager can target it exactly.
+        const startingQuoteId = active.find(
+          r => r.kind === 'grade-quote' && r.start === segmentStart && r.sourceId,
+        )?.sourceId;
         if (hasKind('grade-quote')) {
           classes.push(
             startsKind('grade-quote') ? 'grade-quote-mark' : 'grade-quote-fragment',
@@ -673,7 +779,7 @@ function MessageCardInner({
           classes.push(
             startsKind('local-search') ? 'local-search-mark' : 'local-search-fragment',
             ...(isCurrentKind('local-search')
-              ? ['bg-green-400', 'text-green-900']
+              ? ['bg-green-400', 'text-green-900', 'ring-2', 'ring-green-500', 'ring-offset-1']
               : ['bg-green-200', 'text-green-800'])
           );
         }
@@ -701,6 +807,7 @@ function MessageCardInner({
             className={classes.join(' ')}
             onClick={onClick}
             title={titles.length > 0 ? Array.from(new Set(titles)).join('; ') : undefined}
+            data-quote-idx={startingQuoteId ? startingQuoteId.slice(1) : undefined}
           >
             {node}
           </mark>
@@ -728,7 +835,7 @@ function MessageCardInner({
       return parts;
     };
   }, [
-    getApplicableSearchTerms, localSearchTerm, isCurrentLocalMatch,
+    getApplicableSearchTerms, localSearchTerm, localOccurrenceStart, currentLocalMatchIndex,
     highlightedText, onClearHighlight, messageOccurrenceStart, currentOccurrenceIndex,
     gradeQuotes, index, ephemeralHighlights, onRemoveEphemeralHighlight, message.role,
   ]);
@@ -758,12 +865,13 @@ function MessageCardInner({
     blockKind: RenderBlockKind,
     blockIndex = -1,
     occurrenceStart = messageOccurrenceStart,
+    localStart = localOccurrenceStart,
   ): React.ReactNode => {
     if (!isPresentationMode || collapsedRegions.length === 0) {
-      return highlightSearchAndUrl(text, isReasoning, blockKind, blockIndex, occurrenceStart);
+      return highlightSearchAndUrl(text, isReasoning, blockKind, blockIndex, occurrenceStart, localStart);
     }
     const regionsForThis = collapsedRegions.filter(r => r.messageIndex === index);
-    if (regionsForThis.length === 0) return highlightSearchAndUrl(text, isReasoning, blockKind, blockIndex, occurrenceStart);
+    if (regionsForThis.length === 0) return highlightSearchAndUrl(text, isReasoning, blockKind, blockIndex, occurrenceStart, localStart);
 
     const found: { start: number; end: number; region: CollapsedRegion }[] = [];
     for (const region of regionsForThis) {
@@ -781,7 +889,7 @@ function MessageCardInner({
         for (const m of ms) found.push({ start: m.start, end: m.end, region });
       }
     }
-    if (found.length === 0) return highlightSearchAndUrl(text, isReasoning, blockKind, blockIndex, occurrenceStart);
+    if (found.length === 0) return highlightSearchAndUrl(text, isReasoning, blockKind, blockIndex, occurrenceStart, localStart);
     found.sort((a, b) => a.start - b.start);
 
     // Drop overlapping matches → a clean, ordered list of pills.
@@ -817,6 +925,7 @@ function MessageCardInner({
 
     const parts: React.ReactNode[] = [];
     let visibleOccurrenceStart = occurrenceStart;
+    let visibleLocalStart = localStart;
     for (let i = 0; i <= pills.length; i++) {
       // A pill defaults to joined (inline) on each side; `undefined` here
       // means there's simply no pill on that side (a document end), which
@@ -826,9 +935,10 @@ function MessageCardInner({
       const gap = joinGap(gaps[i], leftAfter, rightBefore);
       if (gap) {
         parts.push(
-          <Fragment key={`vis-${i}`}>{highlightSearchAndUrl(gap, isReasoning, blockKind, blockIndex, visibleOccurrenceStart)}</Fragment>
+          <Fragment key={`vis-${i}`}>{highlightSearchAndUrl(gap, isReasoning, blockKind, blockIndex, visibleOccurrenceStart, visibleLocalStart)}</Fragment>
         );
         visibleOccurrenceStart += countGlobalSearchMatches(gap, isReasoning);
+        visibleLocalStart += countLocalSearchMatches(gap);
       }
       if (i < pills.length) {
         const p = pills[i];
@@ -937,6 +1047,26 @@ function MessageCardInner({
   const textSecondary = isDarkMode ? 'text-gray-300' : 'text-gray-800';
   const textMuted = isDarkMode ? 'text-gray-400' : 'text-gray-600';
   const actionBtn = `rounded-md w-6 h-6 focus:outline-none focus:ring-4 flex justify-center items-center ${config.buttonClassName} shadow-md shadow-black/20`;
+  // Capture-button feedback (mirrors the copiedLink pattern): icon + title
+  // follow the per-card status ChatView reports while a capture runs.
+  const captureIcon = captureStatus === 'busy'
+    ? 'hourglass_top'
+    : captureStatus === 'done'
+      ? 'check'
+      : captureStatus === 'fallback'
+        ? 'download'
+        : captureStatus === 'error'
+          ? 'error'
+          : 'photo_camera';
+  const captureTitle = captureStatus === 'busy'
+    ? 'Rendering capture…'
+    : captureStatus === 'done'
+      ? 'Copied to clipboard'
+      : captureStatus === 'fallback'
+        ? 'Clipboard unavailable — PNG downloaded'
+        : captureStatus === 'error'
+          ? 'Capture failed'
+          : 'Capture this message as an image (or press P)';
   const presentationLabel = typeof message.presentationLabel === 'string'
     ? message.presentationLabel.trim()
     : '';
@@ -962,10 +1092,11 @@ function MessageCardInner({
               onClick={() => setIsExpanded(!isExpanded)}
             >
               <div className="flex items-center gap-2">
-                <button className="presentation-chrome">
+                <button className="presentation-chrome" aria-label="Toggle message content">
                   <span
                     className={`material-symbols-outlined ${textMuted} transition-transform duration-200 p-2 -m-2 ${isExpanded ? '' : '-rotate-90'}`}
                     style={{ fontSize: 17 }}
+                    aria-hidden="true"
                   >
                     expand_less
                   </span>
@@ -991,77 +1122,69 @@ function MessageCardInner({
                     data-testid="expand-message-btn"
                     className={actionBtn}
                     title="Expand all collapsed spans in this message"
+                    aria-label="Expand all collapsed spans in this message"
                     onClick={(e) => { e.stopPropagation(); onExpandMessageCollapses?.(index); }}
                   >
-                    <span className="material-symbols-outlined" style={{ fontSize: 17 }}>unfold_more</span>
+                    <span className="material-symbols-outlined" style={{ fontSize: 17 }} aria-hidden="true">unfold_more</span>
                   </button>
                 )}
                 {isPresentationMode && (
                   <button
                     data-testid="preview-message-btn"
-                    className={`${actionBtn} transition-opacity ${isHovered ? 'opacity-100' : 'opacity-0'}`}
+                    className={`${actionBtn} transition-opacity ${isHovered ? 'opacity-100' : 'opacity-0'} focus-visible:opacity-100`}
                     title="Preview the capture image"
+                    aria-label="Preview the capture image"
                     onClick={(e) => { e.stopPropagation(); previewThisCard(); }}
                   >
-                    <span className="material-symbols-outlined" style={{ fontSize: 17 }}>preview</span>
+                    <span className="material-symbols-outlined" style={{ fontSize: 17 }} aria-hidden="true">preview</span>
                   </button>
                 )}
                 {isPresentationMode && (
                   <button
                     data-testid="capture-message-btn"
-                    className={`${actionBtn} transition-opacity ${isHovered ? 'opacity-100' : 'opacity-0'}`}
-                    title="Capture this message as an image (or press P)"
+                    className={`${actionBtn} transition-opacity ${isHovered || captureStatus ? 'opacity-100' : 'opacity-0'} focus-visible:opacity-100`}
+                    title={captureTitle}
+                    aria-label={captureTitle}
                     onClick={(e) => { e.stopPropagation(); captureThisCard(); }}
                   >
-                    <span className="material-symbols-outlined" style={{ fontSize: 17 }}>photo_camera</span>
+                    <span className="material-symbols-outlined" style={{ fontSize: 17 }} aria-hidden="true">{captureIcon}</span>
                   </button>
                 )}
                 <button
-                  className={`${actionBtn} relative`}
+                  className={`${actionBtn} relative transition-opacity ${isHovered || copiedLink ? 'opacity-100' : 'opacity-0'} focus-visible:opacity-100`}
                   title="Copy link to this message"
+                  aria-label="Copy link to this message"
                   onClick={(e) => { e.stopPropagation(); copyMessageLink(); }}
                 >
-                  <span className="material-symbols-outlined" style={{ fontSize: 17 }}>
+                  <span className="material-symbols-outlined" style={{ fontSize: 17 }} aria-hidden="true">
                     {copiedLink ? 'check' : 'link'}
                   </span>
                 </button>
                 <button
-                  className={`rounded-md w-6 h-6 focus:outline-none focus:ring-4 flex justify-center items-center ${
+                  className={`rounded-md w-6 h-6 focus:outline-none focus:ring-4 flex justify-center items-center transition-opacity ${isHovered || sharedMsg ? 'opacity-100' : 'opacity-0'} focus-visible:opacity-100 ${
                     sharedMsg
                       ? 'bg-green-600 text-white'
                       : isDarkMode ? 'text-emerald-400 bg-emerald-900/60' : 'text-emerald-700 bg-emerald-100'
                   } shadow-md shadow-black/20`}
                   title="Share this message (no password needed)"
+                  aria-label="Share this message (no password needed)"
                   onClick={(e) => { e.stopPropagation(); shareMessage(); }}
                 >
-                  <span className="material-symbols-outlined" style={{ fontSize: 17 }}>
+                  <span className="material-symbols-outlined" style={{ fontSize: 17 }} aria-hidden="true">
                     {sharedMsg ? 'check' : 'share'}
                   </span>
                 </button>
                 <button
-                  className={`rounded-md w-6 h-6 focus:outline-none focus:ring-4 flex justify-center items-center ${
+                  className={`rounded-md w-6 h-6 focus:outline-none focus:ring-4 flex justify-center items-center transition-opacity ${isHovered || copiedText ? 'opacity-100' : 'opacity-0'} focus-visible:opacity-100 ${
                     copiedText ? 'bg-green-600 text-white' : config.buttonClassName
                   } shadow-md shadow-black/20`}
                   title="Copy message text (reasoning, content, tool calls)"
+                  aria-label="Copy message text (reasoning, content, tool calls)"
                   onClick={(e) => { e.stopPropagation(); copyMessageText(); }}
                 >
-                  <span className="material-symbols-outlined" style={{ fontSize: 17 }}>
+                  <span className="material-symbols-outlined" style={{ fontSize: 17 }} aria-hidden="true">
                     {copiedText ? 'check' : 'content_copy'}
                   </span>
-                </button>
-                <button
-                  className={actionBtn}
-                  title="Remove this and all subsequent messages"
-                  onClick={(e) => e.stopPropagation()}
-                >
-                  <span className="material-symbols-outlined" style={{ fontSize: 17 }}>cut</span>
-                </button>
-                <button
-                  className={actionBtn}
-                  title="Edit message"
-                  onClick={(e) => e.stopPropagation()}
-                >
-                  <span className="material-symbols-outlined" style={{ fontSize: 17 }}>edit</span>
                 </button>
               </div>
             </div>
@@ -1075,7 +1198,7 @@ function MessageCardInner({
             <div className="overflow-hidden">
               <div
                 ref={contentRef}
-                className="space-y-3 py-3"
+                className={`space-y-3 py-3${isClamped ? ' max-h-60 overflow-hidden relative' : ''}`}
               >
                 {/* Reasoning block. When collapsed whole, it is NOT drawn
                     here — a standalone block would strand the [...] on its
@@ -1094,14 +1217,15 @@ function MessageCardInner({
                           data-testid="collapse-reasoning-btn"
                           className={`presentation-chrome shrink-0 rounded p-0.5 ${isDarkMode ? 'text-gray-300 hover:bg-white/10' : 'text-gray-600 hover:bg-black/10'}`}
                           title="Collapse the whole reasoning section to [...]"
+                          aria-label="Collapse the whole reasoning section to [...]"
                           onClick={(e) => { e.stopPropagation(); onAddCollapsedRegion?.(index, reasoning); }}
                         >
-                          <span className="material-symbols-outlined" style={{ fontSize: 16 }}>unfold_less</span>
+                          <span className="material-symbols-outlined" style={{ fontSize: 16 }} aria-hidden="true">unfold_less</span>
                         </button>
                       )}
                     </div>
                     <div data-msg-block data-block-kind="reasoning" className={`px-2 py-1 text-sm ${textPrimary} whitespace-pre-wrap`}>
-                      {renderWithCollapse(reasoning, true, 'reasoning', -1, globalOccurrenceStarts.reasoningStart)}
+                      {renderWithCollapse(reasoning, true, 'reasoning', -1, globalOccurrenceStarts.reasoningStart, localSearchStarts.reasoningStart)}
                     </div>
                   </div>
                 )}
@@ -1111,9 +1235,9 @@ function MessageCardInner({
                     (its right-click "same line" toggle then works). */}
                 <div data-msg-block data-block-kind="content" className={`mx-3 whitespace-pre-wrap text-sm ${textPrimary}`}>
                   {reasoning && isSectionCollapsed(reasoning) && (
-                    <>{renderWithCollapse(reasoning, true, 'reasoning', -1, globalOccurrenceStarts.reasoningStart)}{' '}</>
+                    <>{renderWithCollapse(reasoning, true, 'reasoning', -1, globalOccurrenceStarts.reasoningStart, localSearchStarts.reasoningStart)}{' '}</>
                   )}
-                  {renderWithCollapse(mainContent, false, 'content', -1, globalOccurrenceStarts.contentStart)}
+                  {renderWithCollapse(mainContent, false, 'content', -1, globalOccurrenceStarts.contentStart, localSearchStarts.contentStart)}
                 </div>
 
                 {/* Inline tool-call text — only when no structured tool calls
@@ -1139,13 +1263,13 @@ function MessageCardInner({
                       return isSectionCollapsed(args) ? (
                         // Inline span (not a block) so consecutive collapsed
                         // tool calls share a line instead of stacking.
-                        <span key={tcIdx} className="text-xs whitespace-pre-wrap">{renderWithCollapse(args, false, 'tool', tcIdx, globalOccurrenceStarts.toolArgStarts[tcIdx] ?? messageOccurrenceStart)}</span>
+                        <span key={tcIdx} className="text-xs whitespace-pre-wrap">{renderWithCollapse(args, false, 'tool', tcIdx, globalOccurrenceStarts.toolArgStarts[tcIdx] ?? messageOccurrenceStart, localSearchStarts.toolArgStarts[tcIdx] ?? localOccurrenceStart)}</span>
                       ) : (
                         <div key={tcIdx} className={`rounded-md border overflow-hidden ${isDarkMode ? 'border-gray-600 bg-gray-800/50' : 'border-gray-200 bg-gray-50'}`}>
                           <div className={`px-2 py-1 flex items-center justify-between text-xs font-medium ${isDarkMode ? 'bg-gray-700/50 text-gray-300' : 'bg-gray-100 text-gray-600'}`}>
                             <div className="flex items-center gap-1 min-w-0">
                               <span className="material-symbols-outlined" style={{ fontSize: 14 }}>terminal</span>
-                              <span className="truncate">{highlightSearchAndUrl(tc.function.name, false, 'tool', tcIdx, globalOccurrenceStarts.toolNameStarts[tcIdx] ?? messageOccurrenceStart)}</span>
+                              <span className="truncate">{highlightSearchAndUrl(tc.function.name, false, 'tool', tcIdx, globalOccurrenceStarts.toolNameStarts[tcIdx] ?? messageOccurrenceStart, localSearchStarts.toolNameStarts[tcIdx] ?? localOccurrenceStart)}</span>
                             </div>
                             <div className="flex items-center gap-0.5 shrink-0">
                               {isPresentationMode && (
@@ -1154,11 +1278,12 @@ function MessageCardInner({
                                   data-testid={`collapse-toolcall-btn-${tcIdx}`}
                                   onClick={(e) => { e.stopPropagation(); onAddCollapsedRegion?.(index, args); }}
                                   title="Collapse this whole tool call to [...]"
+                                  aria-label="Collapse this whole tool call to [...]"
                                   className={`presentation-chrome rounded p-0.5 transition-colors ${
                                     isDarkMode ? 'text-gray-400 hover:bg-gray-700' : 'text-gray-500 hover:bg-gray-200'
                                   }`}
                                 >
-                                  <span className="material-symbols-outlined" style={{ fontSize: 14 }}>unfold_less</span>
+                                  <span className="material-symbols-outlined" style={{ fontSize: 14 }} aria-hidden="true">unfold_less</span>
                                 </button>
                               )}
                               {/* Wrap toggle — opt-in soft-wrap for long heredocs / pasted output. */}
@@ -1175,7 +1300,7 @@ function MessageCardInner({
                                     : (isDarkMode ? 'text-gray-400 hover:bg-gray-700' : 'text-gray-500 hover:bg-gray-200')
                                 }`}
                               >
-                                <span className="material-symbols-outlined" style={{ fontSize: 14 }}>wrap_text</span>
+                                <span className="material-symbols-outlined" style={{ fontSize: 14 }} aria-hidden="true">wrap_text</span>
                               </button>
                             </div>
                           </div>
@@ -1188,11 +1313,33 @@ function MessageCardInner({
                               isWrapped ? 'whitespace-pre-wrap break-words' : 'overflow-x-auto'
                             } ${isDarkMode ? 'text-green-400' : 'text-gray-800'}`}
                           >
-                            {renderWithCollapse(args, false, 'tool', tcIdx, globalOccurrenceStarts.toolArgStarts[tcIdx] ?? messageOccurrenceStart)}
+                            {renderWithCollapse(args, false, 'tool', tcIdx, globalOccurrenceStarts.toolArgStarts[tcIdx] ?? messageOccurrenceStart, localSearchStarts.toolArgStarts[tcIdx] ?? localOccurrenceStart)}
                           </pre>
                         </div>
                       );
                     })}
+                  </div>
+                )}
+
+                {/* Bottom fade + reveal control for clamped long cards.
+                    Rendered only when the body genuinely overflows. */}
+                {isClamped && isClampOverflowing && (
+                  <div
+                    className={`absolute bottom-0 inset-x-0 flex justify-center items-end pt-10 pb-1.5 bg-gradient-to-t to-transparent ${
+                      isDarkMode ? 'from-[#111827]' : 'from-white'
+                    }`}
+                  >
+                    <button
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); setShowFull(true); }}
+                      className={`px-2 py-0.5 rounded-full border text-xs font-medium shadow-sm ${
+                        isDarkMode
+                          ? 'bg-gray-800 border-gray-600 text-gray-200 hover:bg-gray-700'
+                          : 'bg-white border-gray-300 text-gray-600 hover:bg-gray-50'
+                      }`}
+                    >
+                      Show full message
+                    </button>
                   </div>
                 )}
               </div>
@@ -1222,7 +1369,7 @@ function MessageCardInner({
                   }`}
                   title="Collapse selection — C  (O or Alt-click to isolate)"
                 >
-                  <span className="material-symbols-outlined" style={{ fontSize: 14 }}>unfold_less</span>
+                  <span className="material-symbols-outlined" style={{ fontSize: 14 }} aria-hidden="true">unfold_less</span>
                   Collapse
                 </button>
                 <div className={`w-px h-4 ${isDarkMode ? 'bg-gray-600' : 'bg-gray-300'}`} />
@@ -1236,8 +1383,9 @@ function MessageCardInner({
                 isDarkMode ? 'text-fuchsia-300 hover:bg-gray-700' : 'text-fuchsia-700 hover:bg-fuchsia-50'
               }`}
               title="Highlight selection — H  (session only)"
+              aria-label="Highlight selection — H  (session only)"
             >
-              <span className="material-symbols-outlined" style={{ fontSize: 16 }}>ink_highlighter</span>
+              <span className="material-symbols-outlined" style={{ fontSize: 16 }} aria-hidden="true">ink_highlighter</span>
             </button>
             <button
               onClick={() => applyFormat('bold')}
@@ -1245,8 +1393,9 @@ function MessageCardInner({
                 isDarkMode ? 'text-gray-200 hover:bg-gray-700' : 'text-gray-700 hover:bg-gray-100'
               }`}
               title="Bold selection — B"
+              aria-label="Bold selection — B"
             >
-              <span className="material-symbols-outlined" style={{ fontSize: 16 }}>format_bold</span>
+              <span className="material-symbols-outlined" style={{ fontSize: 16 }} aria-hidden="true">format_bold</span>
             </button>
             <button
               onClick={() => applyFormat('italic')}
@@ -1254,8 +1403,9 @@ function MessageCardInner({
                 isDarkMode ? 'text-gray-200 hover:bg-gray-700' : 'text-gray-700 hover:bg-gray-100'
               }`}
               title="Italic selection — I"
+              aria-label="Italic selection — I"
             >
-              <span className="material-symbols-outlined" style={{ fontSize: 16 }}>format_italic</span>
+              <span className="material-symbols-outlined" style={{ fontSize: 16 }} aria-hidden="true">format_italic</span>
             </button>
             <div className={`w-px h-4 ${isDarkMode ? 'bg-gray-600' : 'bg-gray-300'}`} />
             <button
@@ -1267,7 +1417,7 @@ function MessageCardInner({
               }`}
               title="Copy link with highlighted text"
             >
-              <span className="material-symbols-outlined" style={{ fontSize: 14 }}>
+              <span className="material-symbols-outlined" style={{ fontSize: 14 }} aria-hidden="true">
                 {copiedSelection ? 'check' : 'link'}
               </span>
               {copiedSelection ? 'Copied!' : 'Copy link'}
@@ -1314,7 +1464,7 @@ function MessageCardInner({
               }`}
               title="Share this quote (no password needed)"
             >
-              <span className="material-symbols-outlined" style={{ fontSize: 14 }}>share</span>
+              <span className="material-symbols-outlined" style={{ fontSize: 14 }} aria-hidden="true">share</span>
               Share quote
             </button>
             <div className={`w-px h-4 ${isDarkMode ? 'bg-gray-600' : 'bg-gray-300'}`} />
@@ -1326,8 +1476,9 @@ function MessageCardInner({
                   : 'text-gray-500 hover:bg-gray-100'
               }`}
               title="Close"
+              aria-label="Close"
             >
-              <span className="material-symbols-outlined" style={{ fontSize: 14 }}>close</span>
+              <span className="material-symbols-outlined" style={{ fontSize: 14 }} aria-hidden="true">close</span>
             </button>
             {/* Arrow */}
             <div

@@ -63,6 +63,18 @@ describe('useUrlState', () => {
       expect(state.message).toBe(2);
       expect(state.highlight).toBe('hello');
     });
+
+    it('parses index as integer — the canonical sample identifier', () => {
+      window.location.search = '?file=test.jsonl&index=7';
+      const { result } = renderHook(() => useUrlState());
+      expect(result.current.getUrlState().index).toBe(7);
+    });
+
+    it('parses index=0 (first sample must not be dropped as falsy)', () => {
+      window.location.search = '?file=test.jsonl&index=0';
+      const { result } = renderHook(() => useUrlState());
+      expect(result.current.getUrlState().index).toBe(0);
+    });
   });
 
   describe('setUrlState', () => {
@@ -111,6 +123,22 @@ describe('useUrlState', () => {
       const link = result.current.generateLink({ file: 'path/to/file.jsonl', highlight: 'hello world' });
       expect(link).toContain('file=path');
       expect(link).toContain('highlight=hello');
+    });
+
+    it('dual-emits index alongside rollout during the migration window', () => {
+      // ?index= is canonical (resolved first by App); ?rollout= stays for
+      // legacy readers. Links carry both so either side can resolve them.
+      const { result } = renderHook(() => useUrlState());
+      const link = result.current.generateLink({ file: 'test.jsonl', rollout: 3, step: 1, index: 12 });
+      expect(link).toContain('index=12');
+      expect(link).toContain('rollout=3');
+      expect(link).toContain('step=1');
+    });
+
+    it('emits index=0 for the first sample', () => {
+      const { result } = renderHook(() => useUrlState());
+      const link = result.current.generateLink({ file: 'test.jsonl', index: 0 });
+      expect(link).toContain('index=0');
     });
   });
 });

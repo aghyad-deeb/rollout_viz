@@ -1,6 +1,17 @@
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { PresentationPreviewPanel } from './PresentationPreviewPanel';
+import { encodeImage, downloadBlob, copyImageToClipboard } from '../../utils/captureImage';
 import type { PresentationMessageDraft } from '../../utils/presentationDraft';
+
+vi.mock('../../utils/captureImage', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../utils/captureImage')>();
+  return {
+    ...actual,
+    encodeImage: vi.fn(async (blob: Blob) => blob),
+    downloadBlob: vi.fn(),
+    copyImageToClipboard: vi.fn(async () => true),
+  };
+});
 
 const activeDraft: PresentationMessageDraft = {
   role: 'assistant',
@@ -20,7 +31,7 @@ const baseProps = {
   onExportWidthChange: () => {},
   onFontSizeChange: () => {},
   activeMessageIndex: 0,
-  messageCount: 2,
+  messageLabels: ['user', 'assistant'],
   activeDraft,
   activeDraftDirty: false,
   draftCount: 0,
@@ -35,7 +46,10 @@ function openCardEdit() {
 }
 
 describe('PresentationPreviewPanel', () => {
-  beforeEach(() => localStorage.clear());
+  beforeEach(() => {
+    localStorage.clear();
+    vi.clearAllMocks();
+  });
 
   it('restores PDF as the persisted download format', () => {
     localStorage.setItem('rollout_viz_capture_format', 'pdf');
@@ -111,5 +125,47 @@ describe('PresentationPreviewPanel', () => {
       ...activeDraft,
       displayLabel: 'GPT-5.1',
     });
+  });
+
+  it('labels card picker options with the message label, e.g. "#2 · assistant"', () => {
+    render(<PresentationPreviewPanel {...baseProps} />);
+    openCardEdit();
+
+    expect(screen.getByRole('option', { name: '#2 · assistant' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: '#1 · user' })).toBeInTheDocument();
+  });
+
+  it('shows the active card label in the collapsed Card-edit header', () => {
+    render(<PresentationPreviewPanel {...baseProps} activeMessageIndex={1} />);
+
+    expect(screen.getByRole('button', { name: /card edit/i })).toHaveTextContent('#2 · assistant');
+  });
+
+  it('downloads using exportBaseName when provided', async () => {
+    render(<PresentationPreviewPanel {...baseProps} exportBaseName="my-rollout-msg3" />);
+
+    fireEvent.click(screen.getByText('Download'));
+
+    await waitFor(() => expect(downloadBlob).toHaveBeenCalledTimes(1));
+    expect(encodeImage).toHaveBeenCalledWith(baseProps.imageBlob, 'png');
+    expect(vi.mocked(downloadBlob).mock.calls[0][1]).toBe('my-rollout-msg3.png');
+  });
+
+  it('falls back to rollout-capture for downloads without exportBaseName', async () => {
+    render(<PresentationPreviewPanel {...baseProps} />);
+
+    fireEvent.click(screen.getByText('Download'));
+
+    await waitFor(() => expect(downloadBlob).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(downloadBlob).mock.calls[0][1]).toBe('rollout-capture.png');
+  });
+
+  it('passes the exportBaseName-derived fallback filename to copyImageToClipboard', async () => {
+    render(<PresentationPreviewPanel {...baseProps} exportBaseName="my-rollout-msg3" />);
+
+    fireEvent.click(screen.getByText('Copy'));
+
+    await waitFor(() => expect(copyImageToClipboard).toHaveBeenCalledTimes(1));
+    expect(copyImageToClipboard).toHaveBeenCalledWith(baseProps.imageBlob, '', 'my-rollout-msg3.png');
   });
 });

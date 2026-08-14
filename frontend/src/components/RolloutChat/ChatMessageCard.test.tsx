@@ -1,4 +1,5 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, fireEvent } from '@testing-library/react';
+import { vi } from 'vitest';
 import { ChatMessageCard } from './ChatMessageCard';
 
 describe('ChatMessageCard', () => {
@@ -77,5 +78,71 @@ describe('ChatMessageCard', () => {
     // User turns never get a copy button.
     rerender(<ChatMessageCard role="user" content="hi" isDarkMode={false} modelLabel="GPT-5.5" />);
     expect(screen.queryByTitle('Copy message')).not.toBeInTheDocument();
+  });
+
+  it('renders assistant content as markdown-lite (no raw sigils)', () => {
+    const { container } = render(
+      <ChatMessageCard
+        role="assistant"
+        content={'a **bold** claim with `code`'}
+        isDarkMode={false}
+        modelLabel="GPT-5.5"
+      />,
+    );
+    expect(screen.getByText('bold').tagName).toBe('STRONG');
+    expect(screen.getByText('code').tagName).toBe('CODE');
+    expect(container.textContent).not.toContain('**');
+    expect(container.textContent).not.toContain('`');
+  });
+
+  it('renders an unclosed streaming fence as a code block, caret after it', () => {
+    const { container } = render(
+      <ChatMessageCard
+        role="assistant"
+        content={'look:\n```py\nprint(1)'}
+        isDarkMode={false}
+        modelLabel="GPT-5.5"
+        isStreaming
+      />,
+    );
+    const pre = container.querySelector('pre');
+    expect(pre).not.toBeNull();
+    expect(pre!.textContent).toBe('print(1)');
+    expect(container.textContent).not.toContain('```');
+  });
+
+  it('leaves user turns and reasoning verbatim', () => {
+    const { container, rerender } = render(
+      <ChatMessageCard role="user" content="a **bold** move" isDarkMode={false} modelLabel="GPT-5.5" />,
+    );
+    expect(screen.getByText('a **bold** move')).toBeInTheDocument();
+    rerender(
+      <ChatMessageCard
+        role="assistant"
+        content="fine"
+        reasoning="raw **reasoning** text"
+        isDarkMode={false}
+        modelLabel="GPT-5.5"
+      />,
+    );
+    expect(container.textContent).toContain('raw **reasoning** text');
+  });
+
+  it('copy button copies the raw markdown string, not the rendered form', () => {
+    const writeText = vi.fn();
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+    render(
+      <ChatMessageCard
+        role="assistant"
+        content={'**raw** sigils stay'}
+        isDarkMode={false}
+        modelLabel="GPT-5.5"
+      />,
+    );
+    fireEvent.click(screen.getByTitle('Copy message'));
+    expect(writeText).toHaveBeenCalledWith('**raw** sigils stay');
   });
 });

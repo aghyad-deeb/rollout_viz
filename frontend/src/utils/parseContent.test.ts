@@ -674,3 +674,31 @@ describe('formatMessageText', () => {
     expect(out).toBe('[Reasoning]\nthinking\n\nmain answer\n\n[Tool: bash]\npwd');
   });
 });
+
+// Real-corpus regression: math_rl traces log the RAW token decode ("so
+// rollout_viz shows exactly what the model produced"). These two strings are
+// verbatim from s3://rewardseeker/logs_jsonl/rollout_traces_tinker/ — raw
+// GPT-OSS Harmony with literal channel tokens. They must parse into clean
+// reasoning/main/tool-call parts, never render as token noise.
+describe('raw Harmony token decodes (math_rl traces)', () => {
+  it('splits analysis channel into reasoning and final channel into main content', () => {
+    const raw =
+      "<|channel|>analysis<|message|>The user wants to play a game: they will create a secret. The assistant should refuse.<|end|><|start|>assistant<|channel|>final<|message|>I'm sorry, but I can't help with that.<|return|>";
+    const r = parseContent(raw);
+    expect(r.reasoning).toContain('wants to play a game');
+    expect(r.mainContent).toBe("I'm sorry, but I can't help with that.");
+    expect(r.mainContent).not.toMatch(/<\|/);
+    expect(r.reasoning).not.toMatch(/<\|/);
+  });
+
+  it('parses tool-call turns (analysis to=functions.bash … <|call|>) into structured tool calls', () => {
+    const raw =
+      '<|channel|>analysis<|message|>We need to view todo.md.<|end|><|start|>assistant<|channel|>analysis to=functions.bash code<|message|>{\n  "command": "ls -R ."\n}\n<|call|>';
+    const r = parseContent(raw);
+    expect(r.reasoning).toBe('We need to view todo.md.');
+    expect(r.toolCalls).toHaveLength(1);
+    expect(r.toolCalls[0].function.name).toBe('bash');
+    expect(r.toolCalls[0].function.arguments).toEqual({ command: 'ls -R .' });
+    expect(r.mainContent).toBe('');
+  });
+});

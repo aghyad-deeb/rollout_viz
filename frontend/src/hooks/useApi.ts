@@ -35,6 +35,10 @@ interface MultiFileSamplesResponse {
 export function useApi(shareToken?: string | null) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Per-file load failures that did NOT prevent other files from loading.
+  // `error` remains reserved for "nothing loaded at all" so the sample table
+  // and a partial-failure warning can coexist.
+  const [loadWarnings, setLoadWarnings] = useState<string[]>([]);
   const [messagesLoaded, setMessagesLoaded] = useState(false);
   const [messagesLoading, setMessagesLoading] = useState(false);
   const samplesAbortRef = useRef<AbortController | null>(null);
@@ -165,7 +169,7 @@ export function useApi(shareToken?: string | null) {
   // Returns experiment name string when all files are done.
   const loadFilesProgressively = useCallback(async (
     filePaths: string[],
-    onFileLoaded: (samples: Sample[], filePath: string) => void,
+    onFileLoaded: (samples: Sample[], filePath: string, rawBytes: number) => void,
   ): Promise<{ experimentName: string } | null> => {
     if (filePaths.length === 0) return null;
 
@@ -177,11 +181,15 @@ export function useApi(shareToken?: string | null) {
 
     setLoading(true);
     setError(null);
+    setLoadWarnings([]);
     setMessagesLoaded(false);
 
     const experimentNames = new Set<string>();
     let firstDone = false;
-    let hadError = false;
+    // Human-readable per-file failure details, surfaced as a warning banner
+    // (or as the main error when every file failed).
+    const failedFiles: string[] = [];
+    const fileName = (p: string) => p.split('/').pop() || p;
 
     // Fire all requests in parallel — each resolves independently
     const filePromises = filePaths.map(async (filePath) => {
@@ -200,12 +208,24 @@ export function useApi(shareToken?: string | null) {
 
         if (controller.signal.aborted) return;
         if (!response.ok) {
-          hadError = true;
+          let detail = `${response.status} ${response.statusText}`;
+          try {
+            const errorData = await response.json();
+            detail = errorData.detail || detail;
+          } catch { /* response body not JSON */ }
+          failedFiles.push(`${fileName(filePath)}: ${detail}`);
           return;
         }
 
         const data = await response.json();
         if (controller.signal.aborted) return;
+
+        // The batch endpoint reports per-file parse/read failures in a 200
+        // response's `errors` array — without reading it a broken file just
+        // silently contributes zero samples.
+        for (const e of (data.errors || []) as Array<{ file?: string; error?: string }>) {
+          failedFiles.push(`${fileName(e.file || filePath)}: ${e.error || 'failed to load'}`);
+        }
 
         // Collect experiment names
         const expNames: string[] = data.experiment_names || [];
@@ -220,10 +240,10 @@ export function useApi(shareToken?: string | null) {
         }
 
         // Notify caller with this file's samples
-        onFileLoaded(data.samples, filePath);
+        onFileLoaded(data.samples, filePath, data.total_raw_bytes || 0);
       } catch (err) {
         if (err instanceof DOMException && err.name === 'AbortError') return;
-        hadError = true;
+        failedFiles.push(`${fileName(filePath)}: ${err instanceof Error ? err.message : 'failed to load'}`);
         console.error(`Failed to load ${filePath}:`, err);
       }
     });
@@ -237,8 +257,13 @@ export function useApi(shareToken?: string | null) {
       setLoading(false);
     }
 
-    if (hadError && !firstDone) {
-      setError('Some files failed to load');
+    if (failedFiles.length > 0) {
+      if (!firstDone) {
+        // Nothing loaded — this is a real error, not a warning
+        setError(failedFiles.join('\n'));
+      } else {
+        setLoadWarnings(failedFiles);
+      }
     }
 
     const experimentName = experimentNames.size === 1
@@ -290,6 +315,14 @@ export function useApi(shareToken?: string | null) {
         : experimentNames.length > 1
           ? `${experimentNames.length} experiments`
           : '';
+
+      // Surface per-file hydration failures too (deduped — phase 1 usually
+      // already reported the same broken file).
+      const hydrationFailures = ((data.errors || []) as Array<{ file?: string; error?: string }>)
+        .map(e => `${(e.file || '').split('/').pop() || e.file}: ${e.error || 'failed to load'}`);
+      if (hydrationFailures.length > 0) {
+        setLoadWarnings(prev => [...prev, ...hydrationFailures.filter(f => !prev.includes(f))]);
+      }
 
       setMessagesLoaded(true);
       return {
@@ -372,9 +405,13 @@ export function useApi(shareToken?: string | null) {
     }
   }, [shareHeaders]);
 
+  const clearLoadWarnings = useCallback(() => setLoadWarnings([]), []);
+
   return {
     loading,
     error,
+    loadWarnings,
+    clearLoadWarnings,
     messagesLoaded,
     messagesLoading,
     loadSamples,

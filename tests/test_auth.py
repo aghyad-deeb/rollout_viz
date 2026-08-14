@@ -434,3 +434,134 @@ class TestShareTokens:
         resp = await client.post("/api/share/create", json={"file": "../../etc/passwd"})
         assert resp.status_code == 400
         await client.aclose()
+
+
+class TestApiTokenAuth:
+    """Machine auth: Authorization: Bearer <VIZ_API_TOKEN>.
+
+    Used by first-party consumers (web_chat, auto_eval, agent skills) calling
+    the API headlessly. Full access, same as a cookie session."""
+
+    async def test_valid_bearer_token_grants_access(self, app_with_auth, monkeypatch):
+        import backend.main as main_module
+        monkeypatch.setattr(main_module, "VIZ_API_TOKEN", "sekret-token-123")
+        client = await app_with_auth()
+        resp = await client.get(
+            "/api/preset-metrics", headers={"Authorization": "Bearer sekret-token-123"}
+        )
+        assert resp.status_code == 200
+        await client.aclose()
+
+    async def test_wrong_bearer_token_is_401(self, app_with_auth, monkeypatch):
+        import backend.main as main_module
+        monkeypatch.setattr(main_module, "VIZ_API_TOKEN", "sekret-token-123")
+        client = await app_with_auth()
+        resp = await client.get(
+            "/api/preset-metrics", headers={"Authorization": "Bearer wrong"}
+        )
+        assert resp.status_code == 401
+        await client.aclose()
+
+    async def test_bearer_ignored_when_token_not_configured(self, app_with_auth, monkeypatch):
+        """Without VIZ_API_TOKEN in config, bearer headers change nothing —
+        request falls through to normal (cookie) auth and gets 401."""
+        import backend.main as main_module
+        monkeypatch.setattr(main_module, "VIZ_API_TOKEN", None)
+        client = await app_with_auth()
+        resp = await client.get(
+            "/api/preset-metrics", headers={"Authorization": "Bearer anything"}
+        )
+        assert resp.status_code == 401
+        await client.aclose()
+
+    async def test_bearer_works_without_password_auth(self, app_no_auth, monkeypatch):
+        """Token path must not require VIZ_PASSWORD to be set."""
+        import backend.main as main_module
+        monkeypatch.setattr(main_module, "VIZ_API_TOKEN", "sekret-token-123")
+        client = await app_no_auth()
+        resp = await client.get(
+            "/api/preset-metrics", headers={"Authorization": "Bearer sekret-token-123"}
+        )
+        assert resp.status_code == 200
+        await client.aclose()
+
+    async def test_bearer_grants_write_endpoints(self, app_with_auth, monkeypatch, patch_project_root):
+        """Machine callers can hit POST endpoints (e.g. save-graded pre-flight
+        validation), not just reads. 422 = passed auth, failed validation."""
+        import backend.main as main_module
+        monkeypatch.setattr(main_module, "VIZ_API_TOKEN", "sekret-token-123")
+        client = await app_with_auth()
+        resp = await client.post(
+            "/api/save-graded",
+            headers={"Authorization": "Bearer sekret-token-123"},
+            json={},
+        )
+        assert resp.status_code == 422  # auth passed; body invalid by design
+        await client.aclose()
+
+    async def test_malformed_authorization_header_is_401(self, app_with_auth, monkeypatch):
+        import backend.main as main_module
+        monkeypatch.setattr(main_module, "VIZ_API_TOKEN", "sekret-token-123")
+        client = await app_with_auth()
+        for header in ("Bearer", "Bearer ", "Basic sekret-token-123", "sekret-token-123"):
+            resp = await client.get(
+                "/api/preset-metrics", headers={"Authorization": header}
+            )
+            assert resp.status_code == 401, f"header {header!r} must not authenticate"
+        await client.aclose()
+
+
+class TestServerConfig:
+    """GET /api/config — non-secret cross-app wiring the frontend needs."""
+
+    async def test_config_returns_web_chat_base_url(self, app_no_auth, mock_env_config):
+        import backend.main as main_module
+        mock_env_config(WEB_CHAT_BASE_URL="http://localhost:5173/")
+        client = await app_no_auth()
+        resp = await client.get("/api/config")
+        assert resp.status_code == 200
+        # Trailing slash normalized off so the frontend can append /?chat=...
+        assert resp.json()["web_chat_base_url"] == "http://localhost:5173"
+        await client.aclose()
+
+    async def test_config_null_when_unconfigured(self, app_no_auth, mock_env_config):
+        import backend.main as main_module
+        main_module._env_config.pop("WEB_CHAT_BASE_URL", None)
+        client = await app_no_auth()
+        resp = await client.get("/api/config")
+        assert resp.json()["web_chat_base_url"] is None
+        await client.aclose()
+
+    async def test_config_requires_auth(self, app_with_auth):
+        client = await app_with_auth()
+        resp = await client.get("/api/config")
+        assert resp.status_code == 401
+        await client.aclose()
+
+    async def test_non_ascii_bearer_is_401_not_500(self, app_with_auth, monkeypatch):
+        """Starlette decodes header obs-text as latin-1; compare_digest raises
+        on non-ASCII str — must be treated as a mismatch, not a crash."""
+        import backend.main as main_module
+        monkeypatch.setattr(main_module, "VIZ_API_TOKEN", "sekret-token-123")
+        client = await app_with_auth()
+        resp = await client.get(
+            "/api/preset-metrics",
+            headers={b"Authorization": "Bearer sekrét".encode("latin-1")},
+        )
+        assert resp.status_code == 401
+        await client.aclose()
+
+    async def test_lowercase_bearer_scheme_accepted(self, app_with_auth, monkeypatch):
+        """RFC 7235: auth schemes are case-insensitive."""
+        import backend.main as main_module
+        monkeypatch.setattr(main_module, "VIZ_API_TOKEN", "sekret-token-123")
+        client = await app_with_auth()
+        resp = await client.get(
+            "/api/preset-metrics", headers={"Authorization": "bearer sekret-token-123"}
+        )
+        assert resp.status_code == 200
+        resp = await client.get(
+            "/api/preset-metrics", headers={"Authorization": "bearer wrong"}
+        )
+        assert resp.status_code == 401
+        await client.aclose()

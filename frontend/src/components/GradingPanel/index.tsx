@@ -8,6 +8,14 @@ interface GradingJob {
   sampleIds: number[];
 }
 
+// Per-file outcome of a multi-file grading run, so one failed file doesn't
+// silently swallow the others' results.
+interface FileOutcome {
+  filePath: string;
+  graded: number;
+  failed: boolean;
+}
+
 interface GradingPanelProps {
   gradingJobs: GradingJob[];
   isDarkMode: boolean;
@@ -16,6 +24,15 @@ interface GradingPanelProps {
 }
 
 type ReasoningEffort = 'auto' | 'low' | 'medium' | 'high';
+
+// Parse a raw number-input string, clamping to [min, max] and falling back
+// when empty/unparseable. Used on blur AND at grade time so a never-blurred
+// field can't send NaN to the backend.
+function clampIntOrFallback(raw: string, min: number, max: number, fallback: number): number {
+  const parsed = parseInt(raw, 10);
+  if (Number.isNaN(parsed)) return fallback;
+  return Math.max(min, Math.min(max, parsed));
+}
 
 export function GradingPanel({
   gradingJobs,
@@ -52,8 +69,11 @@ export function GradingPanel({
   const [model, setModel] = useState<string>(lastModel);
   const [apiKeyInput, setApiKeyInput] = useState('');
   const [showApiKey, setShowApiKey] = useState(false);
-  const [parallelSize, setParallelSize] = useState(100);
-  const [maxTokens, setMaxTokens] = useState(32768);
+  const [showKeyOverride, setShowKeyOverride] = useState(false);
+  // String state so the fields can be cleared while typing; clamped on blur
+  // and re-parsed defensively at grade time.
+  const [parallelSize, setParallelSize] = useState('100');
+  const [maxTokens, setMaxTokens] = useState('32768');
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>('low');
   const [requireQuotes, setRequireQuotes] = useState(true);
   
@@ -61,6 +81,11 @@ export function GradingPanel({
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [temperature, setTemperature] = useState<number | undefined>(undefined);
   const [topP, setTopP] = useState<number | undefined>(undefined);
+
+  // Multi-file run tracking: which file is currently grading (1-based) and
+  // the per-file outcomes of the last run (null = no run yet).
+  const [fileProgress, setFileProgress] = useState<{ current: number; total: number } | null>(null);
+  const [fileOutcomes, setFileOutcomes] = useState<FileOutcome[] | null>(null);
 
   // Check if we have a valid API key (local or server-side)
   const hasApiKey = useMemo(() => {
@@ -88,6 +113,12 @@ export function GradingPanel({
     () => gradingJobs.reduce((count, job) => count + job.sampleIds.length, 0),
     [gradingJobs],
   );
+
+  // A '+ New Custom...' metric with a blank name or prompt would grade under
+  // metric_name '' — block grading until both fields are filled in.
+  const customMetricIncomplete =
+    selectedMetric === 'custom' && (!customMetricName.trim() || !customPrompt.trim());
+  const canGrade = hasApiKey && !!currentMetric && totalSampleCount > 0 && !customMetricIncomplete;
 
   // Handle provider change
   const handleProviderChange = (newProvider: LLMProvider) => {
@@ -144,10 +175,15 @@ export function GradingPanel({
 
   // Start grading
   const handleGrade = async () => {
-    if (!currentMetric || totalSampleCount === 0) return;
+    if (!currentMetric || totalSampleCount === 0 || customMetricIncomplete) return;
+
+    // Defensive parse: the string fields may never have been blurred (or may
+    // be mid-edit/empty), so clamp with fallbacks here too.
+    const effectiveMaxTokens = clampIntOrFallback(maxTokens, 1, 128000, 32768);
+    const effectiveParallelSize = clampIntOrFallback(parallelSize, 1, 500, 100);
 
     const advancedSettings = {
-      maxTokens,
+      maxTokens: effectiveMaxTokens,
       ...(reasoningEffort !== 'auto' ? { reasoningEffort } : {}),
       ...(temperature !== undefined ? { temperature } : {}),
       ...(topP !== undefined ? { topP } : {}),
@@ -158,28 +194,42 @@ export function GradingPanel({
       maxQuoteRetries: 2,
     };
 
-    const metricName = selectedMetric === 'custom' ? customMetricName : selectedMetric;
+    const metricName = selectedMetric === 'custom' ? customMetricName.trim() : selectedMetric;
+    const metricPrompt = selectedMetric === 'custom' ? customPrompt.trim() : currentMetric.prompt;
+    const jobs = gradingJobs.filter((job) => job.sampleIds.length > 0);
+    const outcomes: FileOutcome[] = [];
     let completedAny = false;
+    setFileOutcomes(null);
 
-    for (const job of gradingJobs) {
-      if (job.sampleIds.length === 0) continue;
+    for (let i = 0; i < jobs.length; i++) {
+      const job = jobs[i];
+      setFileProgress({ current: i + 1, total: jobs.length });
 
       const result = await gradeAndSave(
         job.filePath,
         job.sampleIds,
         metricName,
-        currentMetric.prompt,
+        metricPrompt,
         currentMetric.grade_type as 'float' | 'int' | 'bool' | 'freeform',
         provider,
         model,
-        parallelSize,
+        effectiveParallelSize,
         advancedSettings,
         quoteSettings,
       );
 
-      if (!result) break;
+      if (!result) {
+        // Record the failure and keep grading the remaining files instead of
+        // silently abandoning them.
+        outcomes.push({ filePath: job.filePath, graded: 0, failed: true });
+        continue;
+      }
+      outcomes.push({ filePath: job.filePath, graded: result.graded_count, failed: false });
       completedAny = completedAny || result.graded_count > 0;
     }
+
+    setFileProgress(null);
+    setFileOutcomes(outcomes);
 
     if (completedAny) {
       onGradingComplete();
@@ -248,8 +298,9 @@ export function GradingPanel({
                 onClick={handleEditCustomMetric}
                 className={`px-2 py-1 rounded ${isDarkMode ? 'text-blue-400 hover:bg-blue-900/30' : 'text-blue-600 hover:bg-blue-50'}`}
                 title="Edit custom metric"
+                aria-label="Edit custom metric"
               >
-                <span className="material-symbols-outlined" style={{ fontSize: 18 }}>edit</span>
+                <span className="material-symbols-outlined" style={{ fontSize: 18 }} aria-hidden="true">edit</span>
               </button>
               <button
                 onClick={async () => {
@@ -261,8 +312,9 @@ export function GradingPanel({
                 }}
                 className="px-2 py-1 rounded text-red-500 hover:bg-red-100 dark:hover:bg-red-900/30"
                 title="Delete custom metric"
+                aria-label="Delete custom metric"
               >
-                <span className="material-symbols-outlined" style={{ fontSize: 18 }}>delete</span>
+                <span className="material-symbols-outlined" style={{ fontSize: 18 }} aria-hidden="true">delete</span>
               </button>
             </>
           )}
@@ -297,8 +349,8 @@ export function GradingPanel({
               value={customPrompt}
               onChange={(e) => setCustomPrompt(e.target.value)}
               placeholder="Enter your grading prompt..."
-              rows={4}
-              className={`w-full px-3 py-2 rounded border text-sm ${inputClass}`}
+              rows={6}
+              className={`w-full px-3 py-2 rounded border text-sm resize-y ${inputClass}`}
             />
             <div className="flex gap-2 items-center">
               <label className={`text-xs ${mutedClass}`}>Grade type:</label>
@@ -392,63 +444,6 @@ export function GradingPanel({
         </div>
       </div>
 
-      {/* Parallel Size */}
-      <div className="space-y-2">
-        <label className={`text-sm font-medium ${textClass}`}>Parallel Requests</label>
-        <div className="flex items-center gap-2">
-          <input
-            type="number"
-            min="1"
-            max="500"
-            value={parallelSize}
-            onChange={(e) => setParallelSize(Math.max(1, Math.min(500, parseInt(e.target.value) || 100)))}
-            className={`w-24 px-3 py-2 rounded border text-sm ${inputClass}`}
-          />
-          <span className={`text-xs ${mutedClass}`}>concurrent requests (1-500)</span>
-        </div>
-      </div>
-
-      {/* Grading budget */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-        <div className="space-y-2">
-          <label htmlFor="gradingMaxTokens" className={`text-sm font-medium ${textClass}`}>
-            Max Output Tokens
-          </label>
-          <div className="flex items-center gap-2">
-            <input
-              id="gradingMaxTokens"
-              aria-label="Max Output Tokens"
-              type="number"
-              min="1"
-              max="128000"
-              value={maxTokens}
-              onChange={(e) => setMaxTokens(Math.max(1, Math.min(128000, parseInt(e.target.value) || 32768)))}
-              className={`w-32 px-3 py-2 rounded border text-sm ${inputClass}`}
-            />
-            <span className={`text-xs ${mutedClass}`}>1 - 128k</span>
-          </div>
-        </div>
-
-        <div className="space-y-2">
-          <label htmlFor="gradingReasoningEffort" className={`text-sm font-medium ${textClass}`}>
-            Effort
-          </label>
-          <select
-            id="gradingReasoningEffort"
-            aria-label="Effort"
-            value={reasoningEffort}
-            onChange={(e) => setReasoningEffort(e.target.value as ReasoningEffort)}
-            className={`w-full px-3 py-2 rounded border text-sm ${inputClass}`}
-          >
-            <option value="auto">Auto</option>
-            <option value="low">Low</option>
-            <option value="medium">Medium</option>
-            <option value="high">High</option>
-          </select>
-          <p className={`text-xs ${mutedClass}`}>Auto uses the provider default.</p>
-        </div>
-      </div>
-
       {/* Require Quotes */}
       <div className="flex items-center gap-2">
         <input
@@ -464,6 +459,83 @@ export function GradingPanel({
         <span className={`text-xs ${mutedClass}`}>(will retry; quote-less samples fail)</span>
       </div>
 
+      {/* API Key */}
+      {usingServerKey && !showKeyOverride ? (
+        <div className="flex items-center gap-2">
+          <span className={`text-sm font-medium ${textClass}`}>API Key:</span>
+          <span className="text-blue-500 text-xs inline-flex items-center gap-1">
+            <span className="material-symbols-outlined" style={{ fontSize: 14 }}>cloud_done</span>
+            Using server .env
+          </span>
+          <button
+            onClick={() => setShowKeyOverride(true)}
+            className={`text-xs underline ${mutedClass} hover:opacity-80`}
+          >
+            Override
+          </button>
+        </div>
+      ) : (
+        <div className="space-y-2">
+          <label className={`text-sm font-medium ${textClass}`}>
+            API Key
+            {usingServerKey ? (
+              <span className="ml-2 text-blue-500 text-xs">
+                <span className="material-symbols-outlined" style={{ fontSize: 14 }}>cloud_done</span>
+                Using server .env
+              </span>
+            ) : hasApiKey ? (
+              <span className="ml-2 text-green-500 text-xs">
+                <span className="material-symbols-outlined" style={{ fontSize: 14 }}>check_circle</span>
+                Saved locally
+              </span>
+            ) : null}
+          </label>
+          {usingServerKey ? (
+            <p className={`text-xs ${mutedClass} p-2 rounded border ${isDarkMode ? 'border-blue-800 bg-blue-900/20' : 'border-blue-200 bg-blue-50'}`}>
+              Using API key from server's <code className="px-1 rounded bg-gray-200 dark:bg-gray-700">.env</code> file.
+              You can override by entering a key below.
+            </p>
+          ) : null}
+          <div className="flex gap-2">
+            <div className="relative flex-1">
+              <input
+                type={showApiKey ? 'text' : 'password'}
+                value={apiKeyInput}
+                onChange={(e) => setApiKeyInput(e.target.value)}
+                placeholder={hasApiKey ? '••••••••••••' : `Enter ${LLM_PROVIDERS[provider].displayName} API key...`}
+                className={`w-full px-3 py-2 pr-10 rounded border text-sm ${inputClass}`}
+              />
+              <button
+                onClick={() => setShowApiKey(!showApiKey)}
+                className={`absolute right-2 top-1/2 -translate-y-1/2 ${mutedClass}`}
+                title={showApiKey ? 'Hide API key' : 'Show API key'}
+                aria-label={showApiKey ? 'Hide API key' : 'Show API key'}
+              >
+                <span className="material-symbols-outlined" style={{ fontSize: 18 }} aria-hidden="true">
+                  {showApiKey ? 'visibility_off' : 'visibility'}
+                </span>
+              </button>
+            </div>
+            <button
+              onClick={handleSaveApiKey}
+              disabled={!apiKeyInput.trim()}
+              className={`px-3 py-2 rounded text-sm font-medium transition-colors
+                ${apiKeyInput.trim()
+                  ? 'bg-blue-500 text-white hover:bg-blue-600'
+                  : 'bg-gray-200 text-gray-400 cursor-not-allowed dark:bg-gray-700'
+                }`}
+            >
+              Save
+            </button>
+          </div>
+          {!usingServerKey && (
+            <p className={`text-xs ${mutedClass}`}>
+              API keys are stored locally in your browser.
+            </p>
+          )}
+        </div>
+      )}
+
       {/* Advanced Settings */}
       <div className="space-y-2">
         <button
@@ -475,9 +547,72 @@ export function GradingPanel({
           </span>
           Advanced Settings
         </button>
-        
+
         {showAdvanced && (
           <div className={`space-y-3 p-3 rounded border ${isDarkMode ? 'border-gray-700 bg-gray-900/50' : 'border-gray-200 bg-gray-50'}`}>
+            {/* Parallel Size */}
+            <div className="space-y-1">
+              <label htmlFor="gradingParallelSize" className={`text-xs font-medium ${textClass}`}>
+                Parallel Requests
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  id="gradingParallelSize"
+                  aria-label="Parallel Requests"
+                  type="number"
+                  min="1"
+                  max="500"
+                  value={parallelSize}
+                  onChange={(e) => setParallelSize(e.target.value)}
+                  onBlur={() => setParallelSize(String(clampIntOrFallback(parallelSize, 1, 500, 100)))}
+                  className={`w-24 px-3 py-2 rounded border text-sm ${inputClass}`}
+                />
+                <span className={`text-xs ${mutedClass}`}>concurrent requests (1-500)</span>
+              </div>
+            </div>
+
+            {/* Grading budget */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="space-y-1">
+                <label htmlFor="gradingMaxTokens" className={`text-xs font-medium ${textClass}`}>
+                  Max Output Tokens
+                </label>
+                <div className="flex items-center gap-2">
+                  <input
+                    id="gradingMaxTokens"
+                    aria-label="Max Output Tokens"
+                    type="number"
+                    min="1"
+                    max="128000"
+                    value={maxTokens}
+                    onChange={(e) => setMaxTokens(e.target.value)}
+                    onBlur={() => setMaxTokens(String(clampIntOrFallback(maxTokens, 1, 128000, 32768)))}
+                    className={`w-32 px-3 py-2 rounded border text-sm ${inputClass}`}
+                  />
+                  <span className={`text-xs ${mutedClass}`}>1 - 128k</span>
+                </div>
+              </div>
+
+              <div className="space-y-1">
+                <label htmlFor="gradingReasoningEffort" className={`text-xs font-medium ${textClass}`}>
+                  Effort
+                </label>
+                <select
+                  id="gradingReasoningEffort"
+                  aria-label="Effort"
+                  value={reasoningEffort}
+                  onChange={(e) => setReasoningEffort(e.target.value as ReasoningEffort)}
+                  className={`w-full px-3 py-2 rounded border text-sm ${inputClass}`}
+                >
+                  <option value="auto">Auto</option>
+                  <option value="low">Low</option>
+                  <option value="medium">Medium</option>
+                  <option value="high">High</option>
+                </select>
+                <p className={`text-xs ${mutedClass}`}>Auto uses the provider default.</p>
+              </div>
+            </div>
+
             {/* Temperature */}
             <div className="space-y-1">
               <label className={`text-xs font-medium ${textClass}`}>
@@ -540,65 +675,6 @@ export function GradingPanel({
         )}
       </div>
 
-      {/* API Key */}
-      <div className="space-y-2">
-        <label className={`text-sm font-medium ${textClass}`}>
-          API Key
-          {usingServerKey ? (
-            <span className="ml-2 text-blue-500 text-xs">
-              <span className="material-symbols-outlined" style={{ fontSize: 14 }}>cloud_done</span>
-              Using server .env
-            </span>
-          ) : hasApiKey ? (
-            <span className="ml-2 text-green-500 text-xs">
-              <span className="material-symbols-outlined" style={{ fontSize: 14 }}>check_circle</span>
-              Saved locally
-            </span>
-          ) : null}
-        </label>
-        {usingServerKey ? (
-          <p className={`text-xs ${mutedClass} p-2 rounded border ${isDarkMode ? 'border-blue-800 bg-blue-900/20' : 'border-blue-200 bg-blue-50'}`}>
-            Using API key from server's <code className="px-1 rounded bg-gray-200 dark:bg-gray-700">.env</code> file. 
-            You can override by entering a key below.
-          </p>
-        ) : null}
-        <div className="flex gap-2">
-          <div className="relative flex-1">
-            <input
-              type={showApiKey ? 'text' : 'password'}
-              value={apiKeyInput}
-              onChange={(e) => setApiKeyInput(e.target.value)}
-              placeholder={hasApiKey ? '••••••••••••' : `Enter ${LLM_PROVIDERS[provider].displayName} API key...`}
-              className={`w-full px-3 py-2 pr-10 rounded border text-sm ${inputClass}`}
-            />
-            <button
-              onClick={() => setShowApiKey(!showApiKey)}
-              className={`absolute right-2 top-1/2 -translate-y-1/2 ${mutedClass}`}
-            >
-              <span className="material-symbols-outlined" style={{ fontSize: 18 }}>
-                {showApiKey ? 'visibility_off' : 'visibility'}
-              </span>
-            </button>
-          </div>
-          <button
-            onClick={handleSaveApiKey}
-            disabled={!apiKeyInput.trim()}
-            className={`px-3 py-2 rounded text-sm font-medium transition-colors
-              ${apiKeyInput.trim() 
-                ? 'bg-blue-500 text-white hover:bg-blue-600' 
-                : 'bg-gray-200 text-gray-400 cursor-not-allowed dark:bg-gray-700'
-              }`}
-          >
-            Save
-          </button>
-        </div>
-        {!usingServerKey && (
-          <p className={`text-xs ${mutedClass}`}>
-            API keys are stored locally in your browser.
-          </p>
-        )}
-      </div>
-
       {/* Grade button and status */}
       <div className="pt-2 space-y-3">
         {/* Success message */}
@@ -622,14 +698,30 @@ export function GradingPanel({
           </div>
         )}
 
-        {/* Error status (all samples failed) */}
-        {progress.status === 'error' && !progress.isRunning && progress.errorDetails.length > 0 && (
+        {/* Error status — also covers pre-flight/connection failures where no
+            per-sample errorDetails exist (the top banner may be scrolled away) */}
+        {progress.status === 'error' && !progress.isRunning && (
           <div className="p-3 rounded-lg bg-red-100 dark:bg-red-900/30 border border-red-300 dark:border-red-700">
             <p className="text-red-700 dark:text-red-300 text-sm font-medium">{progress.statusMessage}</p>
-            {progress.errorDetails.map((detail, i) => (
-              <p key={i} className="text-red-600 dark:text-red-400 text-xs mt-1 font-mono break-all">{detail}</p>
-            ))}
+            {progress.errorDetails.length > 0 ? (
+              progress.errorDetails.map((detail, i) => (
+                <p key={i} className="text-red-600 dark:text-red-400 text-xs mt-1 font-mono break-all">{detail}</p>
+              ))
+            ) : error ? (
+              <p className="text-red-600 dark:text-red-400 text-xs mt-1 font-mono break-all">{error}</p>
+            ) : null}
           </div>
+        )}
+
+        {/* Per-file summary when a multi-file run had mixed outcomes */}
+        {!progress.isRunning && fileOutcomes
+          && fileOutcomes.some((o) => o.failed)
+          && fileOutcomes.some((o) => !o.failed) && (
+          <p className="text-xs font-mono break-all text-amber-600 dark:text-amber-400">
+            {fileOutcomes
+              .map((o) => `${o.filePath.split('/').pop()}: ${o.failed ? 'failed' : `${o.graded} graded`}`)
+              .join(' · ')}
+          </p>
         )}
 
         {/* Cancelled message */}
@@ -668,6 +760,19 @@ export function GradingPanel({
                     <span className="text-red-500">{progress.errors} error{progress.errors !== 1 ? 's' : ''}</span>
                   )}
                 </div>
+                {/* Multi-file runs grade one file at a time; the bar restarts
+                    per file, so show which file this bar belongs to */}
+                {fileProgress && fileProgress.total > 1 && (
+                  <div className={`text-xs ${mutedClass}`}>
+                    {fileProgress.current}/{fileProgress.total} files
+                  </div>
+                )}
+                {progress.jobId && (
+                  <div className="flex items-center gap-1 text-xs text-green-600 dark:text-green-400">
+                    <span className="material-symbols-outlined" style={{ fontSize: 13 }}>cloud_done</span>
+                    Running on the server — safe to close this panel or reload the page.
+                  </div>
+                )}
               </div>
             )}
 
@@ -681,18 +786,29 @@ export function GradingPanel({
             </button>
           </div>
         ) : (
-          <button
-            onClick={handleGrade}
-            disabled={!hasApiKey || !currentMetric || totalSampleCount === 0}
-            className={`w-full px-4 py-2 rounded-lg font-medium transition-colors flex items-center justify-center gap-2
-              ${hasApiKey && currentMetric && totalSampleCount > 0
-                ? 'bg-blue-500 text-white hover:bg-blue-600' 
-                : 'bg-gray-200 text-gray-400 cursor-not-allowed dark:bg-gray-700'
-              }`}
-          >
-            <span className="material-symbols-outlined" style={{ fontSize: 18 }}>psychology</span>
-            Grade {totalSampleCount} sample{totalSampleCount !== 1 ? 's' : ''}
-          </button>
+          <div className="space-y-1">
+            <button
+              onClick={handleGrade}
+              disabled={!canGrade}
+              title={
+                !hasApiKey ? 'Enter an API key to grade'
+                  : totalSampleCount === 0 ? 'Select samples to grade'
+                  : customMetricIncomplete ? 'Enter a metric name and prompt to grade'
+                  : undefined
+              }
+              className={`w-full px-4 py-2 rounded-lg font-medium transition-colors flex items-center justify-center gap-2
+                ${canGrade
+                  ? 'bg-blue-500 text-white hover:bg-blue-600'
+                  : 'bg-gray-200 text-gray-400 cursor-not-allowed dark:bg-gray-700'
+                }`}
+            >
+              <span className="material-symbols-outlined" style={{ fontSize: 18 }}>psychology</span>
+              Grade {totalSampleCount} sample{totalSampleCount !== 1 ? 's' : ''}
+            </button>
+            {customMetricIncomplete && (
+              <p className={`text-xs ${mutedClass}`}>Enter a metric name and prompt to grade</p>
+            )}
+          </div>
         )}
       </div>
 

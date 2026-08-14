@@ -12,6 +12,7 @@ import json
 import os
 import re
 import secrets
+import threading as _threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -29,7 +30,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, ORJSONResponse, StreamingResponse
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from starlette.middleware.gzip import GZipMiddleware
 
 from backend.llm_providers import (
@@ -242,6 +243,10 @@ if _raw_password is not None and _raw_password == "":
 if _config_bool("VIZ_REQUIRE_AUTH") and not _raw_password:
     raise RuntimeError("VIZ_REQUIRE_AUTH=1 requires VIZ_PASSWORD")
 VIZ_PASSWORD = _raw_password
+# Machine auth for headless first-party consumers (web_chat, auto_eval, agent
+# skills). Sent as `Authorization: Bearer <token>`; grants full access like a
+# cookie session. Unset (default) disables the bearer path entirely.
+VIZ_API_TOKEN = _env_config.get("VIZ_API_TOKEN") or None
 SECRET_KEY = _env_config.get("VIZ_SECRET_KEY", secrets.token_hex(32))
 cookie_serializer = URLSafeTimedSerializer(SECRET_KEY)
 
@@ -413,6 +418,24 @@ async def auth_middleware(request: Request, call_next):
             return await call_next(request)
         except (BadSignature, SignatureExpired):
             pass
+
+    # 1.5) Machine token (Authorization: Bearer) → full access. A request that
+    # SENDS a bearer token opted into token auth: a mismatch fails loudly with
+    # 401 rather than falling through, so token typos surface immediately
+    # instead of silently riding the no-password allowance. Scheme match is
+    # case-insensitive (RFC 7235); comparison is over bytes because
+    # compare_digest raises on non-ASCII str input (Starlette decodes header
+    # obs-text as latin-1) — any such token must 401, not 500.
+    auth_header = request.headers.get("authorization", "")
+    scheme, _, bearer_candidate = auth_header.partition(" ")
+    if VIZ_API_TOKEN and scheme.lower() == "bearer":
+        candidate = bearer_candidate.strip()
+        if candidate and _hmac.compare_digest(
+            candidate.encode("utf-8", "surrogateescape"), VIZ_API_TOKEN.encode("utf-8")
+        ):
+            request.state.access_level = "full"
+            return await call_next(request)
+        return JSONResponse(status_code=401, content={"detail": "Invalid API token"})
 
     # 2) No password configured → full access for everyone
     if not VIZ_PASSWORD:
@@ -622,7 +645,14 @@ class Quote(BaseModel):
 
 
 class GradeEntry(BaseModel):
-    """A single grade entry for a metric."""
+    """A single grade entry for a metric.
+
+    extra="allow": producers write fields this schema doesn't know (e.g. the
+    comments feature's tombstone `deletes` target) and the save merge must
+    round-trip them losslessly — the default config silently strips them.
+    """
+    model_config = ConfigDict(extra="allow")
+
     grade: Union[bool, int, float, str]
     grade_type: str  # "float", "int", "bool", "freeform"
     quotes: List[Quote]
@@ -632,16 +662,16 @@ class GradeEntry(BaseModel):
     timestamp: str
 
 
-_GRADE_MAX_SAMPLES = _config_int("VIZ_GRADE_MAX_SAMPLES", 10_000)
+_GRADE_MAX_SAMPLES = _config_int("VIZ_GRADE_MAX_SAMPLES", 100_000)
 _GRADE_MAX_PROMPT_LEN = _config_int("VIZ_GRADE_MAX_PROMPT_LEN", 10_000)
-_GRADE_MAX_PARALLEL = _config_int("VIZ_GRADE_MAX_PARALLEL", 25)
+_GRADE_MAX_PARALLEL = _config_int("VIZ_GRADE_MAX_PARALLEL", 500)
 _GRADE_MAX_TOKENS = _config_int("VIZ_GRADE_MAX_TOKENS", 128_000)
 _GRADE_DEFAULT_MAX_TOKENS = max(1, min(_config_int("VIZ_GRADE_DEFAULT_MAX_TOKENS", 32_768), _GRADE_MAX_TOKENS))
 _GRADE_MAX_ATTEMPTS = _config_int("VIZ_GRADE_MAX_ATTEMPTS", 5)
 _GRADE_MAX_QUOTE_RETRIES = _config_int("VIZ_GRADE_MAX_QUOTE_RETRIES", 2, minimum=0)
 _GRADE_RATE_LIMIT_MAX = _config_int("VIZ_GRADE_RATE_LIMIT_MAX", 20)
 _GRADE_RATE_LIMIT_WINDOW = _config_int("VIZ_GRADE_RATE_LIMIT_WINDOW_SECONDS", 60)
-_GLOBAL_GRADING_SEM = asyncio.Semaphore(_config_int("VIZ_GRADE_GLOBAL_CONCURRENCY", 50))
+_GLOBAL_GRADING_SEM = asyncio.Semaphore(_config_int("VIZ_GRADE_GLOBAL_CONCURRENCY", 500))
 
 class GradeRequest(BaseModel):
     """Request to grade samples."""
@@ -851,8 +881,32 @@ def _reset_s3_client():
 
 
 # --- File loading cache ---
-_file_cache: Dict[str, tuple] = {}  # path_str -> (mtime, data)
+_file_cache: Dict[str, tuple] = {}  # key -> (validator, data, nbytes); validator is mtime (local) or ETag (S3)
 _FILE_CACHE_MAX = 20
+# Byte budget measured in RAW file bytes (parsed Python objects are larger,
+# but raw size is proportional and free to obtain). Without this, 20 entries
+# of up to MAX_FILE_SIZE each can exceed available memory.
+_FILE_CACHE_MAX_BYTES = _config_int("VIZ_FILE_CACHE_MB", 4096) * 1024 * 1024
+# Loaders run concurrently in threadpools (batch endpoint uses up to 10
+# workers); insert+evict must be atomic or the eviction loop's iteration
+# races concurrent inserts (RuntimeError: dict changed size during iteration).
+_file_cache_lock = _threading.Lock()
+
+
+def _cache_put(key: str, validator: Any, data: Any, nbytes: int) -> None:
+    """Insert into the file cache, evicting oldest-inserted entries until both
+    the entry-count cap and the byte budget hold. The newest entry is always
+    kept, even when it alone exceeds the budget — evicting it would only force
+    the next request to re-read the same file."""
+    with _file_cache_lock:
+        if key in _file_cache:
+            del _file_cache[key]  # re-insert at the back of the FIFO order
+        _file_cache[key] = (validator, data, nbytes)
+        while len(_file_cache) > 1 and (
+            len(_file_cache) > _FILE_CACHE_MAX
+            or sum(entry[2] for entry in _file_cache.values()) > _FILE_CACHE_MAX_BYTES
+        ):
+            del _file_cache[next(iter(_file_cache))]
 
 
 def _clear_file_cache():
@@ -893,9 +947,11 @@ def load_jsonl_from_file(file_path: str) -> List[Dict[str, Any]]:
     if stat.st_size > MAX_FILE_SIZE:
         raise ValueError(f"File too large ({stat.st_size // (1024*1024)}MB, max {MAX_FILE_SIZE // (1024*1024)}MB)")
 
-    # Check cache
-    if path_str in _file_cache:
-        cached_mtime, cached_data = _file_cache[path_str]
+    # Check cache (single .get() is atomic under the GIL — a membership check
+    # followed by a separate read could straddle a concurrent eviction)
+    cached = _file_cache.get(path_str)
+    if cached is not None:
+        cached_mtime, cached_data, _ = cached
         if cached_mtime == current_mtime:
             return cached_data
 
@@ -907,12 +963,7 @@ def load_jsonl_from_file(file_path: str) -> List[Dict[str, Any]]:
             if line:
                 samples.append(orjson.loads(line))
 
-    # FIFO eviction
-    if len(_file_cache) >= _FILE_CACHE_MAX:
-        oldest_key = next(iter(_file_cache))
-        del _file_cache[oldest_key]
-
-    _file_cache[path_str] = (current_mtime, samples)
+    _cache_put(path_str, current_mtime, samples, stat.st_size)
     return samples
 
 
@@ -961,9 +1012,10 @@ def load_jsonl_from_s3(bucket: str, key: str) -> List[Dict[str, Any]]:
     s3_client = _get_s3_client()
 
     # Only check ETag if we have a cached version to compare against
-    if cache_key in _file_cache:
+    cached = _file_cache.get(cache_key)
+    if cached is not None:
         current_etag = _get_s3_etag(bucket, key)
-        cached_etag, cached_data = _file_cache[cache_key]
+        cached_etag, cached_data, _ = cached
         if cached_etag == current_etag:
             return cached_data
 
@@ -987,12 +1039,7 @@ def load_jsonl_from_s3(bucket: str, key: str) -> List[Dict[str, Any]]:
         if line:
             samples.append(orjson.loads(line))
 
-    # FIFO eviction
-    if len(_file_cache) >= _FILE_CACHE_MAX:
-        oldest_key = next(iter(_file_cache))
-        del _file_cache[oldest_key]
-
-    _file_cache[cache_key] = (etag, samples)
+    _cache_put(cache_key, etag, samples, size)
     return samples
 
 
@@ -1121,6 +1168,16 @@ def list_local_contents(directory: str) -> Dict[str, List[Dict[str, Any]]]:
 async def health_check():
     """Health check endpoint."""
     return {"status": "ok"}
+
+
+@app.get("/api/config")
+async def server_config():
+    """Non-secret cross-app wiring for the frontend.
+
+    web_chat_base_url enables the "Open in web_chat" action on samples that
+    carry a chat_id; unset (null) hides the action entirely."""
+    web_chat_base = (_env_config.get("WEB_CHAT_BASE_URL") or "").strip().rstrip("/")
+    return {"web_chat_base_url": web_chat_base or None}
 
 
 @app.post("/api/debug/clear-cache")
@@ -1261,6 +1318,7 @@ def _load_samples_sync(file: str, metadata_only: bool = False) -> dict:
             "attributes": filled_attrs,
             "timestamp": raw.get('timestamp', ''),
             "grades": grades,
+            "diagnostics": raw.get('diagnostics'),
             "raw_messages": [] if metadata_only else raw.get('raw_messages'),
             "raw_jsonl_entry": None if metadata_only else raw,
         })
@@ -1377,8 +1435,9 @@ def _load_samples_batch_sync(files: List[str], metadata_only: bool = False) -> d
                     a_bucket, a_key = ap.split("/", 1)
                     _validate_s3_bucket(a_bucket)
                     ck = f"s3://{a_bucket}/{a_key}"
-                    if ck in _file_cache:
-                        cached_etag, cached_data = _file_cache[ck]
+                    cached = _file_cache.get(ck)
+                    if cached is not None:
+                        cached_etag, cached_data, _ = cached
                         curr_etag = _get_s3_etag(a_bucket, a_key)
                         if cached_etag == curr_etag:
                             s3_meta[idx] = {"cached": True, "data": cached_data, "has_grades": has_grades}
@@ -1475,10 +1534,7 @@ def _load_samples_batch_sync(files: List[str], metadata_only: bool = False) -> d
                     # Cache with ETag
                     etag = meta.get("etag", "")
                     cache_key = f"s3://{meta['bucket']}/{meta['key']}"
-                    if len(_file_cache) >= _FILE_CACHE_MAX:
-                        oldest_key = next(iter(_file_cache))
-                        del _file_cache[oldest_key]
-                    _file_cache[cache_key] = (etag, raw_samples)
+                    _cache_put(cache_key, etag, raw_samples, meta.get("size", 0))
                 else:
                     per_file_data[idx] = None
                     continue
@@ -1517,6 +1573,7 @@ def _load_samples_batch_sync(files: List[str], metadata_only: bool = False) -> d
                         "message_count": len(messages),
                         "attributes": filled_attrs, "timestamp": raw.get('timestamp', ''),
                         "grades": grades,
+                        "diagnostics": raw.get('diagnostics'),
                         "raw_messages": [] if metadata_only else raw.get('raw_messages'),
                         "raw_jsonl_entry": None if metadata_only else raw,
                     })
@@ -1548,12 +1605,32 @@ def _load_samples_batch_sync(files: List[str], metadata_only: bool = False) -> d
     file_results = []
     experiment_names_set: set = set()
     next_id = 0
+    total_raw_bytes = 0
+
+    def _cached_raw_bytes(fp: str) -> int:
+        """Raw byte size of a just-loaded file, read from the cache entry the
+        load created (viz/ overlay path preferred — that's what was read).
+        Lets the frontend size-gate bulk hydration: 767 long agentic rollouts
+        can weigh 400MB+, which a sample-count threshold alone misses."""
+        for candidate in (get_viz_path(fp), fp):
+            if candidate.startswith("s3://"):
+                cache_key = candidate
+            else:
+                try:
+                    cache_key = str(_safe_resolve_path(candidate))
+                except ValueError:
+                    continue
+            entry = _file_cache.get(cache_key)
+            if entry is not None:
+                return entry[2]
+        return 0
 
     for idx, file_path in enumerate(files):
         data = per_file_data[idx]
         if data is None:
             file_results.append({"file": file_path, "count": 0, "error": True})
             continue
+        total_raw_bytes += _cached_raw_bytes(file_path)
 
         exp_name = data.get("experiment_name", "unknown")
         if exp_name and exp_name != "unknown":
@@ -1576,6 +1653,7 @@ def _load_samples_batch_sync(files: List[str], metadata_only: bool = False) -> d
         "file_results": file_results,
         "experiment_names": sorted(experiment_names_set),
         "errors": errors,
+        "total_raw_bytes": total_raw_bytes,
     }
 
 
@@ -1661,6 +1739,7 @@ def _load_single_sample_sync(file: str, sample_id: int) -> dict:
         "attributes": filled_attrs,
         "timestamp": raw.get('timestamp', ''),
         "grades": raw.get('grades', None),
+        "diagnostics": raw.get('diagnostics'),
         "raw_messages": raw.get('raw_messages'),
         "raw_jsonl_entry": raw,
     }
@@ -2139,7 +2218,14 @@ async def grade_samples(request: GradeRequest, http_request: Request):
 
 @app.post("/api/grade-stream")
 async def grade_samples_stream(request: GradeRequest, http_request: Request):
-    """Grade samples using an LLM provider with SSE streaming progress."""
+    """Start a persistent grading job and stream its progress (SSE).
+
+    The grading work runs as a detached background task owned by the job
+    registry, so a client disconnect (e.g. a page reload) does NOT stop it.
+    Grades flush to viz/ incrementally, and a reloaded page can reattach via
+    GET /api/grade-jobs/{job_id}/stream. An in-flight job does not survive a
+    backend restart, but grades already written to viz/ do.
+    """
     _prepare_grade_request(request)
     _enforce_window_rate_limit(
         "grade-stream",
@@ -2147,33 +2233,37 @@ async def grade_samples_stream(request: GradeRequest, http_request: Request):
         max_requests=_GRADE_RATE_LIMIT_MAX,
         window_seconds=_GRADE_RATE_LIMIT_WINDOW,
     )
-    import time
+    prefix = _grade_log_prefix("SSE")
 
-    async def generate_events():
-        start_time = time.time()
-        prefix = _grade_log_prefix("SSE")
+    async def generate():
+        # Key resolution, sample loading, provider build and job creation happen
+        # here so any failure is surfaced as an SSE 'error' event (the contract
+        # clients rely on), not an HTTP error mid-handshake.
         try:
             _log_grading_start(prefix, request)
-            
-            # Get API key - use provided key or authenticated server configuration.
             api_key = _resolve_llm_api_key(request.provider, request.api_key, http_request)
 
-            # Load the samples (check viz/ version first, same as GET /api/samples)
+            # One active job per file: if one is already running, tell the client
+            # the existing job_id so it can reattach instead of double-grading.
+            lock_key = _grade_lock_key(request.file_path)
+            async with _GRADE_JOBS_LOCK:
+                existing_id = _GRADE_JOBS_BY_FILE.get(lock_key)
+                if existing_id and existing_id in _GRADE_JOBS and _GRADE_JOBS[existing_id].status == "running":
+                    yield f"data: {json.dumps({'type': 'error', 'message': 'A grading job is already running for this file.', 'job_id': existing_id})}\n\n"
+                    return
+
             actual_path = request.file_path
             viz_path = get_viz_path(request.file_path)
             if await asyncio.to_thread(viz_file_exists, viz_path):
                 actual_path = viz_path
-
             if actual_path.startswith("s3://"):
                 s3_path = actual_path[5:]
                 bucket, key = s3_path.split("/", 1)
                 raw_samples = await asyncio.to_thread(load_jsonl_from_s3, bucket, key)
             else:
                 raw_samples = await asyncio.to_thread(load_jsonl_from_file, actual_path)
-
             print(f"{prefix} loaded {len(raw_samples)} samples from {actual_path}, grading IDs: {request.sample_ids[:5]}{'...' if len(request.sample_ids) > 5 else ''}")
 
-            # Get the LLM provider with advanced settings
             provider = get_provider(
                 request.provider,
                 api_key,
@@ -2187,213 +2277,440 @@ async def grade_samples_stream(request: GradeRequest, http_request: Request):
                 reasoning_effort=request.reasoning_effort,
             )
 
-            total_samples = len(request.sample_ids)
-            completed = 0
-            grades: Dict[int, dict] = {}
-            errors: List[Dict[str, Any]] = []
+            job_id = secrets.token_hex(8)
+            job = GradeJob(job_id, request, raw_samples, provider, prefix)
+            async with _GRADE_JOBS_LOCK:
+                _GRADE_JOBS[job_id] = job
+                _GRADE_JOBS_BY_FILE[lock_key] = job_id
+                _evict_finished_jobs()
+            # Subscribe BEFORE starting the task so this stream cannot miss events.
+            listener = _subscribe(job)
+            job.task = asyncio.create_task(_run_grade_job(job))
 
-            # Send initial progress
-            yield f"data: {json.dumps({'type': 'progress', 'completed': 0, 'total': total_samples})}\n\n"
-
-            async def grade_one(sample_id: int) -> tuple:
-                if sample_id < 0 or sample_id >= len(raw_samples):
-                    return sample_id, None, f"Sample {sample_id} not found"
-                
-                raw = raw_samples[sample_id]
-                messages = raw.get('messages', [])
-                
-                try:
-                    context_token = set_grading_log_context({"prefix": prefix, "sample_id": sample_id})
-                    try:
-                        result = await provider.grade_sample(
-                            messages=messages,
-                            metric_prompt=request.metric_prompt,
-                            grade_type=request.grade_type,
-                            require_quotes=request.require_quotes,
-                            is_quote_retry=False,
-                        )
-                    finally:
-                        reset_grading_log_context(context_token)
-
-                    # Provider owns quote handling; an empty-quote grade is saved.
-                    grade_entry = {
-                        "grade": result.grade,
-                        "grade_type": result.grade_type,
-                        "quotes": [q.model_dump() for q in result.quotes],
-                        "explanation": result.explanation,
-                        "model": result.model,
-                        "prompt_version": result.prompt_version,
-                        "timestamp": result.timestamp,
-                    }
-                    return sample_id, grade_entry, None
-                except Exception as e:
-                    return sample_id, None, _safe_error_detail(e, expose=True)
-            
-            batch_size = min(request.parallel_size, _GRADE_MAX_PARALLEL)
-            sem = asyncio.Semaphore(batch_size)
-
-            async def grade_with_limit(sample_id: int) -> tuple:
-                async with _GLOBAL_GRADING_SEM:
-                    async with sem:
-                        return await grade_one(sample_id)
-
-            last_progress_update = 0
-            progress_interval = max(1, total_samples // 20)  # Update ~20 times during grading
-
-            result_queue: asyncio.Queue[tuple[int, Optional[dict], Optional[str]]] = asyncio.Queue()
-            sample_iter = iter(request.sample_ids)
-            sample_iter_lock = asyncio.Lock()
-            worker_count = min(batch_size, total_samples)
-
-            async def next_sample_id() -> Optional[int]:
-                async with sample_iter_lock:
-                    return next(sample_iter, None)
-
-            async def worker() -> None:
-                while True:
-                    sample_id = await next_sample_id()
-                    if sample_id is None:
-                        return
-                    await result_queue.put(await grade_with_limit(sample_id))
-
-            workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
-
+            yield f"data: {json.dumps({'type': 'started', 'job_id': job_id, 'total': job.total})}\n\n"
             try:
-                while completed < total_samples:
-                    sample_id, grade_entry, error = await result_queue.get()
-                    completed += 1
-
-                    if error:
-                        errors.append({"sample_id": sample_id, "error": error})
-                        print(f"{prefix} sample={sample_id} error: {error}")
-                    elif grade_entry:
-                        grades[sample_id] = grade_entry
-
-                    # Send progress update periodically (not on every single completion)
-                    if completed - last_progress_update >= progress_interval or completed == total_samples:
-                        yield f"data: {json.dumps({'type': 'progress', 'completed': completed, 'total': total_samples})}\n\n"
-                        last_progress_update = completed
+                while True:
+                    try:
+                        ev = await asyncio.wait_for(listener.get(), timeout=15)
+                    except asyncio.TimeoutError:
+                        yield ": keepalive\n\n"
+                        continue
+                    if ev.get("type") == "__end__":
+                        return
+                    yield f"data: {json.dumps(ev)}\n\n"
             finally:
-                for worker_task in workers:
-                    if not worker_task.done():
-                        worker_task.cancel()
-                await asyncio.gather(*workers, return_exceptions=True)
-            
-            # Send final result
-            total_time = time.time() - start_time
-            print(f"{prefix} complete: {len(grades)} graded, {len(errors)} errors in {total_time:.2f}s ({total_time/max(1,len(request.sample_ids)):.2f}s per sample)")
-            failure_ratio = (len(errors) / total_samples) if total_samples else 0.0
-            complete_event = {
-                "type": "complete",
-                "graded_count": len(grades),
-                "errors": errors,
-                "grades": grades,
-                "failure_ratio": failure_ratio,
-                "severity": "warning" if failure_ratio > 0.5 else "ok",
-            }
-            yield f"data: {json.dumps(complete_event)}\n\n"
-            
+                _unsubscribe(job, listener)
         except Exception as e:
-            total_time = time.time() - start_time
-            print(f"{prefix} error after {total_time:.2f}s: {str(e)}")
             yield f"data: {json.dumps({'type': 'error', 'message': _safe_error_detail(e, expose=True)})}\n\n"
-    
+
     return StreamingResponse(
-        generate_events(),
+        generate(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
-        }
+        },
     )
-
-
 _save_locks: Dict[str, asyncio.Lock] = {}
 
 
-@app.post("/api/save-graded")
-async def save_graded_samples(request: SaveGradedRequest):
-    """Save graded samples to the viz/ subdirectory.
-    
-    This merges new grades with any existing grades in the viz/ file.
-    Uses a per-file lock to prevent concurrent writes from clobbering each other.
-    """
-    try:
-        lock_key = (
-            str(_safe_resolve_path(request.file_path))
-            if not request.file_path.startswith("s3://")
-            else request.file_path
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=_safe_error_detail(e, expose=True))
+def _grade_lock_key(file_path: str) -> str:
+    """Stable per-file key shared by the save lock and the job registry."""
+    if file_path.startswith("s3://"):
+        return file_path
+    return str(_safe_resolve_path(file_path))
 
+
+def _merge_grades_into_samples(
+    raw_samples: List[Dict[str, Any]],
+    grades: Dict[Any, Dict[str, Any]],
+) -> int:
+    """Append each {sample_id -> {metric -> grade_entry}} into sample['grades'].
+
+    Copy-on-write per touched sample; append semantics (never overwrites prior
+    grades). Returns the number of samples updated.
+    """
+    samples_updated = 0
+    for sample_id_str, metric_grades in grades.items():
+        sample_id = int(sample_id_str)
+        if sample_id < 0 or sample_id >= len(raw_samples):
+            continue
+        sample = copy.deepcopy(raw_samples[sample_id])
+        raw_samples[sample_id] = sample
+        if 'grades' not in sample:
+            sample['grades'] = {}
+        for metric_name, grade_entry in metric_grades.items():
+            if metric_name not in sample['grades']:
+                sample['grades'][metric_name] = []
+            if isinstance(grade_entry, dict):
+                sample['grades'][metric_name].append(grade_entry)
+            else:
+                sample['grades'][metric_name].append(grade_entry.model_dump())
+        samples_updated += 1
+    return samples_updated
+
+
+async def _save_grades_for_file(file_path: str, grades: Dict[Any, Dict[str, Any]]) -> int:
+    """Merge grades into viz/<file>.jsonl under the per-file lock (atomic write).
+
+    Shared by POST /api/save-graded and the background grading writer so the two
+    can never interleave writes to the same file.
+    """
+    lock_key = _grade_lock_key(file_path)
     if len(_save_locks) >= _MAX_SAVE_LOCKS:
         oldest_key = next(iter(_save_locks))
         del _save_locks[oldest_key]
     lock = _save_locks.setdefault(lock_key, asyncio.Lock())
 
     async with lock:
+        viz_path = get_viz_path(file_path)
+        if await asyncio.to_thread(viz_file_exists, viz_path):
+            source_path = viz_path
+        else:
+            source_path = file_path
+
+        if source_path.startswith("s3://"):
+            s3_path = source_path[5:]
+            bucket, key = s3_path.split("/", 1)
+            raw_samples = await asyncio.to_thread(load_jsonl_from_s3, bucket, key)
+        else:
+            raw_samples = await asyncio.to_thread(load_jsonl_from_file, source_path)
+
+        raw_samples = list(raw_samples)
+        samples_updated = _merge_grades_into_samples(raw_samples, grades)
+
+        if viz_path.startswith("s3://"):
+            s3_path = viz_path[5:]
+            bucket, key = s3_path.split("/", 1)
+            await asyncio.to_thread(save_jsonl_to_s3, bucket, key, raw_samples)
+        else:
+            await asyncio.to_thread(save_jsonl_to_file, viz_path, raw_samples)
+        return samples_updated
+
+
+@app.post("/api/save-graded")
+async def save_graded_samples(request: SaveGradedRequest):
+    """Merge new grades into viz/<file>.jsonl (per-file locked, append semantics)."""
+    try:
+        _grade_lock_key(request.file_path)  # validate/resolve path early
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=_safe_error_detail(e, expose=True))
+    try:
+        samples_updated = await _save_grades_for_file(request.file_path, request.grades)
+        return {"success": True, "samples_updated": samples_updated}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=_safe_error_detail(e, expose=True))
+
+
+# --- Persistent grading jobs ------------------------------------------------
+# A grading job runs as a detached background task so it survives client
+# disconnects (page reloads). Grades flush to viz/ incrementally; the SSE
+# request and any reattach stream are thin readers over the job's event fan-out.
+# A page reload is fully supported; an in-flight job does NOT survive a backend
+# restart (grades already flushed to viz/ do).
+
+_FLUSH_EVERY_N = _config_int("VIZ_GRADE_FLUSH_EVERY_N", 25)
+_FLUSH_EVERY_S = _config_int("VIZ_GRADE_FLUSH_EVERY_SECONDS", 10)
+_MAX_FINISHED_JOBS = _config_int("VIZ_GRADE_MAX_FINISHED_JOBS", 50)
+
+
+class GradeJob:
+    def __init__(self, job_id, request, raw_samples, provider, prefix):
+        self.job_id = job_id
+        self.request = request
+        self.file_path = request.file_path
+        self.metric_name = request.metric_name
+        self.grade_type = request.grade_type
+        self.sample_ids = list(request.sample_ids)
+        self.total = len(self.sample_ids)
+        self.raw_samples = raw_samples
+        self.provider = provider
+        self.prefix = prefix
+        self.completed = 0
+        self.grades: Dict[int, dict] = {}
+        self.saved_ids: set = set()
+        self.errors: List[Dict[str, Any]] = []
+        self.status = "running"
+        self.error_message: Optional[str] = None
+        self.created_at = time.time()
+        self.finished_at: Optional[float] = None
+        self.last_flush = 0.0
+        self.flush_error: Optional[str] = None
+        self.task: Optional[asyncio.Task] = None
+        self.cancel_requested = False
+        self.event_seq = 0
+        self._listeners: List[asyncio.Queue] = []
+
+
+_GRADE_JOBS: Dict[str, "GradeJob"] = {}
+_GRADE_JOBS_BY_FILE: Dict[str, str] = {}
+_GRADE_JOBS_LOCK = asyncio.Lock()
+
+
+def _evict_finished_jobs() -> None:
+    finished = [jid for jid, j in _GRADE_JOBS.items() if j.finished_at is not None]
+    while len(finished) > _MAX_FINISHED_JOBS:
+        _GRADE_JOBS.pop(finished.pop(0), None)
+
+
+def _emit(job: "GradeJob", event: dict) -> None:
+    job.event_seq += 1
+    event = {**event, "seq": job.event_seq}
+    for q in list(job._listeners):
         try:
-            original_path = request.file_path
-            viz_path = get_viz_path(original_path)
+            q.put_nowait(event)
+        except Exception:
+            pass
 
-            if viz_file_exists(viz_path):
-                source_path = viz_path
-            else:
-                source_path = original_path
 
-            if source_path.startswith("s3://"):
-                s3_path = source_path[5:]
-                bucket, key = s3_path.split("/", 1)
-                raw_samples = load_jsonl_from_s3(bucket, key)
-            else:
-                raw_samples = load_jsonl_from_file(source_path)
+def _subscribe(job: "GradeJob") -> asyncio.Queue:
+    q: asyncio.Queue = asyncio.Queue()
+    job._listeners.append(q)
+    return q
 
-            raw_samples = list(raw_samples)
-            samples_updated = 0
 
-            for sample_id_str, metric_grades in request.grades.items():
-                sample_id = int(sample_id_str)
-                if sample_id < 0 or sample_id >= len(raw_samples):
-                    continue
+def _unsubscribe(job: "GradeJob", q: asyncio.Queue) -> None:
+    try:
+        job._listeners.remove(q)
+    except ValueError:
+        pass
 
-                sample = copy.deepcopy(raw_samples[sample_id])
-                raw_samples[sample_id] = sample
 
-                if 'grades' not in sample:
-                    sample['grades'] = {}
+def _job_info(job: "GradeJob") -> dict:
+    return {
+        "job_id": job.job_id,
+        "file_path": job.file_path,
+        "metric_name": job.metric_name,
+        "status": job.status,
+        "completed": job.completed,
+        "total": job.total,
+        "errors_count": len(job.errors),
+        "created_at": job.created_at,
+    }
 
-                for metric_name, grade_entry in metric_grades.items():
-                    if metric_name not in sample['grades']:
-                        sample['grades'][metric_name] = []
 
-                    if isinstance(grade_entry, dict):
-                        sample['grades'][metric_name].append(grade_entry)
-                    else:
-                        sample['grades'][metric_name].append(grade_entry.model_dump())
+def _terminal_event(job: "GradeJob") -> dict:
+    if job.status == "error":
+        return {"type": "error", "message": job.error_message or "Grading failed", "job_id": job.job_id}
+    failure_ratio = (len(job.errors) / job.total) if job.total else 0.0
+    return {
+        "type": "complete",
+        "job_id": job.job_id,
+        "status": job.status,
+        "graded_count": len(job.grades),
+        "completed": job.completed,
+        "total": job.total,
+        "errors": job.errors,
+        "failure_ratio": failure_ratio,
+        "severity": "warning" if failure_ratio > 0.5 else "ok",
+    }
 
-                samples_updated += 1
 
-            if viz_path.startswith("s3://"):
-                s3_path = viz_path[5:]
-                bucket, key = s3_path.split("/", 1)
-                save_jsonl_to_s3(bucket, key, raw_samples)
-            else:
-                save_jsonl_to_file(viz_path, raw_samples)
+async def _flush_job_grades(job: "GradeJob", *, force: bool = False) -> None:
+    """Flush newly-completed grades to viz/ in batches (count- or time-triggered)."""
+    pending_ids = [sid for sid in job.grades if sid not in job.saved_ids]
+    if not pending_ids:
+        return
+    if (not force and len(pending_ids) < _FLUSH_EVERY_N
+            and (time.monotonic() - job.last_flush) < _FLUSH_EVERY_S):
+        return
+    payload = {str(sid): {job.metric_name: job.grades[sid]} for sid in pending_ids}
+    try:
+        await _save_grades_for_file(job.file_path, payload)
+        job.saved_ids.update(pending_ids)
+        job.last_flush = time.monotonic()
+        job.flush_error = None
+    except Exception as e:
+        # Keep the job alive; unsaved ids retry on the next flush tick.
+        job.flush_error = _safe_error_detail(e, expose=True)
+        print(f"{job.prefix} flush error: {job.flush_error}")
 
-            return {
-                "success": True,
-                "samples_updated": samples_updated,
+
+async def _run_grade_job(job: "GradeJob") -> None:
+    request = job.request
+    raw_samples = job.raw_samples
+    provider = job.provider
+    prefix = job.prefix
+    start_time = time.time()
+    job.last_flush = time.monotonic()
+
+    async def grade_one(sample_id: int) -> tuple:
+        if sample_id < 0 or sample_id >= len(raw_samples):
+            return sample_id, None, f"Sample {sample_id} not found"
+        raw = raw_samples[sample_id]
+        messages = raw.get('messages', [])
+        try:
+            context_token = set_grading_log_context({"prefix": prefix, "sample_id": sample_id})
+            try:
+                result = await provider.grade_sample(
+                    messages=messages,
+                    metric_prompt=request.metric_prompt,
+                    grade_type=request.grade_type,
+                    require_quotes=request.require_quotes,
+                    is_quote_retry=False,
+                )
+            finally:
+                reset_grading_log_context(context_token)
+            grade_entry = {
+                "grade": result.grade,
+                "grade_type": result.grade_type,
+                "quotes": [q.model_dump() for q in result.quotes],
+                "explanation": result.explanation,
+                "model": result.model,
+                "prompt_version": result.prompt_version,
+                "timestamp": result.timestamp,
             }
-
-        except HTTPException:
-            raise
+            return sample_id, grade_entry, None
         except Exception as e:
-            raise HTTPException(status_code=500, detail=_safe_error_detail(e, expose=True))
+            return sample_id, None, _safe_error_detail(e, expose=True)
 
+    batch_size = min(request.parallel_size, _GRADE_MAX_PARALLEL)
+    sem = asyncio.Semaphore(batch_size)
+
+    async def grade_with_limit(sample_id: int) -> tuple:
+        async with _GLOBAL_GRADING_SEM:
+            async with sem:
+                return await grade_one(sample_id)
+
+    result_queue: asyncio.Queue = asyncio.Queue()
+    sample_iter = iter(job.sample_ids)
+    sample_iter_lock = asyncio.Lock()
+    worker_count = max(1, min(batch_size, job.total))
+
+    async def next_sample_id() -> Optional[int]:
+        async with sample_iter_lock:
+            return next(sample_iter, None)
+
+    async def worker() -> None:
+        while True:
+            if job.cancel_requested:
+                return
+            sample_id = await next_sample_id()
+            if sample_id is None:
+                return
+            await result_queue.put(await grade_with_limit(sample_id))
+
+    workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
+    try:
+        while job.completed < job.total and not job.cancel_requested:
+            try:
+                sample_id, grade_entry, error = await asyncio.wait_for(result_queue.get(), timeout=2.0)
+            except asyncio.TimeoutError:
+                await _flush_job_grades(job)  # time-based flush during slow stretches
+                continue
+            job.completed += 1
+            if error:
+                job.errors.append({"sample_id": sample_id, "error": error})
+                print(f"{prefix} sample={sample_id} error: {error}")
+            elif grade_entry:
+                job.grades[sample_id] = grade_entry
+            _emit(job, {
+                "type": "progress",
+                "completed": job.completed,
+                "total": job.total,
+                "errors": len(job.errors),
+                "flush_error": job.flush_error,
+            })
+            await _flush_job_grades(job)
+
+        await _flush_job_grades(job, force=True)
+        job.status = "cancelled" if (job.cancel_requested and job.completed < job.total) else "complete"
+    except Exception as e:
+        job.status = "error"
+        job.error_message = _safe_error_detail(e, expose=True)
+        try:
+            await _flush_job_grades(job, force=True)
+        except Exception:
+            pass
+        print(f"{prefix} job error: {job.error_message}")
+    finally:
+        for w in workers:
+            if not w.done():
+                w.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        job.finished_at = time.time()
+        total_time = job.finished_at - start_time
+        print(f"{prefix} job {job.status}: {len(job.grades)} graded, {len(job.errors)} errors in {total_time:.2f}s")
+        _emit(job, _terminal_event(job))
+        _emit(job, {"type": "__end__"})
+        async with _GRADE_JOBS_LOCK:
+            file_key = _grade_lock_key(job.file_path)
+            if _GRADE_JOBS_BY_FILE.get(file_key) == job.job_id:
+                _GRADE_JOBS_BY_FILE.pop(file_key, None)
+            _evict_finished_jobs()
+
+
+async def _tail_job_sse(job: "GradeJob", snapshot: bool):
+    """Yield SSE chunks for a job: optional state snapshot, then live events.
+
+    A disconnecting reader just unsubscribes; the job is untouched. A 15s
+    heartbeat comment keeps the connection alive through proxies/tunnels.
+    """
+    q = _subscribe(job)
+    try:
+        if snapshot:
+            snap = {
+                "type": "snapshot",
+                "job_id": job.job_id,
+                "completed": job.completed,
+                "total": job.total,
+                "errors": len(job.errors),
+                "status": job.status,
+                "flush_error": job.flush_error,
+            }
+            yield f"data: {json.dumps(snap)}\n\n"
+            if job.status != "running":
+                yield f"data: {json.dumps(_terminal_event(job))}\n\n"
+                return
+        while True:
+            try:
+                ev = await asyncio.wait_for(q.get(), timeout=15)
+            except asyncio.TimeoutError:
+                yield ": keepalive\n\n"
+                continue
+            if ev.get("type") == "__end__":
+                return
+            yield f"data: {json.dumps(ev)}\n\n"
+    finally:
+        _unsubscribe(job, q)
+
+
+@app.get("/api/grade-jobs")
+async def list_grade_jobs():
+    """List active and recently-finished grading jobs (for reattach on reload)."""
+    return [_job_info(j) for j in _GRADE_JOBS.values()]
+
+
+@app.get("/api/grade-jobs/{job_id}/stream")
+async def grade_job_stream(job_id: str):
+    """Reattach to a job: a snapshot of current state, then live progress (SSE)."""
+    job = _GRADE_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return StreamingResponse(
+        _tail_job_sse(job, snapshot=True),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/api/grade-jobs/{job_id}/cancel")
+async def cancel_grade_job(job_id: str):
+    """Cooperatively cancel a running job; already-flushed grades are kept."""
+    job = _GRADE_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job.cancel_requested = True
+    return {"cancelled": True, "job_id": job_id}
 
 def _frontend_response(full_path: str) -> FileResponse:
     """Serve the production frontend build without exposing dev source files."""
@@ -2565,6 +2882,33 @@ async def rollout_chat_stream(request: RolloutChatRequest, http_request: Request
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# Canonical single-rollout fetch API (GET /api/rollout). Lives in its own
+# module; imported here (bottom of the module, before the static-file
+# catch-all) so backend.main is fully initialized when fetch_api binds to it.
+from backend.fetch_api import router as _fetch_router  # noqa: E402
+app.include_router(_fetch_router)
+
+# Library landing-page API (GET /api/library, GET /api/library/preview).
+from backend.library_api import router as _library_router  # noqa: E402
+app.include_router(_library_router)
+
+# Companion files (plan.md / summary.json / execution.jsonl next to a loaded
+# rollout file) + the raw-file reader behind the "Run files" drawer.
+from backend.companion_api import router as _companion_router  # noqa: E402
+app.include_router(_companion_router)
+
+
+@app.on_event("startup")
+async def _warm_library_cache():
+    """Kick off the first Library scan in the background at boot so the
+    landing view never eats the ~90s cold listing (stale-while-revalidate
+    keeps it warm afterward). Tests are unaffected — httpx's ASGITransport
+    doesn't run lifespan events; set VIZ_LIBRARY_WARMUP=0 to disable."""
+    if _config_bool("VIZ_LIBRARY_WARMUP", True):
+        from backend import library_api
+        library_api._ensure_scan_task()
 
 
 @app.get("/", include_in_schema=False)
