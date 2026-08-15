@@ -277,31 +277,36 @@ export function NavigationBar({
             {/* Sample info */}
             <div className="flex items-center gap-2">
               <div className="flex items-center">
+                {/* Two lines, not four — the nav bar sits above every
+                    transcript and each stacked line is permanent vertical
+                    cost. Position and the diag pill ride inline. */}
                 <div className="flex flex-col items-center">
                   <span className={`text-xs font-medium whitespace-nowrap ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>
                     {experimentName || 'No experiment'}
                   </span>
-                  <span className={`text-sm font-medium whitespace-nowrap ${isDarkMode ? 'text-gray-200' : 'text-gray-700'}`}>
-                    {sample
-                      ? `sample ${sample.attributes.sample_index}, step ${sample.attributes.step}`
-                      : 'No sample selected'
-                    }
+                  <span className="flex items-center gap-2 whitespace-nowrap">
+                    <span className={`text-sm font-medium tnum ${isDarkMode ? 'text-gray-200' : 'text-gray-700'}`}>
+                      {sample
+                        ? `sample ${sample.attributes.sample_index}, step ${sample.attributes.step}`
+                        : 'No sample selected'
+                      }
+                    </span>
+                    {navPos >= 0 && (
+                      <span className={`text-xs tnum ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>
+                        · {navPos + 1} / {navTotal}
+                      </span>
+                    )}
+                    {(sample?.diagnostics?.length ?? 0) > 0 && (
+                      <span
+                        className={`text-[10px] uppercase tracking-wide font-semibold px-1.5 py-0.5 rounded-full cursor-help ${
+                          isDarkMode ? 'bg-amber-900/50 text-amber-300' : 'bg-amber-100 text-amber-800'
+                        }`}
+                        title={`Producer diagnostics:\n${sample!.diagnostics!.join('\n')}`}
+                      >
+                        diag
+                      </span>
+                    )}
                   </span>
-                  {navPos >= 0 && (
-                    <span className={`text-xs whitespace-nowrap ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>
-                      {navPos + 1} / {navTotal}
-                    </span>
-                  )}
-                  {(sample?.diagnostics?.length ?? 0) > 0 && (
-                    <span
-                      className={`text-[10px] uppercase tracking-wide font-semibold px-1.5 py-0.5 rounded-full whitespace-nowrap cursor-help ${
-                        isDarkMode ? 'bg-amber-900/50 text-amber-300' : 'bg-amber-100 text-amber-700'
-                      }`}
-                      title={`Producer diagnostics:\n${sample!.diagnostics!.join('\n')}`}
-                    >
-                      diag
-                    </span>
-                  )}
                 </div>
                 {!isSharedMode && (
                   <button

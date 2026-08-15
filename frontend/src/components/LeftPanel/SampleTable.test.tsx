@@ -86,7 +86,7 @@ describe('SampleTable', () => {
     render(<SampleTable {...defaultProps} samples={samples} />);
     const gradeEl = screen.getByText('0.85');
     // Positive grades use the app's teal identity (matches Analysis view)
-    expect(gradeEl.className).toContain('text-teal-700');
+    expect(gradeEl.className).toContain('text-teal-800');
   });
 
   it('applies red color for low grade', () => {

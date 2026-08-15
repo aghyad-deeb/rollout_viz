@@ -222,6 +222,8 @@ function MessageCardInner({
   // (measured in a layout effect) — short cards get no fade / button chrome.
   const [showFull, setShowFull] = useState(false);
   const [isClampOverflowing, setIsClampOverflowing] = useState(false);
+  // ~lines hidden behind the clamp (scroll overflow / 20px line boxes).
+  const [clampHiddenLines, setClampHiddenLines] = useState(0);
   const cardRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const popupRef = useRef<HTMLDivElement>(null);
@@ -481,10 +483,10 @@ function MessageCardInner({
   // wrote inline tool tags rather than message.tool_calls.
   const { reasoning, mainContent, toolCallText, toolCalls } = useMemo(
     () => normalizeAssistantMessage(message),
-    // normalizeAssistantMessage reads only these four fields of `message`;
+    // normalizeAssistantMessage reads only these five fields of `message`;
     // listing them (not `message`) avoids recompute on unrelated identity changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [message.role, message.content, message.content_parts, message.tool_calls],
+    [message.role, message.content, message.content_parts, message.tool_calls, message.reasoning],
   );
 
   const countGlobalSearchMatches = (text: string, isReasoning: boolean): number => {
@@ -561,14 +563,17 @@ function MessageCardInner({
   }
   const isClamped = isClampable && !showFull;
 
-  // Measure whether the clamped body actually overflows max-h-60, to decide
-  // whether the fade + "Show full message" chrome renders. clientHeight is 0
-  // in jsdom (and while the card is collapsed) — skip rather than misreport.
+  // Measure whether the clamped body actually overflows its max-h, to decide
+  // whether the fade + "Show full message" chrome renders — and how much is
+  // hidden, so the pill can say so before the user commits to expanding.
+  // clientHeight is 0 in jsdom (and while the card is collapsed) — skip
+  // rather than misreport.
   useLayoutEffect(() => {
     if (!isClamped) return;
     const el = contentRef.current;
     if (!el || el.clientHeight === 0) return;
     setIsClampOverflowing(el.scrollHeight > el.clientHeight);
+    setClampHiddenLines(Math.max(0, Math.round((el.scrollHeight - el.clientHeight) / 20)));
   }, [isClamped, isExpanded, message]);
 
   // Highlight compositor. Every strategy contributes ranges, then one
@@ -768,27 +773,35 @@ function MessageCardInner({
           r => r.kind === 'grade-quote' && r.start === segmentStart && r.sourceId,
         )?.sourceId;
         if (hasKind('grade-quote')) {
+          // Violet (bluer) family: judge evidence must never be mistakable
+          // for the user's own fuchsia ephemeral highlights.
           classes.push(
             startsKind('grade-quote') ? 'grade-quote-mark' : 'grade-quote-fragment',
-            'bg-purple-200', 'dark:bg-purple-900/50', 'text-purple-900',
-            'dark:text-purple-200', 'border-b-2', 'border-purple-400'
+            'bg-violet-200', 'dark:bg-violet-900/50', 'text-violet-900',
+            'dark:text-violet-200', 'border-b-2', 'border-violet-500', 'dark:border-violet-400'
           );
           titles.push('Quoted by LLM grader');
         }
         if (hasKind('local-search')) {
+          // Normal matches get a muted dark-mode fill (the light fills glow on
+          // dark cards); only the CURRENT match keeps the vivid beacon, minus
+          // the white ring-offset halo that is a light-mode leftover.
           classes.push(
             startsKind('local-search') ? 'local-search-mark' : 'local-search-fragment',
             ...(isCurrentKind('local-search')
-              ? ['bg-green-400', 'text-green-900', 'ring-2', 'ring-green-500', 'ring-offset-1']
-              : ['bg-green-200', 'text-green-800'])
+              ? ['bg-green-400', 'text-green-900', 'ring-2', 'ring-green-500', 'ring-offset-1', 'dark:ring-offset-0']
+              : ['bg-green-200', 'text-green-800', 'dark:bg-green-500/30', 'dark:text-green-200'])
           );
         }
         if (hasKind('global-search')) {
           classes.push(
             startsKind('global-search') ? 'global-search-highlight' : 'global-search-highlight-fragment',
             ...(isCurrentKind('global-search')
-              ? ['bg-orange-400', 'text-orange-950', 'ring-2', 'ring-orange-500', 'ring-offset-1']
-              : ['bg-yellow-300', 'text-yellow-900'])
+              ? ['bg-orange-400', 'text-orange-950', 'ring-2', 'ring-orange-500', 'ring-offset-1', 'dark:ring-offset-0']
+              // ring-yellow-600 gives the mark a defining edge inside gold
+              // assistant cards, where fill chroma alone is the weakest cue.
+              : ['bg-yellow-300', 'text-yellow-900', 'ring-1', 'ring-yellow-600/60',
+                 'dark:bg-yellow-500/30', 'dark:text-yellow-200', 'dark:ring-0'])
           );
         }
         if (hasKind('ephemeral-highlight')) {
@@ -1070,10 +1083,24 @@ function MessageCardInner({
   const presentationLabel = typeof message.presentationLabel === 'string'
     ? message.presentationLabel.trim()
     : '';
-  const fileLabel = message.role === 'file' && typeof message.name === 'string'
+  // A named tool result reads "bash" instead of the generic "tool" — same
+  // field and code path the file role already uses.
+  const fileLabel = (message.role === 'file' || message.role === 'tool') && typeof message.name === 'string'
     ? message.name.trim()
     : '';
   const headerLabel = presentationLabel || fileLabel || message.role;
+
+  // Collapsed cards show a one-line excerpt of what they hide — collapse-all
+  // becomes a table of contents instead of a column of mute role bars.
+  const collapsedExcerpt = useMemo(() => {
+    if (isExpanded) return null;
+    const source = (reasoning?.trim() || mainContent?.trim() || toolCallText?.trim() || '');
+    const firstLine = source.split('\n').find(l => l.trim())?.trim() ?? '';
+    if (!firstLine) return null;
+    const totalChars = (reasoning?.length ?? 0) + (mainContent?.length ?? 0) + (toolCallText?.length ?? 0);
+    const sizeHint = totalChars >= 1000 ? ` · ${(totalChars / 1000).toFixed(1)}k chars` : '';
+    return `${firstLine}${sizeHint}`;
+  }, [isExpanded, reasoning, mainContent, toolCallText]);
 
   return (
     <div
@@ -1088,10 +1115,25 @@ function MessageCardInner({
           {/* Header */}
           <div className={`shadow-xs ${config.headerClassName}`}>
             <div
-              className={`flex items-center justify-between pl-2 pr-1 py-1 cursor-pointer transition-colors duration-150 ${isDarkMode ? 'hover:bg-white/5' : 'hover:bg-gray-50/50'}`}
+              className={`flex items-center justify-between pl-3 pr-1 py-1 cursor-pointer transition-colors duration-150 ${isDarkMode ? 'hover:bg-white/5' : 'hover:bg-gray-50/50'}`}
               onClick={() => setIsExpanded(!isExpanded)}
             >
-              <div className="flex items-center gap-2">
+              {/* Icon + label lead at the card's shared left edge (chevron
+                  follows), so label and body text sit on one optical margin.
+                  The label is a 12px running head — body size then means
+                  exactly one thing: transcript text. */}
+              <div className="flex items-center gap-2 min-w-0 flex-1">
+                <span className={`text-xs font-semibold uppercase tracking-wide ${textSecondary}`}>
+                  {/* min-h (not fixed h) so in the scaled-up capture the
+                      header grows with the enlarged icon/label instead of
+                      staying cramped. */}
+                  <span className="flex items-center min-h-5 gap-1">
+                    <span className="material-symbols-outlined" style={{ fontSize: 20 }}>
+                      {config.icon}
+                    </span>
+                    {headerLabel}
+                  </span>
+                </span>
                 <button className="presentation-chrome" aria-label="Toggle message content">
                   <span
                     className={`material-symbols-outlined ${textMuted} transition-transform duration-200 p-2 -m-2 ${isExpanded ? '' : '-rotate-90'}`}
@@ -1101,18 +1143,11 @@ function MessageCardInner({
                     expand_less
                   </span>
                 </button>
-                <span className={`font-medium text-sm ${textSecondary}`}>
-                  {/* min-h (not fixed h) so in the scaled-up capture the
-                      header grows with the enlarged icon/label instead of
-                      staying cramped. On screen the content is 20px tall, so
-                      min-h-5 renders identically to the old h-5. */}
-                  <span className="flex items-center min-h-5 gap-1">
-                    <span className="material-symbols-outlined" style={{ fontSize: 20 }}>
-                      {config.icon}
-                    </span>
-                    {headerLabel}
+                {!isExpanded && collapsedExcerpt && (
+                  <span className={`truncate min-w-0 flex-1 text-left text-xs font-normal normal-case tracking-normal ${textMuted}`}>
+                    {collapsedExcerpt}
                   </span>
-                </span>
+                )}
               </div>
               {/* Action buttons — entirely presentation-chrome (excluded
                   from a captured image). */}
@@ -1131,7 +1166,7 @@ function MessageCardInner({
                 {isPresentationMode && (
                   <button
                     data-testid="preview-message-btn"
-                    className={`${actionBtn} transition-opacity ${isHovered ? 'opacity-100' : 'opacity-0'} focus-visible:opacity-100`}
+                    className={`${actionBtn} transition-opacity ${isHovered ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'} focus-visible:opacity-100 focus-visible:pointer-events-auto`}
                     title="Preview the capture image"
                     aria-label="Preview the capture image"
                     onClick={(e) => { e.stopPropagation(); previewThisCard(); }}
@@ -1142,7 +1177,7 @@ function MessageCardInner({
                 {isPresentationMode && (
                   <button
                     data-testid="capture-message-btn"
-                    className={`${actionBtn} transition-opacity ${isHovered || captureStatus ? 'opacity-100' : 'opacity-0'} focus-visible:opacity-100`}
+                    className={`${actionBtn} transition-opacity ${isHovered || captureStatus ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'} focus-visible:opacity-100 focus-visible:pointer-events-auto`}
                     title={captureTitle}
                     aria-label={captureTitle}
                     onClick={(e) => { e.stopPropagation(); captureThisCard(); }}
@@ -1151,7 +1186,7 @@ function MessageCardInner({
                   </button>
                 )}
                 <button
-                  className={`${actionBtn} relative transition-opacity ${isHovered || copiedLink ? 'opacity-100' : 'opacity-0'} focus-visible:opacity-100`}
+                  className={`${actionBtn} relative transition-opacity ${isHovered || copiedLink ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'} focus-visible:opacity-100 focus-visible:pointer-events-auto`}
                   title="Copy link to this message"
                   aria-label="Copy link to this message"
                   onClick={(e) => { e.stopPropagation(); copyMessageLink(); }}
@@ -1161,7 +1196,7 @@ function MessageCardInner({
                   </span>
                 </button>
                 <button
-                  className={`rounded-md w-6 h-6 focus:outline-none focus:ring-4 flex justify-center items-center transition-opacity ${isHovered || sharedMsg ? 'opacity-100' : 'opacity-0'} focus-visible:opacity-100 ${
+                  className={`rounded-md w-6 h-6 focus:outline-none focus:ring-4 flex justify-center items-center transition-opacity ${isHovered || sharedMsg ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'} focus-visible:opacity-100 focus-visible:pointer-events-auto ${
                     sharedMsg
                       ? 'bg-green-600 text-white'
                       : isDarkMode ? 'text-emerald-400 bg-emerald-900/60' : 'text-emerald-700 bg-emerald-100'
@@ -1175,7 +1210,7 @@ function MessageCardInner({
                   </span>
                 </button>
                 <button
-                  className={`rounded-md w-6 h-6 focus:outline-none focus:ring-4 flex justify-center items-center transition-opacity ${isHovered || copiedText ? 'opacity-100' : 'opacity-0'} focus-visible:opacity-100 ${
+                  className={`rounded-md w-6 h-6 focus:outline-none focus:ring-4 flex justify-center items-center transition-opacity ${isHovered || copiedText ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'} focus-visible:opacity-100 focus-visible:pointer-events-auto ${
                     copiedText ? 'bg-green-600 text-white' : config.buttonClassName
                   } shadow-md shadow-black/20`}
                   title="Copy message text (reasoning, content, tool calls)"
@@ -1198,7 +1233,12 @@ function MessageCardInner({
             <div className="overflow-hidden">
               <div
                 ref={contentRef}
-                className={`space-y-3 py-3${isClamped ? ' max-h-60 overflow-hidden relative' : ''}`}
+                className={
+                  // Tool results are the evidence and keep the taller clamp;
+                  // system/file boilerplate is read once per file and yields
+                  // its screen space sooner.
+                  `space-y-2 py-2${isClamped ? ` ${message.role === 'tool' ? 'max-h-60' : 'max-h-40'} overflow-hidden relative` : ''}`
+                }
               >
                 {/* Reasoning block. When collapsed whole, it is NOT drawn
                     here — a standalone block would strand the [...] on its
@@ -1206,9 +1246,9 @@ function MessageCardInner({
                     inline (see the content block). */}
                 {reasoning && !isSectionCollapsed(reasoning) && (
                   <div className="mx-3 rounded-md border-l-4 shadow-xs overflow-hidden reasoning">
-                    <div className={`px-2 py-1 flex items-center justify-between gap-1 text-sm font-medium ${textSecondary} shadow-2xs reasoning-header`}>
+                    <div className={`px-2 py-0.5 flex items-center justify-between gap-1 text-xs font-semibold uppercase tracking-wide ${textSecondary} shadow-2xs reasoning-header`}>
                       <span className="flex items-center gap-1">
-                        <span className="material-symbols-outlined" style={{ fontSize: 20 }}>lightbulb</span>
+                        <span className="material-symbols-outlined" style={{ fontSize: 14 }}>lightbulb</span>
                         reasoning
                       </span>
                       {isPresentationMode && (
@@ -1224,7 +1264,7 @@ function MessageCardInner({
                         </button>
                       )}
                     </div>
-                    <div data-msg-block data-block-kind="reasoning" className={`px-2 py-1 text-sm ${textPrimary} whitespace-pre-wrap`}>
+                    <div data-msg-block data-block-kind="reasoning" className={`px-3 py-2 text-[13px] leading-[1.6] max-w-[90ch] ${textPrimary} whitespace-pre-wrap`}>
                       {renderWithCollapse(reasoning, true, 'reasoning', -1, globalOccurrenceStarts.reasoningStart, localSearchStarts.reasoningStart)}
                     </div>
                   </div>
@@ -1232,13 +1272,26 @@ function MessageCardInner({
 
                 {/* Main content. A collapsed-whole reasoning section leads
                     here as an inline [...] so it shares the first line
-                    (its right-click "same line" toggle then works). */}
-                <div data-msg-block data-block-kind="content" className={`mx-3 whitespace-pre-wrap text-sm ${textPrimary}`}>
-                  {reasoning && isSectionCollapsed(reasoning) && (
-                    <>{renderWithCollapse(reasoning, true, 'reasoning', -1, globalOccurrenceStarts.reasoningStart, localSearchStarts.reasoningStart)}{' '}</>
-                  )}
-                  {renderWithCollapse(mainContent, false, 'content', -1, globalOccurrenceStarts.contentStart, localSearchStarts.contentStart)}
-                </div>
+                    (its right-click "same line" toggle then works). Skipped
+                    entirely when there is nothing to show — an empty div
+                    still costs a space-y gap in tool-call-only turns. Tool
+                    and file bodies are code/stdout: mono, full width. */}
+                {(mainContent !== '' || (reasoning && isSectionCollapsed(reasoning))) && (
+                  <div
+                    data-msg-block
+                    data-block-kind="content"
+                    className={`mx-3 whitespace-pre-wrap ${
+                      message.role === 'tool' || message.role === 'file'
+                        ? 'font-mono text-xs leading-[1.5]'
+                        : 'text-sm leading-6 max-w-[90ch]'
+                    } ${textPrimary}`}
+                  >
+                    {reasoning && isSectionCollapsed(reasoning) && (
+                      <>{renderWithCollapse(reasoning, true, 'reasoning', -1, globalOccurrenceStarts.reasoningStart, localSearchStarts.reasoningStart)}{' '}</>
+                    )}
+                    {renderWithCollapse(mainContent, false, 'content', -1, globalOccurrenceStarts.contentStart, localSearchStarts.contentStart)}
+                  </div>
+                )}
 
                 {/* Inline tool-call text — only when no structured tool calls
                     were extracted (older Kimi rows the parser didn't fully
@@ -1249,7 +1302,7 @@ function MessageCardInner({
                       <span className="material-symbols-outlined" style={{ fontSize: 14 }}>terminal</span>
                       tool call
                     </div>
-                    <pre className={`px-2 py-1 text-xs overflow-x-auto ${isDarkMode ? 'text-green-400' : 'text-gray-800'}`}>{toolCallText}</pre>
+                    <pre className={`px-3 py-2 text-xs leading-[1.5] overflow-x-auto ${isDarkMode ? 'text-green-400' : 'text-gray-800'}`}>{toolCallText}</pre>
                   </div>
                 )}
 
@@ -1266,7 +1319,7 @@ function MessageCardInner({
                         <span key={tcIdx} className="text-xs whitespace-pre-wrap">{renderWithCollapse(args, false, 'tool', tcIdx, globalOccurrenceStarts.toolArgStarts[tcIdx] ?? messageOccurrenceStart, localSearchStarts.toolArgStarts[tcIdx] ?? localOccurrenceStart)}</span>
                       ) : (
                         <div key={tcIdx} className={`rounded-md border overflow-hidden ${isDarkMode ? 'border-gray-600 bg-gray-800/50' : 'border-gray-200 bg-gray-50'}`}>
-                          <div className={`px-2 py-1 flex items-center justify-between text-xs font-medium ${isDarkMode ? 'bg-gray-700/50 text-gray-300' : 'bg-gray-100 text-gray-600'}`}>
+                          <div className={`px-2 py-0.5 flex items-center justify-between text-xs font-medium ${isDarkMode ? 'bg-gray-700/50 text-gray-300' : 'bg-gray-100 text-gray-600'}`}>
                             <div className="flex items-center gap-1 min-w-0">
                               <span className="material-symbols-outlined" style={{ fontSize: 14 }}>terminal</span>
                               <span className="truncate">{highlightSearchAndUrl(tc.function.name, false, 'tool', tcIdx, globalOccurrenceStarts.toolNameStarts[tcIdx] ?? messageOccurrenceStart, localSearchStarts.toolNameStarts[tcIdx] ?? localOccurrenceStart)}</span>
@@ -1309,7 +1362,7 @@ function MessageCardInner({
                             data-block-kind="tool"
                             data-block-index={tcIdx}
                             data-testid={`tool-call-pre-${tcIdx}`}
-                            className={`px-2 py-1 text-xs ${
+                            className={`px-3 py-2 text-xs leading-[1.5] ${
                               isWrapped ? 'whitespace-pre-wrap break-words' : 'overflow-x-auto'
                             } ${isDarkMode ? 'text-green-400' : 'text-gray-800'}`}
                           >
@@ -1338,7 +1391,29 @@ function MessageCardInner({
                           : 'bg-white border-gray-300 text-gray-600 hover:bg-gray-50'
                       }`}
                     >
-                      Show full message
+                      {clampHiddenLines > 0 ? `Show full message (~${clampHiddenLines} lines)` : 'Show full message'}
+                    </button>
+                  </div>
+                )}
+
+                {/* Way back down from a fully revealed long card — the header
+                    chevron may be thousands of pixels up by now. */}
+                {isClampable && showFull && !isHighlighted && !hasCurrentLocalMatch && (
+                  <div className="flex justify-center pb-1.5">
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setShowFull(false);
+                        cardRef.current?.scrollIntoView({ block: 'nearest' });
+                      }}
+                      className={`px-2 py-0.5 rounded-full border text-xs font-medium shadow-sm ${
+                        isDarkMode
+                          ? 'bg-gray-800 border-gray-600 text-gray-200 hover:bg-gray-700'
+                          : 'bg-white border-gray-300 text-gray-600 hover:bg-gray-50'
+                      }`}
+                    >
+                      Collapse
                     </button>
                   </div>
                 )}

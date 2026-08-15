@@ -59,8 +59,8 @@ function formatGrade(grade: number | boolean | string, gradeType: string): strin
 function getGradeColor(grade: number | boolean | string, gradeType: string, isDarkMode: boolean): string {
   if (gradeType === 'bool') {
     return grade
-      ? (isDarkMode ? 'text-teal-400' : 'text-teal-700')
-      : (isDarkMode ? 'text-red-400' : 'text-red-600');
+      ? (isDarkMode ? 'text-teal-400' : 'text-teal-800')
+      : (isDarkMode ? 'text-red-400' : 'text-red-700');
   }
   if (gradeType === 'freeform') {
     // No intrinsic ordering — render neutral.
@@ -77,9 +77,9 @@ function getGradeColor(grade: number | boolean | string, gradeType: string, isDa
   }
   // For numeric grades, use a gradient
   const value = grade as number;
-  if (value >= 0.7) return isDarkMode ? 'text-teal-400' : 'text-teal-700';
+  if (value >= 0.7) return isDarkMode ? 'text-teal-400' : 'text-teal-800';
   if (value >= 0.4) return isDarkMode ? 'text-yellow-400' : 'text-yellow-600';
-  return isDarkMode ? 'text-red-400' : 'text-red-600';
+  return isDarkMode ? 'text-red-400' : 'text-red-700';
 }
 
 // Comments are human annotations, not judgements: they get their own compact
@@ -377,23 +377,23 @@ export function SampleTable({
                 onClick={() => onSelectSample(sample.id)}
               >
                 {/* Identity column: sample_index, or rollout_n when the ID column is degenerate */}
-                <div style={{ width: idColumnWidth, minWidth: idColumnWidth }} className={`text-center text-sm font-medium ${isDarkMode ? 'text-gray-200' : 'text-gray-900'}`}>
+                <div style={{ width: idColumnWidth, minWidth: idColumnWidth }} className={`text-center text-sm font-medium tnum ${isDarkMode ? 'text-gray-200' : 'text-gray-900'}`}>
                   {sample.attributes[idColumnKey]}
                 </div>
 
                 {/* Step */}
                 {!hiddenColumns.has('step') && (
-                  <div style={{ width: 48, minWidth: 48 }} className={`text-center text-sm ${isDarkMode ? 'text-gray-400' : 'text-gray-600'}`}>
+                  <div style={{ width: 48, minWidth: 48 }} className={`text-center text-sm tnum ${isDarkMode ? 'text-gray-400' : 'text-gray-600'}`}>
                     {sample.attributes.step}
                   </div>
                 )}
 
                 {/* Reward — width kept in sync with the reward column def above */}
                 {!hiddenColumns.has('reward') && (
-                  <div style={{ width: 76, minWidth: 76 }} className={`text-right text-sm font-medium pr-2 ${
+                  <div style={{ width: 76, minWidth: 76 }} className={`text-right text-sm font-medium tnum pr-2 ${
                     reward >= 0
-                      ? (isDarkMode ? 'text-teal-400' : 'text-teal-700')
-                      : (isDarkMode ? 'text-red-400' : 'text-red-600')
+                      ? (isDarkMode ? 'text-teal-400' : 'text-teal-800')
+                      : (isDarkMode ? 'text-red-400' : 'text-red-700')
                   }`}>
                     {reward}
                   </div>
@@ -405,7 +405,7 @@ export function SampleTable({
                 {!hiddenColumns.has('data_source') && (
                   <div
                     style={{ minWidth: 100, flex: 1 }}
-                    className={`px-2 text-xs truncate ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}
+                    className={`px-2 text-xs truncate ${isDarkMode ? 'text-gray-400' : 'text-gray-600'}`}
                     title={sample.attributes.data_source}
                   >
                     {sample.attributes.data_source.split('/').slice(-2).join('/')}
@@ -455,7 +455,7 @@ export function SampleTable({
                       title={gradeEntry ? `${metricName}: ${formatGrade(gradeEntry.grade, gradeEntry.grade_type)}\n${gradeEntry.explanation?.slice(0, 100) || ''}` : 'Not graded'}
                     >
                       {gradeEntry ? (
-                        <span className={`text-sm font-medium truncate ${getGradeColor(gradeEntry.grade, gradeEntry.grade_type, isDarkMode)}`}>
+                        <span className={`text-sm font-medium truncate tnum ${getGradeColor(gradeEntry.grade, gradeEntry.grade_type, isDarkMode)}`}>
                           {formatGrade(gradeEntry.grade, gradeEntry.grade_type)}
                         </span>
                       ) : (

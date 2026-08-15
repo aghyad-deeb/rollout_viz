@@ -170,6 +170,32 @@ describe('normalizeAssistantMessage', () => {
     expect(out.mainContent).toBe('Hello');
   });
 
+  it('honors an explicit top-level reasoning field (tinker reconstruction)', () => {
+    // The backend's tinker reconstruction emits reasoning as a first-class
+    // field with plain content and structured tool_calls alongside.
+    const msg: Message = {
+      role: 'assistant',
+      content: 'the answer',
+      reasoning: 'served-but-once-invisible thinking',
+      tool_calls: [{ type: 'function', function: { name: 'bash', arguments: { command: 'ls' } } }],
+    };
+    const out = normalizeAssistantMessage(msg);
+    expect(out.reasoning).toBe('served-but-once-invisible thinking');
+    expect(out.mainContent).toBe('the answer');
+    expect(out.toolCalls).toHaveLength(1);
+  });
+
+  it('joins an explicit reasoning field with reasoning parsed from content tags', () => {
+    const msg: Message = {
+      role: 'assistant',
+      content: '<think>from tags</think>answer',
+      reasoning: 'from field',
+    };
+    const out = normalizeAssistantMessage(msg);
+    expect(out.reasoning).toBe('from field\n\nfrom tags');
+    expect(out.mainContent).toBe('answer');
+  });
+
   it('prefers content_parts when present', () => {
     const msg: Message = {
       role: 'assistant',

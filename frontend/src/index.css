@@ -1,5 +1,14 @@
 @import "tailwindcss";
 
+/* Wire the faces the app already downloads (index.html) into Tailwind v4's
+   theme: Inter carries body text (and real tabular figures for .tnum);
+   IBM Plex Mono becomes the single mono voice for tool output, tool-call
+   args, and the Analysis readouts. */
+@theme {
+  --font-sans: 'Inter', ui-sans-serif, system-ui, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji';
+  --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
 /* Make Tailwind's `dark:` variant follow the `.dark` class controlled by
    useDarkMode instead of the OS `prefers-color-scheme` directly.
    Without this, `dark:` utilities and the in-app dark toggle disagree
@@ -112,17 +121,19 @@
 
 /* Message role colors - Palette: #264653 #2a9d8f #e9c46a #f4a261 #e76f51 */
 
-/* System: #E76F51 (coral) */
+/* System: #E76F51 (coral). Fills stay quieter than the border — a system
+   prompt is context, not an error banner; red-family slabs must stay
+   reserved for negative reward and failures. */
 .message-system {
   border-left-color: #e76f51;
-  background-color: #fde8e4;
+  background-color: #fbeeea;
 }
 .message-system-header {
-  background-color: #f9c9bf;
+  background-color: #f6d5cb;
 }
 .message-system-button {
   background-color: #f0a090;
-  color: #7a2e1c;
+  color: #692715;
 }
 .message-system-button:hover {
   background-color: #e76f51;
@@ -130,13 +141,13 @@
 }
 
 .dark .message-system {
-  background-color: #3d2020;
+  background-color: #362424;
 }
 .dark .message-system-header {
-  background-color: #5c2d2d;
+  background-color: #4e2c2a;
 }
 .dark .message-system-button {
-  background-color: #c75a3f;
+  background-color: #b04a31;
   color: #ffffff;
 }
 
@@ -150,7 +161,7 @@
 }
 .message-user-button {
   background-color: #6fc4b8;
-  color: #1a5f56;
+  color: #12463f; /* 5.2:1 on the tint — the 12px labels need AA */
 }
 .message-user-button:hover {
   background-color: #2a9d8f;
@@ -178,7 +189,7 @@
 }
 .message-assistant-button {
   background-color: #f2d898;
-  color: #8a6d1f;
+  color: #6b520e;
 }
 .message-assistant-button:hover {
   background-color: #e9c46a;
@@ -198,13 +209,13 @@
 /* Tool: #264653 (dark teal) */
 .message-tool {
   border-left-color: #264653;
-  background-color: #dce6e9;
+  background-color: #d6e2e6; /* one step deeper than .message-file so the two blue-grays sort at a glance */
 }
 .message-tool-header {
   background-color: #b8ccd3;
 }
 .message-tool-button {
-  background-color: #5c8a97;
+  background-color: #46707c;
   color: #ffffff;
 }
 .message-tool-button:hover {
@@ -225,7 +236,7 @@
 /* File: #607D8B (blue gray) */
 .message-file {
   border-left-color: #607d8b;
-  background-color: #e8eef1;
+  background-color: #eef2f5;
 }
 .message-file-header {
   background-color: #cfd8dc;
@@ -250,20 +261,22 @@
   color: #ffffff;
 }
 
-/* Reasoning block: #F4A261 (orange) */
+/* Reasoning block: #F4A261 (orange). One clear step away from the assistant
+   card it nests in — quieter than body content is fine, indistinguishable
+   is not (the dark fills were near-twins of .dark .message-assistant). */
 .reasoning {
   border-left-color: #f4a261;
-  background-color: #fdebd9;
+  background-color: #fce4c8;
 }
 .reasoning-header {
   background-color: #fad7b3;
 }
 
 .dark .reasoning {
-  background-color: #3d2d1a;
+  background-color: #33220f;
 }
 .dark .reasoning-header {
-  background-color: #5c4427;
+  background-color: #52381b;
 }
 
 /* Resize handle */

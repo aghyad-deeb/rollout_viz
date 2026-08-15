@@ -336,7 +336,7 @@ describe('ChatView', () => {
 
   it('shows search chat button when search is not open', () => {
     render(<ChatView {...defaultProps} />);
-    expect(screen.getByText('Search chat')).toBeInTheDocument();
+    expect(screen.getByLabelText('Search chat')).toBeInTheDocument();
   });
 
   it('floats the toolbar cluster outside the messages scroll container', () => {
@@ -350,7 +350,7 @@ describe('ChatView', () => {
     // ...but overlaid within the same relative wrapper.
     expect(messagesContainer.parentElement!.contains(collapseAll)).toBe(true);
     expect(screen.getByLabelText('Expand all messages')).toBeInTheDocument();
-    expect(screen.getByText('Search chat')).toBeInTheDocument();
+    expect(screen.getByLabelText('Search chat')).toBeInTheDocument();
   });
 
   it('shows no highlight count + clear button when there are no ephemeral highlights', () => {
@@ -431,9 +431,9 @@ describe('ChatView', () => {
 describe('ChatView local search corpus', () => {
   function openSearch() {
     // jsdom doesn't bubble synthetic KeyboardEvents through the window-level
-    // listener consistently, so we click the visible "Search chat" button —
+    // listener consistently, so we click the "Search chat" icon button —
     // it triggers the same setIsSearchOpen(true) as the Ctrl+F binding.
-    fireEvent.click(screen.getByText('Search chat'));
+    fireEvent.click(screen.getByLabelText('Search chat'));
   }
   function typeSearch(term: string) {
     const input = screen.getByPlaceholderText('Search in this chat...') as HTMLInputElement;
@@ -569,7 +569,7 @@ describe('ChatView local search navigation', () => {
   afterEach(() => { mockControls.useRealMessageCard = false; });
 
   function openSearch() {
-    fireEvent.click(screen.getByText('Search chat'));
+    fireEvent.click(screen.getByLabelText('Search chat'));
   }
   function typeSearch(term: string) {
     const input = screen.getByPlaceholderText('Search in this chat...') as HTMLInputElement;
@@ -646,7 +646,7 @@ describe('ChatView Ctrl+F ergonomics', () => {
 
   it('refocuses and selects the input when Ctrl+F is pressed while already open', () => {
     render(<ChatView {...defaultProps} />);
-    fireEvent.click(screen.getByText('Search chat'));
+    fireEvent.click(screen.getByLabelText('Search chat'));
     const input = screen.getByPlaceholderText('Search in this chat...') as HTMLInputElement;
     fireEvent.change(input, { target: { value: 'hello' } });
     input.blur();
@@ -671,8 +671,12 @@ describe('ChatView collapse/expand all messages', () => {
   beforeEach(() => { mockControls.useRealMessageCard = true; });
   afterEach(() => { mockControls.useRealMessageCard = false; });
 
+  // Collapsed headers repeat the first content line as an excerpt, so the
+  // text can match twice — resolve to the body copy inside the grid wrapper.
   const gridOf = (text: string) =>
-    screen.getByText(text).closest('[class*="grid-rows"]') as HTMLElement;
+    screen.getAllByText(text)
+      .map(el => el.closest('[class*="grid-rows"]'))
+      .find(el => el !== null) as HTMLElement;
 
   it('Collapse all collapses every card, then one card can be re-expanded individually', () => {
     render(<ChatView {...defaultProps} />);
@@ -975,5 +979,58 @@ describe('ChatView capture filenames', () => {
     });
     fireEvent.click(screen.getByText('Download'));
     expect(captureMocks.downloadBlob).toHaveBeenCalledWith(expect.any(Blob), 'rollout-1-step100-msg2.png');
+  });
+});
+
+describe('ChatView conversation minimap', () => {
+  // jsdom has no layout: fake an overflowing (or fitting) transcript by
+  // stubbing the scroll metrics on the prototype, the same way the
+  // MessageCard overflow tests do.
+  const stubScrollMetrics = (scrollHeight: number, clientHeight: number) => {
+    Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
+      configurable: true,
+      get: () => clientHeight,
+    });
+    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
+      configurable: true,
+      get: () => scrollHeight,
+    });
+  };
+
+  afterEach(() => {
+    Reflect.deleteProperty(HTMLElement.prototype, 'clientHeight');
+    Reflect.deleteProperty(HTMLElement.prototype, 'scrollHeight');
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('renders a role-tagged block per message when the transcript overflows', () => {
+    stubScrollMetrics(2000, 500);
+    render(<ChatView {...defaultProps} />);
+    expect(screen.getByTestId('conversation-minimap')).toBeInTheDocument();
+    expect(screen.getByTestId('minimap-block-0')).toHaveAttribute('data-role', 'user');
+    expect(screen.getByTestId('minimap-block-1')).toHaveAttribute('data-role', 'assistant');
+  });
+
+  it('clicking a minimap block scrolls that message into view', () => {
+    stubScrollMetrics(2000, 500);
+    render(<ChatView {...defaultProps} />);
+    fireEvent.click(screen.getByTestId('minimap-block-1'));
+    expect(scrolledElements).toHaveLength(1);
+    expect(scrolledElements[0].contains(screen.getByTestId('message-1'))).toBe(true);
+  });
+
+  it('is hidden in Presentation Mode', () => {
+    stubScrollMetrics(2000, 500);
+    render(<ChatView {...defaultProps} isPresentationMode={true} />);
+    expect(screen.queryByTestId('conversation-minimap')).not.toBeInTheDocument();
+  });
+
+  it('is hidden when the whole transcript fits without scrolling', () => {
+    stubScrollMetrics(400, 500);
+    render(<ChatView {...defaultProps} />);
+    expect(screen.queryByTestId('conversation-minimap')).not.toBeInTheDocument();
   });
 });

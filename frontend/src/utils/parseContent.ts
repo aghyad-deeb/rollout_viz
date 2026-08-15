@@ -292,6 +292,19 @@ export function normalizeAssistantMessage(message: Message): ParsedContent {
     };
   }
 
+  // An explicit top-level `reasoning` field (written by producers and by the
+  // backend's tinker reconstruction) takes precedence: whatever the branches
+  // below extract from content/content_parts is appended after it.
+  const fieldReasoning =
+    typeof message.reasoning === 'string' && message.reasoning ? message.reasoning : null;
+  if (fieldReasoning) {
+    const inner = normalizeAssistantMessage({ ...message, reasoning: undefined });
+    return {
+      ...inner,
+      reasoning: inner.reasoning ? `${fieldReasoning}\n\n${inner.reasoning}` : fieldReasoning,
+    };
+  }
+
   if (message.content_parts && message.content_parts.length > 0) {
     const thinkingParts = message.content_parts
       .filter(p => p.type === 'thinking' && p.thinking)

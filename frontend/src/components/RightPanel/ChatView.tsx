@@ -3,6 +3,7 @@ import { createPortal, flushSync } from 'react-dom';
 import type { Sample, Message, SearchCondition, Quote, EphemeralHighlight, CollapsedRegion, RegionLocator, ExportWidth, FontSize } from '../../types';
 import { MessageCard } from './MessageCard';
 import { GradesDisplay } from './GradesDisplay';
+import { Minimap } from './Minimap';
 import { countMessageOccurrences, buildSearchCorpus } from '../../utils/parseContent';
 import { findAllMatchesCI } from '../../utils/textMatch';
 import { extractHighlightAnchor } from '../../utils/textSnippet';
@@ -883,6 +884,13 @@ export function ChatView({
     return () => clearTimeout(timeoutId);
   }, [sample.id, sample.messages, primarySearchTerm, currentOccurrenceIndex]);
 
+  // Minimap click → bring that message to the top of the view. Stable
+  // identity (reads the ref map) so the memoized Minimap never re-renders
+  // for it.
+  const scrollMessageIntoView = useCallback((index: number) => {
+    messageRefs.current.get(index)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }, []);
+
   // Register message ref
   const setMessageRef = useCallback((index: number, element: HTMLDivElement | null) => {
     if (element) {
@@ -1152,23 +1160,56 @@ export function ChatView({
       <div className="relative flex-1 min-h-0">
         <div
           ref={messagesContainerRef}
-          className="h-full overflow-y-auto custom-scrollbar p-4 space-y-4"
+          className="h-full overflow-y-auto custom-scrollbar py-4 pl-4 pr-7"
           onDragOver={isPresentationMode ? (e) => e.preventDefault() : undefined}
           onDrop={isPresentationMode ? handlePngDrop : undefined}
         >
+          {/* Role-aware rhythm instead of a uniform gap: a tool result hugs
+              the call that produced it (6px), each assistant turn opens a
+              visual paragraph (24px), everything else keeps the old 16px.
+              Wrappers stay direct children — the Cmd+C `:scope > div`
+              mapping and message indices are untouched. */}
           {displayedMessages.map((message, index) => (
-            <div key={index} ref={(el) => setMessageRef(index, el)}>
+            <div
+              key={index}
+              ref={(el) => setMessageRef(index, el)}
+              className={
+                index === 0 ? undefined
+                  : message.role === 'tool' ? 'mt-1.5'
+                    : message.role === 'assistant' ? 'mt-6'
+                      : 'mt-4'
+              }
+            >
               {renderMessageCard(message, index)}
             </div>
           ))}
         </div>
+
+        {/* Conversation minimap — slim overlay rail on the right edge, a
+            SIBLING of the scroll container (the `:scope > div` contract
+            above forbids putting it inside). Hidden in Presentation Mode;
+            it also hides itself when the transcript fits without scrolling.
+            The off-screen capture render clones individual cards only, so
+            it can never include this. */}
+        {!isPresentationMode && (
+          <Minimap
+            messages={displayedMessages}
+            containerRef={messagesContainerRef}
+            isDarkMode={isDarkMode}
+            searchConditions={searchConditions}
+            localSearchTerm={localSearchTerm}
+            gradeQuotes={gradeQuotes}
+            highlightedMessageIndex={highlightedMessageIndex}
+            onMessageClick={scrollMessageIntoView}
+          />
+        )}
 
         {/* Floating toolbar cluster — collapse/expand-all + search (and the
             ephemeral-highlights count) overlaid on the top-right corner
             instead of spending a full-width row. */}
         {!isSearchOpen && !isPresentationMode && (
           <div
-            className={`absolute top-2 right-4 z-10 flex items-center gap-1 px-1.5 py-0.5 rounded-md border backdrop-blur-sm shadow-sm ${
+            className={`absolute top-1 right-9 z-10 flex items-center gap-1 px-1.5 py-0.5 rounded-md border backdrop-blur-sm shadow-sm ${
               isDarkMode ? 'bg-[#111827]/85 border-gray-700' : 'bg-white/85 border-gray-200'
             }`}
           >
@@ -1210,13 +1251,13 @@ export function ChatView({
             </button>
             <button
               onClick={() => setIsSearchOpen(true)}
-              className={`flex items-center gap-1 px-2 py-1 text-xs rounded whitespace-nowrap ${
+              className={`p-1 rounded ${
                 isDarkMode ? 'text-gray-400 hover:text-gray-200 hover:bg-gray-700' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-100'
               }`}
               title="Search in chat (Ctrl+F)"
+              aria-label="Search chat"
             >
-              <span className="material-symbols-outlined" style={{ fontSize: 14 }} aria-hidden="true">search</span>
-              Search chat
+              <span className="material-symbols-outlined" style={{ fontSize: 16 }} aria-hidden="true">search</span>
             </button>
           </div>
         )}

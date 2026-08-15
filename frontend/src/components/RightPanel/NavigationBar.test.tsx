@@ -122,7 +122,7 @@ describe('NavigationBar', () => {
   describe('position indicator', () => {
     it('shows the 1-based position within the filtered list', () => {
       render(<NavigationBar {...makeProps({ navPos: 1, navTotal: 5 })} />);
-      expect(screen.getByText('2 / 5')).toBeInTheDocument();
+      expect(screen.getByText((_, el) => el?.textContent?.trim() === '· 2 / 5')).toBeInTheDocument();
     });
 
     it('hides the indicator when no sample is in the list', () => {

@@ -120,14 +120,14 @@ describe('MessageCard', () => {
     expect(mark.className).toContain('green');
   });
 
-  it('highlights grade quotes with purple', () => {
+  it('highlights grade quotes with violet (bluer than user-fuchsia highlights)', () => {
     render(<MessageCard {...defaultProps}
       message={{ role: 'user', content: 'This is important text here' }}
       gradeQuotes={[{ message_index: 0, start: 8, end: 17, text: 'important' }]}
     />);
     const mark = screen.getByText('important');
     expect(mark.tagName).toBe('MARK');
-    expect(mark.className).toContain('purple');
+    expect(mark.className).toContain('violet');
   });
 
   it('matches grade quotes across Unicode whitespace mismatches (LLM normalized U+202F → space)', () => {
@@ -145,11 +145,11 @@ describe('MessageCard', () => {
     // (with U+202F preserved) — not the normalized quote text.
     const marks = document.querySelectorAll('mark');
     expect(marks.length).toBeGreaterThan(0);
-    const purpleMark = Array.from(marks).find(m => m.className.includes('purple'));
-    expect(purpleMark).toBeDefined();
-    expect(purpleMark!.textContent).toContain('\u202F'); // original whitespace preserved
+    const quoteMark = Array.from(marks).find(m => m.className.includes('violet'));
+    expect(quoteMark).toBeDefined();
+    expect(quoteMark!.textContent).toContain('\u202F'); // original whitespace preserved
     // Carries the scroll-target class so ChatView's prev/next can find it.
-    expect(purpleMark!.className).toContain('grade-quote-mark');
+    expect(quoteMark!.className).toContain('grade-quote-mark');
   });
 
   it('matches grade quotes case-insensitively (judge capitalized a mid-sentence excerpt)', () => {
@@ -380,9 +380,16 @@ describe('MessageCard', () => {
     const header = screen.getByText('user').closest('[class*="cursor-pointer"]');
     if (header) fireEvent.click(header);
 
-    // The grid-rows class should change to 0fr when collapsed
-    const contentWrapper = screen.getByText('Collapsible content').closest('[class*="grid"]');
+    // The grid-rows class should change to 0fr when collapsed. The text now
+    // appears twice — hidden body + the header's one-line excerpt — so pick
+    // the body occurrence (the one inside the grid wrapper).
+    const contentWrapper = screen.getAllByText('Collapsible content')
+      .map(el => el.closest('[class*="grid"]'))
+      .find(el => el !== null);
     expect(contentWrapper?.className).toContain('grid-rows-[0fr]');
+    // …and the collapsed header carries the excerpt.
+    const excerpt = screen.getAllByText('Collapsible content').find(el => el.className.includes('truncate'));
+    expect(excerpt).toBeDefined();
   });
 
   it('shows ring highlight when isHighlighted is true', () => {
@@ -806,8 +813,12 @@ describe('MessageCard current local match styling', () => {
 // ---------------------------------------------------------------------------
 
 describe('MessageCard expand-all signal', () => {
+  // Collapsed headers repeat the first content line as an excerpt, so the
+  // text can match twice — always resolve to the body copy inside the grid.
   const gridOf = (text: string) =>
-    screen.getByText(text).closest('[class*="grid"]') as HTMLElement;
+    screen.getAllByText(text)
+      .map(el => el.closest('[class*="grid"]'))
+      .find(el => el !== null) as HTMLElement;
 
   it('does not apply the signal value on initial mount', () => {
     render(<MessageCard {...defaultProps}
@@ -904,8 +915,10 @@ describe('MessageCard long-card clamping', () => {
     role: 'system' as const,
     content: 'a very long system prompt line. '.repeat(80),
   };
+  // Clamp height is role-dependent (system/file 160px, tool 240px) — match
+  // any max-h so the tests survive tuning of the exact values.
   const clampedEl = (container: HTMLElement) =>
-    container.querySelector('[class*="max-h-60"]');
+    container.querySelector('[class*="max-h-"]');
 
   beforeEach(() => {
     Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
@@ -926,11 +939,15 @@ describe('MessageCard long-card clamping', () => {
     const { container } = render(<MessageCard {...defaultProps} message={longSystem} />);
     expect(clampedEl(container)).not.toBeNull();
 
-    const reveal = screen.getByText('Show full message');
+    // The pill states how much is hidden (mocked overflow: 760px ≈ 38 lines).
+    const reveal = screen.getByText(/Show full message/);
+    expect(reveal.textContent).toMatch(/~\d+ lines/);
     fireEvent.click(reveal);
 
     expect(clampedEl(container)).toBeNull();
-    expect(screen.queryByText('Show full message')).not.toBeInTheDocument();
+    expect(screen.queryByText(/Show full message/)).not.toBeInTheDocument();
+    // A revealed long card offers the way back down.
+    expect(screen.getByText('Collapse')).toBeInTheDocument();
   });
 
   it('does not clamp user or assistant cards', () => {
