@@ -42,6 +42,7 @@ from backend.llm_providers import (
     reset_grading_log_context,
     set_grading_log_context,
 )
+from backend.message_reconstruction import reconstruct_messages, reconstruction_note
 
 # Backward-compatible patch point for tests and local scripts that mocked
 # backend.main.get_provider before grading moved to model_router.
@@ -1311,6 +1312,11 @@ def _load_samples_sync(file: str, metadata_only: bool = False) -> dict:
                 filled_attrs[k] = v
 
         messages = raw.get('messages', [])
+        diagnostics = raw.get('diagnostics')
+        if not metadata_only:
+            messages, n_reconstructed = reconstruct_messages(messages)
+            if n_reconstructed:
+                diagnostics = list(diagnostics or []) + [reconstruction_note(n_reconstructed)]
         samples.append({
             "id": i,
             "messages": [] if metadata_only else messages,
@@ -1318,7 +1324,7 @@ def _load_samples_sync(file: str, metadata_only: bool = False) -> dict:
             "attributes": filled_attrs,
             "timestamp": raw.get('timestamp', ''),
             "grades": grades,
-            "diagnostics": raw.get('diagnostics'),
+            "diagnostics": diagnostics,
             "raw_messages": [] if metadata_only else raw.get('raw_messages'),
             "raw_jsonl_entry": None if metadata_only else raw,
         })
@@ -1567,13 +1573,18 @@ def _load_samples_batch_sync(files: List[str], metadata_only: bool = False) -> d
                         if k not in filled_attrs:
                             filled_attrs[k] = v
                     messages = raw.get('messages', [])
+                    diagnostics = raw.get('diagnostics')
+                    if not metadata_only:
+                        messages, n_reconstructed = reconstruct_messages(messages)
+                        if n_reconstructed:
+                            diagnostics = list(diagnostics or []) + [reconstruction_note(n_reconstructed)]
                     samples.append({
                         "id": i,
                         "messages": [] if metadata_only else messages,
                         "message_count": len(messages),
                         "attributes": filled_attrs, "timestamp": raw.get('timestamp', ''),
                         "grades": grades,
-                        "diagnostics": raw.get('diagnostics'),
+                        "diagnostics": diagnostics,
                         "raw_messages": [] if metadata_only else raw.get('raw_messages'),
                         "raw_jsonl_entry": None if metadata_only else raw,
                     })
@@ -1732,6 +1743,10 @@ def _load_single_sample_sync(file: str, sample_id: int) -> dict:
             filled_attrs[k] = v
 
     messages = raw.get('messages', [])
+    diagnostics = raw.get('diagnostics')
+    messages, n_reconstructed = reconstruct_messages(messages)
+    if n_reconstructed:
+        diagnostics = list(diagnostics or []) + [reconstruction_note(n_reconstructed)]
     return {
         "id": sample_id,
         "messages": messages,
@@ -1739,7 +1754,7 @@ def _load_single_sample_sync(file: str, sample_id: int) -> dict:
         "attributes": filled_attrs,
         "timestamp": raw.get('timestamp', ''),
         "grades": raw.get('grades', None),
-        "diagnostics": raw.get('diagnostics'),
+        "diagnostics": diagnostics,
         "raw_messages": raw.get('raw_messages'),
         "raw_jsonl_entry": raw,
     }

@@ -7,6 +7,8 @@ Supports model_router-backed grading plus legacy OpenAI, Anthropic, Google, and 
 import asyncio
 import contextvars
 import json
+
+from backend.message_reconstruction import reconstruct_messages
 import math
 import os
 import random
@@ -516,6 +518,9 @@ def _message_channels(message: Dict[str, Any]) -> Dict[str, str]:
 
 
 def _format_target_conversation(messages: List[Dict[str, Any]]) -> _FormattedConversation:
+    # Grade jobs hold RAW rows, so tinker-serialized assistant turns must be
+    # decomposed here too — the judge reads clean channels, not token soup.
+    messages, _ = reconstruct_messages([_as_plain_dict(m) for m in messages])
     blocks: List[str] = []
     channel_map: Dict[int, Dict[str, str]] = {}
     for i, message in enumerate(messages):
