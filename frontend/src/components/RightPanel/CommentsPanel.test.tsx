@@ -780,7 +780,7 @@ describe('CommentsPanel', () => {
         />,
       );
       const panel = screen.getByRole('dialog', { name: 'Comments' });
-      expect(panel.className).toContain('bg-gray-900');
+      expect(panel.className).toContain('bg-[var(--bg-secondary)]');
       expect(screen.getByText('dark note')).toBeInTheDocument();
       expect(postButton().className).toContain('bg-sky-700');
     });

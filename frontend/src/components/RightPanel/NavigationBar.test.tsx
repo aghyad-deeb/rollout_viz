@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, act } from '@testing-library/react';
+import { render, screen, fireEvent, act, within } from '@testing-library/react';
 import type { ComponentProps } from 'react';
 import { NavigationBar } from './NavigationBar';
 import { makeSample } from '../../test/fixtures';
@@ -262,5 +262,51 @@ describe('NavigationBar', () => {
       expect(button).not.toHaveTextContent('Copied');
       expect(button.querySelector('.material-symbols-outlined')).toHaveTextContent('link');
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reward chip
+// ---------------------------------------------------------------------------
+//
+// The reward is the single number an analyst scans for, so it rides beside
+// "sample N, step M" as a signed pill rather than only in the footer strip.
+
+describe('NavigationBar reward chip', () => {
+  const chipFor = (reward: number, isDarkMode = false) => {
+    const sample = makeSample();
+    sample.attributes.reward = reward;
+    const { container } = render(<NavigationBar {...makeProps({ sample, isDarkMode })} />);
+    return within(container).getByTestId('reward-chip');
+  };
+
+  it('renders a negative reward in the rose family', () => {
+    const chip = chipFor(-0.75);
+    expect(chip).toHaveTextContent('-0.75');
+    expect(chip.className).toContain('#fde7e7');
+    expect(chip.className).toContain('#9f1d1d');
+  });
+
+  it('renders a positive reward in the green family', () => {
+    const chip = chipFor(1.5);
+    expect(chip).toHaveTextContent('1.5');
+    expect(chip.className).toContain('#e3f5ea');
+    expect(chip.className).toContain('#166534');
+  });
+
+  it('renders a zero reward as neutral gray', () => {
+    const chip = chipFor(0);
+    expect(chip).toHaveTextContent('0');
+    expect(chip.className).toContain('bg-gray-100');
+  });
+
+  it('uses the deep rose / emerald pair in dark mode', () => {
+    expect(chipFor(-1, true).className).toContain('bg-rose-900/50');
+    expect(chipFor(2, true).className).toContain('bg-emerald-900/50');
+  });
+
+  it('is absent when no sample is selected', () => {
+    render(<NavigationBar {...makeProps({ sample: null, navPos: -1 })} />);
+    expect(screen.queryByTestId('reward-chip')).not.toBeInTheDocument();
   });
 });

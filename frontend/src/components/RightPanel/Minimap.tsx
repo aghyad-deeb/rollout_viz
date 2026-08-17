@@ -31,10 +31,10 @@ const ROLE_COLORS: Record<string, { light: string; dark: string }> = {
 // deep-link > purple grade quotes > green in-chat search > yellow global
 // search (same priority order MessageCard paints them in).
 const MARKERS = [
-  { kind: 'deeplink', color: '#3b82f6' },
-  { kind: 'quote', color: '#a855f7' },
-  { kind: 'local', color: '#22c55e' },
-  { kind: 'global', color: '#eab308' },
+  { kind: 'deeplink', color: '#3b82f6', label: 'linked' },
+  { kind: 'quote', color: '#a855f7', label: 'grader quote' },
+  { kind: 'local', color: '#22c55e', label: 'find match' },
+  { kind: 'global', color: '#eab308', label: 'search match' },
 ] as const;
 
 // Rail geometry. The rail spans the transcript wrapper from below the
@@ -223,8 +223,12 @@ function MinimapInner({
 
   const theme = isDarkMode ? 'dark' : 'light';
   const hovered = hoverIndex !== null && hoverIndex < n ? hoverIndex : null;
+  const hoverCorpus = hovered !== null
+    ? buildSearchCorpus(messages[hovered]).replace(/\s+/g, ' ').trim()
+    : '';
+  const hoverChars = hoverCorpus.length;
   const hoverPreview = hovered !== null
-    ? buildSearchCorpus(messages[hovered]).replace(/\s+/g, ' ').trim().slice(0, 60)
+    ? hoverCorpus.slice(0, 140)
     : '';
 
   const deeplinkHits: ReadonlySet<number> =
@@ -243,8 +247,8 @@ function MinimapInner({
       // A bare strip, not a boxed panel — the blocks themselves are the rail
       // (editor-minimap style). The transcript scroller reserves a right
       // gutter (pr-7) so cards never run underneath.
-      className="absolute z-10 w-2 select-none"
-      style={{ top: RAIL_TOP, bottom: RAIL_BOTTOM, right: 10 }}
+      className="absolute z-10 w-2.5 select-none"
+      style={{ top: RAIL_TOP, bottom: RAIL_BOTTOM, right: 6 }}
       onMouseLeave={() => setHoverIndex(null)}
     >
       <div className="absolute" style={{ top: RAIL_PAD_Y, bottom: RAIL_PAD_Y, left: 0, right: 0 }}>
@@ -258,12 +262,17 @@ function MinimapInner({
               data-testid={`minimap-block-${i}`}
               data-role={message.role}
               aria-label={`Jump to message ${i + 1} (${message.role})`}
-              className="absolute left-0 right-0 rounded-full cursor-pointer transition-opacity duration-100 motion-reduce:transition-none"
+              className="absolute left-0 right-0 rounded-[2px] cursor-pointer transition-opacity duration-100 motion-reduce:transition-none"
               style={{
                 top: blockTops[i],
                 height: Math.max(1, blockHeights[i] ?? 0),
                 backgroundColor: color,
-                opacity: hovered === i ? 1 : isDarkMode ? 0.7 : 0.6,
+                opacity: hovered === i ? 1 : 0.75,
+                // A hairline inset keeps adjacent same-role blocks legible as
+                // separate messages once the rail is wide enough to read.
+                boxShadow: isDarkMode
+                  ? 'inset 0 0 0 1px rgba(255,255,255,.08)'
+                  : 'inset 0 0 0 1px rgba(0,0,0,.06)',
               }}
               onClick={() => onMessageClick(i)}
               onMouseEnter={() => setHoverIndex(i)}
@@ -271,24 +280,27 @@ function MinimapInner({
           );
         })}
 
-        {/* Tick overlays — one short bar per category per message, stacked
-            from the block's top in highlight-priority order. */}
+        {/* Tick overlays — ONE tick per message, colored by the highest-
+            priority category present (deep link > quote > find > search).
+            Stacked per-category bars crowded out the block itself on short
+            blocks; the hover tooltip still enumerates every category. */}
         {messages.map((_, i) => {
-          const present = markerLayers.filter((m) => m.set.has(i));
-          return present.map(({ kind, color }, slot) => (
+          const top = markerLayers.find((m) => m.set.has(i));
+          if (!top) return null;
+          return (
             <div
-              key={`${kind}-${i}`}
-              data-testid={`minimap-tick-${kind}-${i}`}
-              className="absolute pointer-events-none rounded-full"
+              key={`tick-${i}`}
+              data-testid={`minimap-tick-${top.kind}-${i}`}
+              className="absolute pointer-events-none rounded-[1px]"
               style={{
-                top: blockTops[i] + 1 + slot * 3,
+                top: blockTops[i] + 1,
                 left: 1,
                 right: 1,
-                height: 2,
-                backgroundColor: color,
+                height: 3,
+                backgroundColor: top.color,
               }}
             />
-          ));
+          );
         })}
 
         {/* Viewport indicator — the currently visible slice of the transcript. */}
@@ -301,22 +313,44 @@ function MinimapInner({
         />
       </div>
 
-      {/* Hover tooltip — role, index, first ~60 chars. */}
+      {/* Hover tooltip — a small card that pops from the rail: role-colored
+          accent + dot, index, size, a two-line preview, and any highlight
+          markers this message carries. */}
       {hovered !== null && (
         <div
           data-testid="minimap-tooltip"
-          className={`absolute right-full mr-2 z-20 pointer-events-none px-2 py-1 rounded border shadow-md text-[11px] leading-snug w-max max-w-[18rem] ${
-            isDarkMode ? 'bg-gray-800 border-gray-600 text-gray-200' : 'bg-white border-gray-300 text-gray-700'
+          className={`minimap-tooltip absolute right-full mr-2.5 z-20 pointer-events-none px-3 py-2 rounded-lg border shadow-lg border-l-2 text-[11px] leading-snug w-max max-w-[19rem] backdrop-blur-sm ${
+            isDarkMode ? 'bg-gray-800/95 border-gray-600 text-gray-200' : 'bg-white/95 border-gray-200 text-gray-700'
           }`}
           style={{
             top: Math.max(0, Math.min((blockTops[hovered] ?? 0) + RAIL_PAD_Y - 6, railInnerH - 28)),
+            borderLeftColor: (ROLE_COLORS[messages[hovered].role] ?? ROLE_COLORS.system)[theme],
           }}
         >
-          <span className={`font-medium ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>
-            #{hovered + 1} · {messages[hovered].role}
+          <span className="flex items-baseline gap-1.5">
+            <span
+              className="self-center w-2 h-2 rounded-full shrink-0"
+              style={{ backgroundColor: (ROLE_COLORS[messages[hovered].role] ?? ROLE_COLORS.system)[theme] }}
+            />
+            <span className={`font-semibold uppercase tracking-wide text-[10px] ${isDarkMode ? 'text-gray-300' : 'text-gray-600'}`}>
+              #{hovered + 1} · {messages[hovered].role}
+            </span>
+            <span className={`ml-auto pl-3 tnum ${isDarkMode ? 'text-gray-500' : 'text-gray-400'}`}>
+              {hoverChars >= 1000 ? `${(hoverChars / 1000).toFixed(1)}k` : hoverChars} chars
+            </span>
           </span>
           {hoverPreview && (
-            <span className="block truncate max-w-[17rem]">{hoverPreview}</span>
+            <span className="block mt-1 line-clamp-2 max-w-[17.5rem] whitespace-normal">{hoverPreview}</span>
+          )}
+          {markerLayers.some((m) => m.set.has(hovered)) && (
+            <span className="flex items-center gap-2.5 mt-1.5">
+              {markerLayers.filter((m) => m.set.has(hovered)).map(({ kind, color, label }) => (
+                <span key={kind} className={`flex items-center gap-1 text-[10px] ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>
+                  <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: color }} />
+                  {label}
+                </span>
+              ))}
+            </span>
           )}
         </div>
       )}

@@ -149,7 +149,7 @@ export function PresentationPreviewPanel({
     : 'text-gray-600 hover:bg-gray-100 disabled:text-gray-300';
 
   return (
-    <div className={`h-full flex flex-col ${isDarkMode ? 'bg-[#16213e]' : 'bg-gray-50'}`}>
+    <div className={`h-full flex flex-col ${isDarkMode ? 'bg-[var(--bg-secondary)]' : 'bg-gray-50'}`}>
       <div
         className={`px-3 py-2 border-b text-sm font-medium flex items-center gap-1.5 ${border} ${
           isDarkMode ? 'text-gray-200' : 'text-gray-700'

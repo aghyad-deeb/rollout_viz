@@ -688,7 +688,7 @@ describe('ChatView collapse/expand all messages', () => {
     expect(gridOf('I am doing well, thank you!').className).toContain('grid-rows-[0fr]');
 
     // Per-card toggle still works after the bulk action.
-    const header = screen.getByText('user').closest('[class*="cursor-pointer"]');
+    const header = screen.getByText('TASK').closest('[class*="cursor-pointer"]');
     fireEvent.click(header!);
     expect(gridOf('Hello, how are you?').className).toContain('grid-rows-[1fr]');
     expect(gridOf('I am doing well, thank you!').className).toContain('grid-rows-[0fr]');
@@ -711,6 +711,62 @@ describe('ChatView expand-all signal plumbing', () => {
     const signals = screen.getAllByTestId('expand-signal-1').map((el) => el.textContent);
     expect(signals).toContain('true:0'); // list card gets the signal
     expect(signals).toContain('no-signal'); // capture clone does not
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Off-screen capture card: always full-bodied
+// ---------------------------------------------------------------------------
+//
+// Regression: the portal card was one un-keyed MessageCard inheriting the
+// role's on-screen default. With system cards collapsed by default, exporting
+// a system message produced a header-only strip.
+
+describe('ChatView off-screen capture card', () => {
+  const withSystem = makeSample({
+    messages: [
+      { role: 'system', content: 'you are a helpful assistant boilerplate' },
+      { role: 'assistant', content: 'I am doing well, thank you!' },
+    ],
+  });
+
+  beforeEach(() => { mockControls.useRealMessageCard = true; });
+  afterEach(() => { mockControls.useRealMessageCard = false; });
+
+  const gridsFor = (text: string) =>
+    screen.getAllByText(text, { exact: false })
+      .map((el) => el.closest('[data-testid="message-body-grid"]'))
+      .filter((el): el is HTMLElement => el !== null);
+
+  it('renders the active system card expanded even though the on-screen one is collapsed', () => {
+    const { container } = render(
+      <ChatView {...defaultProps} sample={withSystem} isPresentationMode={true}
+        presentationActiveIndex={0} onPresentationActiveIndexChange={vi.fn()} />,
+    );
+    // On-screen (inside `container`) the system card keeps its collapsed default…
+    const onScreen = within(container).getAllByText('you are a helpful assistant boilerplate')
+      .map((el) => el.closest('[data-testid="message-body-grid"]'))
+      .filter((el): el is HTMLElement => el !== null);
+    expect(onScreen.length).toBeGreaterThan(0);
+    expect(onScreen.every((g) => g.className.includes('grid-rows-[0fr]'))).toBe(true);
+    // …while the portalled capture clone (outside it) is expanded.
+    const all = gridsFor('you are a helpful assistant boilerplate');
+    expect(all.some((g) => g.className.includes('grid-rows-[1fr]'))).toBe(true);
+  });
+
+  it('remounts the capture card when the active message changes', () => {
+    const { rerender } = render(
+      <ChatView {...defaultProps} sample={withSystem} isPresentationMode={true}
+        presentationActiveIndex={1} onPresentationActiveIndexChange={vi.fn()} />,
+    );
+    rerender(
+      <ChatView {...defaultProps} sample={withSystem} isPresentationMode={true}
+        presentationActiveIndex={0} onPresentationActiveIndexChange={vi.fn()} />,
+    );
+    // The clone now shows the system message, fully expanded — no state
+    // carried over from the assistant card it replaced.
+    const all = gridsFor('you are a helpful assistant boilerplate');
+    expect(all.some((g) => g.className.includes('grid-rows-[1fr]'))).toBe(true);
   });
 });
 
@@ -1032,5 +1088,105 @@ describe('ChatView conversation minimap', () => {
     stubScrollMetrics(400, 500);
     render(<ChatView {...defaultProps} />);
     expect(screen.queryByTestId('conversation-minimap')).not.toBeInTheDocument();
+  });
+});
+
+describe('ChatView role-aware message rhythm', () => {
+  // The wrapper margins encode turn structure: a tool result binds to the
+  // assistant call above it (4px + a 24px indent, and MessageCard prefixes
+  // its label with '↳'), but consecutive tool results keep the full gap —
+  // two hugging siblings would read as one card.
+  it('binds a tool result to its assistant call but not to a preceding tool result', () => {
+    const sample = makeSample({
+      messages: [
+        { role: 'user', content: 'go' },
+        { role: 'assistant', content: 'calling' },
+        { role: 'tool', content: 'result one', name: 'bash' },
+        { role: 'tool', content: 'result two', name: 'bash' },
+        { role: 'assistant', content: 'done' },
+      ],
+    });
+    render(<ChatView {...defaultProps} sample={sample} />);
+
+    const wrapperOf = (i: number) =>
+      screen.getByTestId(`message-${i}`).parentElement as HTMLElement;
+    expect(wrapperOf(0).className).toBe('');           // first message: no margin
+    expect(wrapperOf(2).className).toContain('mt-1');   // tool after assistant binds
+    expect(wrapperOf(2).className).toContain('ml-6');   // …and indents under it
+    expect(wrapperOf(3).className).toContain('mt-4');   // tool after tool keeps the gap
+    expect(wrapperOf(3).className).not.toContain('ml-6');
+    expect(wrapperOf(4).className).toContain('mt-7');   // assistant opens a paragraph
+  });
+
+  it("prefixes a bound tool result's header label with the turn glyph", () => {
+    mockControls.useRealMessageCard = true;
+    const sample = makeSample({
+      messages: [
+        { role: 'assistant', content: 'calling' },
+        { role: 'tool', content: 'result one', name: 'bash' },
+        { role: 'tool', content: 'result two', name: 'bash' },
+      ],
+    });
+    render(<ChatView {...defaultProps} sample={sample} />);
+    expect(screen.getByText('↳ bash')).toBeInTheDocument(); // bound to the call
+    expect(screen.getByText('bash')).toBeInTheDocument();   // free-standing result
+  });
+});
+
+// ---------------------------------------------------------------------------
+// First-screen economy: task primacy + collapsed system prompts
+// ---------------------------------------------------------------------------
+
+describe('ChatView first-screen economy', () => {
+  beforeEach(() => { mockControls.useRealMessageCard = true; });
+  afterEach(() => { mockControls.useRealMessageCard = false; });
+
+  it("gives ONLY the first user message the TASK running head", () => {
+    const sample = makeSample({
+      messages: [
+        { role: 'system', content: 'sys' },
+        { role: 'user', content: 'the actual task' },
+        { role: 'assistant', content: 'ok' },
+        { role: 'user', content: 'a follow-up' },
+      ],
+    });
+    render(<ChatView {...defaultProps} sample={sample} />);
+    expect(screen.getAllByText('TASK')).toHaveLength(1);
+    expect(screen.getAllByText('user')).toHaveLength(1); // the follow-up
+  });
+
+  it('starts system cards collapsed and every other role expanded', () => {
+    const sample = makeSample({
+      messages: [
+        { role: 'system', content: 'a long system prompt' },
+        { role: 'user', content: 'the actual task' },
+      ],
+    });
+    render(<ChatView {...defaultProps} sample={sample} />);
+    const gridOf = (text: string) =>
+      screen.getAllByText(text)
+        .map(el => el.closest('[class*="grid-rows"]'))
+        .find(el => el !== null) as HTMLElement;
+    expect(gridOf('a long system prompt').className).toContain('grid-rows-[0fr]');
+    expect(gridOf('the actual task').className).toContain('grid-rows-[1fr]');
+
+    // Still individually expandable…
+    fireEvent.click(screen.getByText('system').closest('[class*="cursor-pointer"]')!);
+    expect(gridOf('a long system prompt').className).toContain('grid-rows-[1fr]');
+  });
+
+  it('expand-all opens the collapsed system card', () => {
+    const sample = makeSample({
+      messages: [
+        { role: 'system', content: 'a long system prompt' },
+        { role: 'user', content: 'the actual task' },
+      ],
+    });
+    render(<ChatView {...defaultProps} sample={sample} />);
+    fireEvent.click(screen.getByLabelText('Expand all messages'));
+    const grid = screen.getAllByText('a long system prompt')
+      .map(el => el.closest('[class*="grid-rows"]'))
+      .find(el => el !== null) as HTMLElement;
+    expect(grid.className).toContain('grid-rows-[1fr]');
   });
 });

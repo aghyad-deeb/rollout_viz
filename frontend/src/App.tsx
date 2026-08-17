@@ -79,7 +79,7 @@ function LoginOverlay({ isDarkMode, onLogin }: { isDarkMode: boolean; onLogin: (
   };
 
   return (
-    <div className={`h-screen flex items-center justify-center ${isDarkMode ? 'bg-[#1a1a2e]' : 'bg-gray-50'}`}>
+    <div className={`h-screen flex items-center justify-center ${isDarkMode ? 'bg-[var(--bg-primary)]' : 'bg-gray-50'}`}>
       <form onSubmit={handleSubmit} className={`p-8 rounded-xl shadow-lg w-80 ${isDarkMode ? 'bg-gray-900 text-gray-100' : 'bg-white text-gray-900'}`}>
         <h2 className="text-lg font-semibold mb-4">Rollout Visualizer</h2>
         <input
@@ -1010,7 +1010,7 @@ function App() {
 
   if (authState === 'loading') {
     return (
-      <div className={`h-screen flex items-center justify-center ${isDarkMode ? 'bg-[#1a1a2e]' : 'bg-white'}`}>
+      <div className={`h-screen flex items-center justify-center ${isDarkMode ? 'bg-[var(--bg-primary)]' : 'bg-white'}`}>
         <div className="text-center">
           <span className={`material-symbols-outlined animate-spin ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`} style={{ fontSize: 32 }}>progress_activity</span>
           <p className={`mt-3 text-sm ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>Connecting to server...</p>
@@ -1020,7 +1020,7 @@ function App() {
   }
   if (authState === 'connection_failed') {
     return (
-      <div className={`h-screen flex items-center justify-center ${isDarkMode ? 'bg-[#1a1a2e]' : 'bg-gray-50'}`}>
+      <div className={`h-screen flex items-center justify-center ${isDarkMode ? 'bg-[var(--bg-primary)]' : 'bg-gray-50'}`}>
         <div className={`p-8 rounded-xl shadow-lg w-80 text-center ${isDarkMode ? 'bg-gray-900 text-gray-100' : 'bg-white text-gray-900'}`}>
           <span className={`material-symbols-outlined ${isDarkMode ? 'text-red-400' : 'text-red-500'}`} style={{ fontSize: 40 }}>cloud_off</span>
           <h2 className="text-lg font-semibold mt-3 mb-2">Connection Failed</h2>
@@ -1042,7 +1042,7 @@ function App() {
   }
 
   return (
-    <div className={`h-screen flex flex-col ${isDarkMode ? 'bg-[#1a1a2e]' : 'bg-white'}`}>
+    <div className={`h-screen flex flex-col ${isDarkMode ? 'bg-[var(--bg-primary)]' : 'bg-white'}`}>
       {/* Shared mode banner with login upgrade */}
       {isSharedMode && (
         <SharedBanner isDarkMode={isDarkMode} onLogin={() => {

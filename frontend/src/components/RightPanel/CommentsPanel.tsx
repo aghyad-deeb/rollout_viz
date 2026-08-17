@@ -303,7 +303,7 @@ export function CommentsPanel({
     // to a full-width overlay (absolute, against the content area's wrapper).
     <div
       className={`absolute inset-y-0 right-0 z-20 w-full max-w-full sm:static sm:shrink-0 sm:w-[24rem] flex flex-col border-l shadow-xl comments-drawer ${
-        isDarkMode ? 'bg-gray-900 border-gray-700' : 'bg-white border-gray-200'
+        isDarkMode ? 'bg-[var(--bg-secondary)] border-[var(--border-color)]' : 'bg-white border-gray-200'
       } ${isOpen ? '' : 'hidden'}`}
       role="dialog"
       aria-label="Comments"
@@ -413,7 +413,7 @@ export function CommentsPanel({
         </div>
       )}
 
-      <div className={`p-3 border-t ${border} ${isDarkMode ? 'bg-[#16213e]' : 'bg-gray-50'}`}>
+      <div className={`p-3 border-t ${border} bg-[var(--bg-tertiary)]`}>
         <div className="flex items-center gap-2 mb-2">
           <label htmlFor="comment-author" className={`text-[11px] shrink-0 ${muted}`}>
             Your name <span aria-hidden="true" className={isDarkMode ? 'text-red-400' : 'text-red-500'}>*</span>

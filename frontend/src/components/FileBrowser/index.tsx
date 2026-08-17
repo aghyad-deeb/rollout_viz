@@ -427,7 +427,7 @@ export function FileBrowser({
         role="dialog"
         aria-modal="true"
         aria-label="File browser"
-        className={`relative rounded-lg shadow-xl w-full max-w-[800px] max-h-full flex flex-col overflow-hidden ${isDarkMode ? 'bg-gray-900' : 'bg-white'}`}
+        className={`relative rounded-lg shadow-xl w-full max-w-[800px] max-h-full flex flex-col overflow-hidden ${isDarkMode ? 'bg-[var(--bg-secondary)]' : 'bg-white'}`}
       >
         {/* Header */}
         <div className={`flex items-center justify-between px-4 py-3 border-b ${isDarkMode ? 'border-gray-700' : 'border-gray-200'}`}>
@@ -549,7 +549,7 @@ export function FileBrowser({
         <div className={`px-4 py-2 border-b flex flex-col gap-2 ${isDarkMode ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-gray-50'}`}>
           {/* Search input */}
           <div className="flex items-center gap-2">
-            <div className={`flex-1 flex items-center gap-2 px-3 py-1.5 border rounded-md ${isDarkMode ? 'bg-gray-900 border-gray-600' : 'bg-white border-gray-300'}`}>
+            <div className={`flex-1 flex items-center gap-2 px-3 py-1.5 border rounded-md ${isDarkMode ? 'bg-[var(--bg-primary)] border-gray-600' : 'bg-white border-gray-300'}`}>
               <span className={`material-symbols-outlined text-sm ${isDarkMode ? 'text-gray-500' : 'text-gray-400'}`}>search</span>
               <input
                 ref={searchInputRef}

@@ -182,14 +182,14 @@ export function RolloutChatPanel({ sample, isDarkMode, onClose, onDirtyChange }:
     ta.style.height = `${Math.min(ta.scrollHeight, 160)}px`;
   };
 
-  const panelBg = isDarkMode ? 'bg-[#16213e]' : 'bg-gray-50';
-  const barBg = isDarkMode ? 'bg-[#1b2a52]' : 'bg-white';
+  const panelBg = isDarkMode ? 'bg-[var(--bg-secondary)]' : 'bg-gray-50';
+  const barBg = isDarkMode ? 'bg-[var(--bg-tertiary)]' : 'bg-white';
   const border = isDarkMode ? 'border-gray-700' : 'border-gray-200';
   const iconBtn = isDarkMode
     ? 'text-gray-300 hover:bg-white/10'
     : 'text-gray-500 hover:bg-gray-200';
   const selectCls = isDarkMode
-    ? 'bg-[#16213e] border-gray-600 text-gray-200'
+    ? 'bg-[var(--bg-secondary)] border-gray-600 text-gray-200'
     : 'bg-white border-gray-300 text-gray-700';
   const modelLabel = CHAT_MODELS.find((m) => m.id === model)?.label ?? 'Model';
   const a = sample?.attributes;
@@ -379,7 +379,7 @@ export function RolloutChatPanel({ sample, isDarkMode, onClose, onDirtyChange }:
         <div
           className={`flex items-end gap-2 rounded-xl border px-2.5 py-2 transition-colors ${
             isDarkMode
-              ? 'bg-[#16213e] border-gray-600 focus-within:border-sky-500'
+              ? 'bg-[var(--bg-secondary)] border-gray-600 focus-within:border-sky-500'
               : 'bg-white border-gray-300 focus-within:border-sky-400'
           }`}
         >

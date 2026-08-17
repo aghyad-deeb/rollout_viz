@@ -29,6 +29,30 @@
   box-shadow: none !important;
 }
 .capture-export .presentation-chrome { display: none !important; }
+/* Force the message body open in an export. The on-screen collapse is a
+   grid-rows 1fr/0fr animation over an `overflow: hidden` clip — neither grows
+   when the capture scales font-size / line-height / padding up, so at Medium
+   and above the last line(s) of the card were sliced off. These two rules are
+   scoped to the body wrapper's own classes (MessageCard renders
+   `.message-body-grid` / `.message-body-clip`); a blanket `.overflow-hidden`
+   override would also un-clip the rounded card corners, the truncating header
+   cells and the tool-call scrollers. */
+.capture-export .message-body-grid { grid-template-rows: auto !important; }
+.capture-export .message-body-clip { overflow: visible !important; }
+/* The collapsed header's one-line excerpt is a scan-mode affordance that
+   duplicates the body — in a figure it is noise, and at fontScale > 1 it
+   overran the '#N · M ln' meta run. */
+.capture-export .collapsed-excerpt { display: none !important; }
+/* The fixed `w-28` role gutter and its `truncate` exist to align excerpts
+   down a COLUMN of cards. A figure shows one card, so the gutter sizes to its
+   label and the label is never clipped — belt and braces with scaleCard's
+   width scaling, which alone still lost the last glyph to the rasterizer's
+   sub-pixel font metrics. */
+.capture-export .role-label-gutter { width: auto !important; }
+.capture-export .role-label-text {
+  overflow: visible !important;
+  text-overflow: clip !important;
+}
 /* Suppress transient/tooling highlights — search, URL-share, grade quotes —
    so the exported figure shows only the user's deliberate emphasis. */
 .capture-export .global-search-highlight,
@@ -78,9 +102,20 @@
 /* Base styles */
 :root {
   color-scheme: light;
+  /* Transcript surfaces (2026-08 neutral-paper pass): role color lives on the
+     card EDGE, never in the fill, so grade quotes / search marks / reward
+     chips are the only chroma competing for the eye. */
+  --card-paper: #ffffff;
+  --card-border: #e7e5e1;
+  --card-hairline: #eeece8;
+  --transcript-bg: #f6f5f3;
+  --card-quiet: #f1efec;      /* neutral button + footer-bar surface */
   --bg-primary: #ffffff;
-  --bg-secondary: #f8fafc;
-  --bg-tertiary: #f1f5f9;
+  /* Chrome grounds share the transcript's WARM paper temperature — the old
+     cool slate tints (#f8fafc / #f1f5f9) read as a second, bluer paper next
+     to the neutral cards. */
+  --bg-secondary: #f6f5f3;
+  --bg-tertiary: #f1efec;
   --text-primary: #1f2937;
   --text-secondary: #4b5563;
   --text-muted: #9ca3af;
@@ -90,14 +125,24 @@
 
 .dark {
   color-scheme: dark;
-  --bg-primary: #1a1a2e;
-  --bg-secondary: #16213e;
-  --bg-tertiary: #0f3460;
+  --card-paper: #16191d;
+  --card-border: #262b31;
+  --card-hairline: #262b31;
+  --transcript-bg: #0e1114;
+  --card-quiet: #232830;
+  /* App chrome, re-grounded onto the transcript's neutral family (2026-08).
+     These used to be the old navy trio (#1a1a2e / #16213e / #0f3460), which
+     put a visible hue seam at every border with the neutral cards. Relative
+     depth is preserved: primary = panel ground, secondary = nav/tab/footer
+     strips and drawers, tertiary = raised controls. */
+  --bg-primary: #111418;
+  --bg-secondary: #16191d;
+  --bg-tertiary: #1c2126;
   --text-primary: #e5e7eb;
   --text-secondary: #d1d5db;
   --text-muted: #9ca3af;
-  --border-color: #374151;
-  --border-color-dark: #4b5563;
+  --border-color: #2b3138;
+  --border-color-dark: #3c444d;
 }
 
 /* Custom scrollbar */
@@ -119,165 +164,126 @@
   background: var(--text-muted);
 }
 
-/* Message role colors - Palette: #264653 #2a9d8f #e9c46a #f4a261 #e76f51 */
+/* ─────────────────────────────────────────────────────────────────────
+   Message cards — NEUTRAL PAPER (2026-08 readability pass)
+   Palette: #264653 #2a9d8f #e9c46a #f4a261 #e76f51
 
-/* System: #E76F51 (coral). Fills stay quieter than the border — a system
-   prompt is context, not an error banner; red-family slabs must stay
-   reserved for negative reward and failures. */
-.message-system {
-  border-left-color: #e76f51;
-  background-color: #fbeeea;
-}
-.message-system-header {
-  background-color: #f6d5cb;
-}
-.message-system-button {
-  background-color: #f0a090;
-  color: #692715;
-}
-.message-system-button:hover {
-  background-color: #e76f51;
-  color: #ffffff;
-}
+   Role color moved off the card fill and onto the card EDGE. Every card is
+   the same paper with a 1px border and a 3px role rail; the header carries
+   an ~8% tint of the role hue and the role LABEL carries the hue itself.
+   The one exception is the user card — the task statement keeps a faint
+   mint wash so the ask is findable in a long scroll.
+   ───────────────────────────────────────────────────────────────────── */
 
-.dark .message-system {
-  background-color: #362424;
-}
-.dark .message-system-header {
-  background-color: #4e2c2a;
-}
-.dark .message-system-button {
-  background-color: #b04a31;
-  color: #ffffff;
+.message-system,
+.message-user,
+.message-assistant,
+.message-tool,
+.message-file {
+  background-color: var(--card-paper);
+  border: 1px solid var(--card-border);
+  border-left-width: 3px;
 }
 
-/* User: #2A9D8F (teal) */
+/* Shared quiet button surface — role identity survives in the text color
+   (all AA at 12px on the surface below). */
+.message-system-button,
+.message-user-button,
+.message-assistant-button,
+.message-tool-button,
+.message-file-button {
+  background-color: var(--card-quiet);
+}
+.dark .message-system-button,
+.dark .message-user-button,
+.dark .message-assistant-button,
+.dark .message-tool-button,
+.dark .message-file-button {
+  background-color: var(--card-quiet);
+}
+
+/* System: #E76F51 (coral) */
+.message-system { border-left-color: #e76f51; }
+.message-system-header { background-color: rgba(231, 111, 81, 0.08); }
+.message-system-label { color: #b4472a; }
+.message-system-button { color: #b4472a; }
+.message-system-button:hover { background-color: #e76f51; color: #ffffff; }
+.dark .message-system-header { background-color: rgba(231, 111, 81, 0.1); }
+.dark .message-system-label { color: #f0937b; }
+.dark .message-system-button { color: #f0937b; }
+.dark .message-system-button:hover { background-color: #b04a31; color: #ffffff; }
+
+/* User: #2A9D8F (teal). The ONE tinted body — this is the task. */
 .message-user {
   border-left-color: #2a9d8f;
-  background-color: #d9f0ed;
+  background-color: #eef7f6;
 }
-.message-user-header {
-  background-color: #b5e3dc;
-}
-.message-user-button {
-  background-color: #6fc4b8;
-  color: #12463f; /* 5.2:1 on the tint — the 12px labels need AA */
-}
-.message-user-button:hover {
-  background-color: #2a9d8f;
-  color: #ffffff;
-}
+.message-user-header { background-color: rgba(42, 157, 143, 0.1); }
+.message-user-label { color: #1a7268; }
+.message-user-button { color: #1a7268; }
+.message-user-button:hover { background-color: #2a9d8f; color: #ffffff; }
+.dark .message-user { background-color: #182426; }
+.dark .message-user-header { background-color: rgba(42, 157, 143, 0.12); }
+.dark .message-user-label { color: #5fc9bc; }
+.dark .message-user-button { color: #5fc9bc; }
+.dark .message-user-button:hover { background-color: #2a9d8f; color: #ffffff; }
 
-.dark .message-user {
-  background-color: #1a3a36;
-}
-.dark .message-user-header {
-  background-color: #245550;
-}
-.dark .message-user-button {
-  background-color: #2a9d8f;
-  color: #ffffff;
-}
-
-/* Assistant: #E9C46A (yellow/gold) */
-.message-assistant {
-  border-left-color: #e9c46a;
-  background-color: #faf3dc;
-}
-.message-assistant-header {
-  background-color: #f5e6b8;
-}
-.message-assistant-button {
-  background-color: #f2d898;
-  color: #6b520e;
-}
-.message-assistant-button:hover {
-  background-color: #e9c46a;
-}
-
-.dark .message-assistant {
-  background-color: #3d3520;
-}
-.dark .message-assistant-header {
-  background-color: #5c4f2d;
-}
-.dark .message-assistant-button {
-  background-color: #c9a44a;
-  color: #3d3520;
-}
+/* Assistant: #E9C46A (gold) */
+.message-assistant { border-left-color: #e9c46a; }
+.message-assistant-header { background-color: rgba(233, 196, 106, 0.14); }
+.message-assistant-label { color: #806110; }
+.message-assistant-button { color: #806110; }
+.message-assistant-button:hover { background-color: #e9c46a; color: #3d3520; }
+.dark .message-assistant-header { background-color: rgba(233, 196, 106, 0.1); }
+.dark .message-assistant-label { color: #e9c46a; }
+.dark .message-assistant-button { color: #e9c46a; }
+.dark .message-assistant-button:hover { background-color: #c9a44a; color: #211d10; }
 
 /* Tool: #264653 (dark teal) */
-.message-tool {
-  border-left-color: #264653;
-  background-color: #d6e2e6; /* one step deeper than .message-file so the two blue-grays sort at a glance */
-}
-.message-tool-header {
-  background-color: #b8ccd3;
-}
-.message-tool-button {
-  background-color: #46707c;
-  color: #ffffff;
-}
-.message-tool-button:hover {
-  background-color: #264653;
-}
-
-.dark .message-tool {
-  background-color: #1a2a30;
-}
-.dark .message-tool-header {
-  background-color: #264653;
-}
-.dark .message-tool-button {
-  background-color: #3d6673;
-  color: #ffffff;
-}
+.message-tool { border-left-color: #264653; }
+.message-tool-header { background-color: rgba(38, 70, 83, 0.08); }
+.message-tool-label { color: #264653; }
+.message-tool-button { color: #264653; }
+.message-tool-button:hover { background-color: #264653; color: #ffffff; }
+.dark .message-tool { border-left-color: #5c8a97; }
+.dark .message-tool-header { background-color: rgba(92, 138, 151, 0.12); }
+.dark .message-tool-label { color: #8fbdcc; }
+.dark .message-tool-button { color: #8fbdcc; }
+.dark .message-tool-button:hover { background-color: #3d6673; color: #ffffff; }
 
 /* File: #607D8B (blue gray) */
-.message-file {
-  border-left-color: #607d8b;
-  background-color: #eef2f5;
-}
-.message-file-header {
-  background-color: #cfd8dc;
-}
-.message-file-button {
-  background-color: #90a4ae;
-  color: #1f343d;
-}
-.message-file-button:hover {
-  background-color: #607d8b;
-  color: #ffffff;
-}
+.message-file { border-left-color: #607d8b; }
+.message-file-header { background-color: rgba(96, 125, 139, 0.09); }
+.message-file-label { color: #4a616d; }
+.message-file-button { color: #4a616d; }
+.message-file-button:hover { background-color: #607d8b; color: #ffffff; }
+.dark .message-file-header { background-color: rgba(144, 164, 174, 0.1); }
+.dark .message-file-label { color: #a4bcc8; }
+.dark .message-file-button { color: #a4bcc8; }
+.dark .message-file-button:hover { background-color: #546e7a; color: #ffffff; }
 
-.dark .message-file {
-  background-color: #263238;
-}
-.dark .message-file-header {
-  background-color: #37474f;
-}
-.dark .message-file-button {
-  background-color: #546e7a;
-  color: #ffffff;
-}
-
-/* Reasoning block: #F4A261 (orange). One clear step away from the assistant
-   card it nests in — quieter than body content is fine, indistinguishable
-   is not (the dark fills were near-twins of .dark .message-assistant). */
+/* Reasoning band: #F4A261 (orange). Borderless — a 2px rule and a micro
+   label, no fill, so the model's thinking reads as an aside inside the
+   assistant card rather than a second card. Violet stays reserved for
+   grade quotes. */
 .reasoning {
-  border-left-color: #f4a261;
-  background-color: #fce4c8;
+  border-left: 2px solid #f4a261;
+  background-color: transparent;
+  padding-left: 12px;
 }
-.reasoning-header {
-  background-color: #fad7b3;
+.reasoning-label { color: #a85f21; }
+.dark .reasoning { border-left-color: #f6b077; }
+.dark .reasoning-label { color: #f2a86b; }
+
+/* Tool-call band inside an assistant card — flattened the same way: a
+   hairline separates bands, the micro label names the call. */
+.tool-call-band {
+  border-top: 1px solid var(--card-hairline);
 }
 
-.dark .reasoning {
-  background-color: #33220f;
-}
-.dark .reasoning-header {
-  background-color: #52381b;
-}
+/* The transcript scroller's paper-tray backdrop, so neutral cards still
+   read as cards rather than as the page itself. */
+.transcript-surface { background-color: var(--transcript-bg); }
 
 /* Resize handle */
 .responsive-resize-handle {
@@ -312,6 +318,25 @@
   .comments-drawer { animation: none; }
 }
 
+/* Minimap hover tooltip — pops from the rail with a quick settle. */
+@keyframes minimap-tooltip-in {
+  from { opacity: 0; transform: translateX(6px) scale(0.96); }
+  to { opacity: 1; transform: translateX(0) scale(1); }
+}
+.minimap-tooltip {
+  animation: minimap-tooltip-in 150ms cubic-bezier(0.16, 1, 0.3, 1);
+  transform-origin: right center;
+}
+@media (prefers-reduced-motion: reduce) {
+  .minimap-tooltip { animation: none; }
+}
+
+/* The transcript scroller hides its scrollbar while the minimap is present —
+   two side-by-side position indicators are one too many. Presentation Mode
+   (no minimap) keeps the styled scrollbar. */
+.scrollbar-none { scrollbar-width: none; }
+.scrollbar-none::-webkit-scrollbar { display: none; }
+
 /* ─────────────────────────────────────────────────────────────────────
    Analysis dashboard ("scientific instrument panel")
    Cohesive with the app's warm palette; adds depth, motion, and a
@@ -326,32 +351,34 @@
 }
 .tnum { font-variant-numeric: tabular-nums; }
 
-/* Atmospheric backdrop — faint palette glows, never fighting the data. */
+/* Atmospheric backdrop — faint palette glows, never fighting the data. One
+   paper temperature per theme: the light ground is the transcript's warm tray
+   (not pure white), the dark ground the neutral panel (not the old navy). */
 .analysis-surface {
-  background-color: var(--bg-primary);
+  background-color: var(--transcript-bg);
   background-image:
     radial-gradient(110% 75% at 100% 0%, rgba(42, 157, 143, 0.07), transparent 55%),
     radial-gradient(95% 65% at 0% 100%, rgba(233, 196, 106, 0.06), transparent 50%);
 }
 .dark .analysis-surface {
-  background-color: #15152a;
+  background-color: var(--bg-primary);
   background-image:
     radial-gradient(110% 75% at 100% 0%, rgba(42, 157, 143, 0.12), transparent 55%),
-    radial-gradient(95% 65% at 0% 100%, rgba(15, 52, 96, 0.55), transparent 55%);
+    radial-gradient(95% 65% at 0% 100%, rgba(233, 196, 106, 0.07), transparent 55%);
 }
 
 /* Card: hairline border, layered fill, accent rail on hover/elevation. */
 .analysis-card {
   position: relative;
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.65), rgba(248, 250, 252, 0.35));
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(241, 239, 236, 0.38));
   border: 1px solid var(--border-color);
   border-radius: 14px;
   backdrop-filter: blur(2px);
   transition: box-shadow 0.22s ease, transform 0.22s ease, border-color 0.22s ease;
 }
 .dark .analysis-card {
-  background: linear-gradient(180deg, rgba(31, 41, 64, 0.55), rgba(22, 33, 62, 0.35));
-  border-color: #2b3b57;
+  background: linear-gradient(180deg, rgba(35, 40, 48, 0.62), rgba(22, 25, 29, 0.4));
+  border-color: #2b3138;
 }
 .analysis-card:hover {
   transform: translateY(-2px);
@@ -407,7 +434,7 @@
   background: var(--bg-primary);
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
 }
-.dark .seg-btn[data-active='true'] { background: #0f3460; color: #fff; }
+.dark .seg-btn[data-active='true'] { background: #2b3138; color: #fff; }
 
 /* Recharts polish: thinner, calmer gridlines that recede behind the data. */
 .analysis-card .recharts-cartesian-grid line { opacity: 0.55; }

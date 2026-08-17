@@ -821,7 +821,7 @@ function CompositionBar({ stats, dark }: { stats: RewardStats; dark: boolean }) 
         <h3 className={`text-sm font-semibold tracking-tight ${dark ? 'text-gray-200' : 'text-gray-800'}`}>Reward Composition</h3>
         <span className={`text-xs ${mutedColorClass(dark)}`}>n = <span className="font-data">{stats.n.toLocaleString()}</span></span>
       </div>
-      <div className="flex w-full h-3.5 rounded-full overflow-hidden" style={{ background: dark ? '#0f3460' : '#eef2f6' }}>
+      <div className="flex w-full h-3.5 rounded-full overflow-hidden" style={{ background: dark ? 'var(--bg-tertiary)' : 'var(--card-quiet)' }}>
         {segments.map((s, i) => (
           <div key={i} title={`${s.label}: ${pct(s.value)}`} style={{ width: `${s.value * 100}%`, background: s.color }} className="h-full transition-all" />
         ))}

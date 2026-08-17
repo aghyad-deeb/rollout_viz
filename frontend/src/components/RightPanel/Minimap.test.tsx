@@ -147,9 +147,11 @@ describe('Minimap', () => {
     // Green local-search tick on message 2 only.
     expect(screen.getByTestId('minimap-tick-local-2')).toBeInTheDocument();
     expect(screen.queryByTestId('minimap-tick-local-0')).not.toBeInTheDocument();
-    // Purple grade-quote tick and blue deep-link tick on message 1.
-    expect(screen.getByTestId('minimap-tick-quote-1')).toBeInTheDocument();
+    // Message 1 carries BOTH a grade quote and the deep link — one tick per
+    // message, and the deep link wins on priority; the tooltip still lists
+    // every category.
     expect(screen.getByTestId('minimap-tick-deeplink-1')).toBeInTheDocument();
+    expect(screen.queryByTestId('minimap-tick-quote-1')).not.toBeInTheDocument();
   });
 
   it('hides itself when the transcript fits without scrolling', () => {
@@ -188,11 +190,28 @@ describe('Minimap', () => {
     const tooltip = screen.getByTestId('minimap-tooltip');
     expect(tooltip).toHaveTextContent('#2 · assistant');
     expect(tooltip).toHaveTextContent('The quick brown fox');
-    // Preview is capped at ~60 chars.
-    expect(tooltip.textContent!.length).toBeLessThan(90);
+    // Size metadata rides in the header row (74 chars here).
+    expect(tooltip).toHaveTextContent(/\d+ chars/);
+    // The pop-in animation class is attached.
+    expect(tooltip.className).toContain('minimap-tooltip');
 
     fireEvent.mouseLeave(screen.getByTestId('conversation-minimap'));
     expect(screen.queryByTestId('minimap-tooltip')).not.toBeInTheDocument();
+  });
+
+  it('lists the highlight markers a hovered message carries', () => {
+    const messages = [
+      makeMessage('user', 'nothing here'),
+      makeMessage('assistant', 'the needle is in this haystack'),
+    ];
+    container = buildContainer(messages.length);
+    renderMinimap(messages, container, { localSearchTerm: 'needle' });
+
+    fireEvent.mouseEnter(screen.getByTestId('minimap-block-1'));
+    expect(screen.getByTestId('minimap-tooltip')).toHaveTextContent('find match');
+
+    fireEvent.mouseEnter(screen.getByTestId('minimap-block-0'));
+    expect(screen.getByTestId('minimap-tooltip')).not.toHaveTextContent('find match');
   });
 
   it('keeps blocks out of the tab order so keyboard navigation is unaffected', () => {

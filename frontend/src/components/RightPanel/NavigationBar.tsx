@@ -180,7 +180,7 @@ export function NavigationBar({
     : 'text-gray-600 bg-gray-200 hover:bg-gray-300';
 
   return (
-    <div className={`flex flex-wrap items-center justify-between gap-x-4 gap-y-2 px-4 py-2 border-b ${isDarkMode ? 'bg-[#16213e] border-gray-700' : 'bg-white border-gray-200'}`}>
+    <div className={`flex flex-wrap items-center justify-between gap-x-4 gap-y-2 px-4 py-2 border-b ${isDarkMode ? 'bg-[var(--bg-secondary)] border-[var(--border-color)]' : 'bg-white border-gray-200'}`}>
       {/* View mode toggle */}
       <div className="flex items-center">
         <div className={`flex h-9 rounded-md border overflow-hidden mr-4 ${isDarkMode ? 'border-gray-600' : 'border-gray-300'}`}>
@@ -291,6 +291,21 @@ export function NavigationBar({
                         : 'No sample selected'
                       }
                     </span>
+                    {sample && typeof sample.attributes.reward === 'number' && (
+                      <span
+                        data-testid="reward-chip"
+                        title={`Reward ${sample.attributes.reward}`}
+                        className={`text-[12.5px] font-semibold tnum px-1.5 py-0.5 rounded ${
+                          sample.attributes.reward < 0
+                            ? (isDarkMode ? 'bg-rose-900/50 text-rose-300' : 'bg-[#fde7e7] text-[#9f1d1d]')
+                            : sample.attributes.reward > 0
+                              ? (isDarkMode ? 'bg-emerald-900/50 text-emerald-300' : 'bg-[#e3f5ea] text-[#166534]')
+                              : (isDarkMode ? 'bg-gray-700 text-gray-300' : 'bg-gray-100 text-gray-600')
+                        }`}
+                      >
+                        {sample.attributes.reward}
+                      </span>
+                    )}
                     {navPos >= 0 && (
                       <span className={`text-xs tnum ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>
                         · {navPos + 1} / {navTotal}
@@ -391,7 +406,7 @@ export function NavigationBar({
                         data-testid="comments-attention-dot"
                         aria-hidden="true"
                         className={`absolute -bottom-0.5 -right-0.5 w-2 h-2 rounded-full ring-1 ${
-                          isDarkMode ? 'bg-amber-400 ring-[#16213e]' : 'bg-amber-500 ring-white'
+                          isDarkMode ? 'bg-amber-400 ring-[var(--bg-secondary)]' : 'bg-amber-500 ring-white'
                         }`}
                       />
                     )}

@@ -90,9 +90,12 @@ export function CompanionDrawer({ filePath, isDarkMode, onClose }: CompanionDraw
   };
 
   return (
+    // Layout mirrors CommentsPanel: on sm+ a STATIC flex sibling of the
+    // content column, so opening it shrinks the transcript instead of covering
+    // the text being read. Below sm it falls back to a full-width overlay.
     <div
-      className={`absolute inset-y-0 right-0 z-20 w-full sm:w-[32rem] max-w-full flex flex-col border-l shadow-xl ${
-        isDarkMode ? 'bg-gray-900 border-gray-700' : 'bg-white border-gray-200'
+      className={`absolute inset-y-0 right-0 z-20 w-full max-w-full sm:static sm:shrink-0 sm:w-[24rem] flex flex-col border-l shadow-xl ${
+        isDarkMode ? 'bg-[var(--bg-secondary)] border-[var(--border-color)]' : 'bg-white border-gray-200'
       }`}
       role="dialog"
       aria-label="Run files"

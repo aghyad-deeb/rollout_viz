@@ -60,6 +60,18 @@ interface MessageCardProps {
   // Bulk expand/collapse signal from ChatView. The version bump is what
   // applies the value; per-card toggling still works after a bulk action.
   expandAllSignal?: { value: boolean; version: number };
+  // The conversation's FIRST user message — the task statement. Gets a
+  // 'TASK' running head and a step-up in body size. Role semantics (colors,
+  // search scoping, minimap) are untouched.
+  isTaskMessage?: boolean;
+  // This tool result answers the assistant call directly above it (ChatView
+  // also indents its wrapper) — the header label reads '↳ bash'.
+  isChainedToolResult?: boolean;
+  // True for the off-screen capture clone (ChatView's portal card). An
+  // exported figure must show the WHOLE message: the card mounts expanded and
+  // fully revealed no matter what the role's on-screen default is (system
+  // cards start collapsed) and ignores the bulk expand/collapse signal.
+  forCapture?: boolean;
 }
 
 const ROLE_CONFIG = {
@@ -68,42 +80,49 @@ const ROLE_CONFIG = {
     className: 'message-system',
     headerClassName: 'message-system-header',
     buttonClassName: 'message-system-button',
+    labelClassName: 'message-system-label',
   },
   user: {
     icon: 'person',
     className: 'message-user',
     headerClassName: 'message-user-header',
     buttonClassName: 'message-user-button',
+    labelClassName: 'message-user-label',
   },
   assistant: {
     icon: 'network_intelligence',
     className: 'message-assistant',
     headerClassName: 'message-assistant-header',
     buttonClassName: 'message-assistant-button',
+    labelClassName: 'message-assistant-label',
   },
   tool: {
     icon: 'build',
     className: 'message-tool',
     headerClassName: 'message-tool-header',
     buttonClassName: 'message-tool-button',
+    labelClassName: 'message-tool-label',
   },
   file: {
     icon: 'description',
     className: 'message-file',
     headerClassName: 'message-file-header',
     buttonClassName: 'message-file-button',
+    labelClassName: 'message-file-label',
   },
   developer: {
     icon: 'code',
     className: 'message-system',
     headerClassName: 'message-system-header',
     buttonClassName: 'message-system-button',
+    labelClassName: 'message-system-label',
   },
   _gptoss_internal_system: {
     icon: 'contextual_token',
     className: 'message-system',
     headerClassName: 'message-system-header',
     buttonClassName: 'message-system-button',
+    labelClassName: 'message-system-label',
   },
 } as const;
 
@@ -208,9 +227,18 @@ function MessageCardInner({
   captureStatus,
   isPresentationActive = false,
   expandAllSignal,
+  isTaskMessage = false,
+  isChainedToolResult = false,
+  forCapture = false,
 }: MessageCardProps) {
   void isSharedMode;
-  const [isExpanded, setIsExpanded] = useState(true);
+  // First-screen economy: system prompts are read once per file, so they
+  // start collapsed (their header still shows a one-line excerpt). Every
+  // other role opens expanded. Bulk expand/collapse, the per-card toggle and
+  // the deep-link / search force-reveal below all still apply.
+  // The capture clone is always expanded: an exported figure of a header strip
+  // is never what the researcher asked for.
+  const [isExpanded, setIsExpanded] = useState(forCapture || message.role !== 'system');
   const [isHovered, setIsHovered] = useState(false);
   const [selectionPopup, setSelectionPopup] = useState<SelectionPopup>({ show: false, x: 0, y: 0, text: '', before: '', after: '', blockKind: '', blockIndex: -1 });
   const [copiedLink, setCopiedLink] = useState(false);
@@ -220,7 +248,7 @@ function MessageCardInner({
   // Long-card clamping: `showFull` is the user's "Show full message" reveal;
   // `isClampOverflowing` records whether the clamped body actually overflows
   // (measured in a layout effect) — short cards get no fade / button chrome.
-  const [showFull, setShowFull] = useState(false);
+  const [showFull, setShowFull] = useState(forCapture);
   const [isClampOverflowing, setIsClampOverflowing] = useState(false);
   // ~lines hidden behind the clamp (scroll overflow / 20px line boxes).
   const [clampHiddenLines, setClampHiddenLines] = useState(0);
@@ -234,15 +262,18 @@ function MessageCardInner({
   // mount-time version guards the initial mount (and re-mounts): only a
   // version bump after mount applies the value, so per-card toggling still
   // works after a bulk action.
+  // The capture clone opts out entirely — a collapse-all must not empty the
+  // figure that is about to be exported.
   const lastExpandAllVersionRef = useRef(expandAllSignal?.version);
   useEffect(() => {
+    if (forCapture) return;
     if (expandAllSignal && expandAllSignal.version !== lastExpandAllVersionRef.current) {
       lastExpandAllVersionRef.current = expandAllSignal.version;
       setIsExpanded(expandAllSignal.value);
       // Expand-all also reveals a clamped long card; collapse-all re-clamps.
       setShowFull(expandAllSignal.value);
     }
-  }, [expandAllSignal]);
+  }, [expandAllSignal, forCapture]);
 
   // Smooth-scroll the card into view when it becomes the URL-shared target.
   useEffect(() => {
@@ -549,7 +580,8 @@ function MessageCardInner({
   // Never clamp in presentation mode (the off-screen capture clone renders
   // with isPresentationMode=true, so it is covered too) or when the card is
   // the URL-highlight target.
-  const isClampable = CLAMPABLE_ROLES.includes(message.role) && !isPresentationMode && !isHighlighted;
+  const isClampable = CLAMPABLE_ROLES.includes(message.role)
+    && !isPresentationMode && !forCapture && !isHighlighted;
   // True when ChatView's Ctrl+F cursor points at a match inside this card —
   // the card owns local-match indices [localOccurrenceStart, end).
   const hasCurrentLocalMatch = localSearchTerm.trim() !== ''
@@ -560,6 +592,11 @@ function MessageCardInner({
   // same pattern as GradesDisplay's history reset.
   if ((isHighlighted || hasCurrentLocalMatch) && !showFull) {
     setShowFull(true);
+  }
+  // Same guarantee for the collapsed-by-default system card: a deep link or
+  // the current Ctrl+F match must never point into a card that isn't drawn.
+  if ((isHighlighted || hasCurrentLocalMatch) && !isExpanded) {
+    setIsExpanded(true);
   }
   const isClamped = isClampable && !showFull;
 
@@ -790,7 +827,7 @@ function MessageCardInner({
             startsKind('local-search') ? 'local-search-mark' : 'local-search-fragment',
             ...(isCurrentKind('local-search')
               ? ['bg-green-400', 'text-green-900', 'ring-2', 'ring-green-500', 'ring-offset-1', 'dark:ring-offset-0']
-              : ['bg-green-200', 'text-green-800', 'dark:bg-green-500/30', 'dark:text-green-200'])
+              : ['bg-green-200', 'text-green-800', 'dark:bg-green-400', 'dark:text-green-950'])
           );
         }
         if (hasKind('global-search')) {
@@ -801,7 +838,7 @@ function MessageCardInner({
               // ring-yellow-600 gives the mark a defining edge inside gold
               // assistant cards, where fill chroma alone is the weakest cue.
               : ['bg-yellow-300', 'text-yellow-900', 'ring-1', 'ring-yellow-600/60',
-                 'dark:bg-yellow-500/30', 'dark:text-yellow-200', 'dark:ring-0'])
+                 'dark:bg-yellow-400', 'dark:text-yellow-950', 'dark:ring-0'])
           );
         }
         if (hasKind('ephemeral-highlight')) {
@@ -1088,19 +1125,35 @@ function MessageCardInner({
   const fileLabel = (message.role === 'file' || message.role === 'tool') && typeof message.name === 'string'
     ? message.name.trim()
     : '';
-  const headerLabel = presentationLabel || fileLabel || message.role;
+  const baseHeaderLabel = presentationLabel || fileLabel
+    || (isTaskMessage && message.role === 'user' ? 'TASK' : message.role);
+  // A tool result bound to the call above it reads as a continuation.
+  const headerLabel = isChainedToolResult ? `↳ ${baseHeaderLabel}` : baseHeaderLabel;
+
+  // Last lines of a clamped tool/file output, shown as a tail preview under
+  // the clamp fade (see the clamp footer render).
+  const clampTail = useMemo(() => {
+    if (message.role !== 'tool' && message.role !== 'file') return '';
+    return (mainContent ?? '').split('\n').slice(-6).join('\n').trimEnd();
+  }, [message.role, mainContent]);
 
   // Collapsed cards show a one-line excerpt of what they hide — collapse-all
-  // becomes a table of contents instead of a column of mute role bars.
+  // becomes a table of contents instead of a column of mute role bars. The
+  // excerpt is NOT sliced here: it is truncated by CSS so the visible text
+  // always fills the actual column width.
   const collapsedExcerpt = useMemo(() => {
     if (isExpanded) return null;
     const source = (reasoning?.trim() || mainContent?.trim() || toolCallText?.trim() || '');
-    const firstLine = source.split('\n').find(l => l.trim())?.trim() ?? '';
-    if (!firstLine) return null;
-    const totalChars = (reasoning?.length ?? 0) + (mainContent?.length ?? 0) + (toolCallText?.length ?? 0);
-    const sizeHint = totalChars >= 1000 ? ` · ${(totalChars / 1000).toFixed(1)}k chars` : '';
-    return `${firstLine}${sizeHint}`;
+    return source.split('\n').find(l => l.trim())?.trim() ?? null;
   }, [isExpanded, reasoning, mainContent, toolCallText]);
+
+  // Physical size of the message, in lines — the scan-mode weight cue. Shown
+  // as a badge ahead of a collapsed excerpt and in the header's meta run.
+  const lineCount = useMemo(() => {
+    const source = [reasoning, mainContent, toolCallText].filter(Boolean).join('\n');
+    if (!source) return 0;
+    return source.split('\n').length;
+  }, [reasoning, mainContent, toolCallText]);
 
   return (
     <div
@@ -1111,44 +1164,70 @@ function MessageCardInner({
       onMouseDown={() => { if (isPresentationMode) onPreviewSelect?.(index); }}
     >
       <div className="relative">
-        <div className={`rounded-lg border-l-4 overflow-hidden transition-all duration-200 ${config.className} shadow-md`}>
+        <div className={`rounded-lg overflow-hidden transition-all duration-200 ${config.className} shadow-sm`}>
           {/* Header */}
           <div className={`shadow-xs ${config.headerClassName}`}>
             <div
-              className={`flex items-center justify-between pl-3 pr-1 py-1 cursor-pointer transition-colors duration-150 ${isDarkMode ? 'hover:bg-white/5' : 'hover:bg-gray-50/50'}`}
+              className={`flex items-center gap-2 pl-3 pr-1 py-1 cursor-pointer transition-colors duration-150 ${isDarkMode ? 'hover:bg-white/5' : 'hover:bg-gray-50/50'}`}
               onClick={() => setIsExpanded(!isExpanded)}
             >
-              {/* Icon + label lead at the card's shared left edge (chevron
-                  follows), so label and body text sit on one optical margin.
-                  The label is a 12px running head — body size then means
-                  exactly one thing: transcript text. */}
-              <div className="flex items-center gap-2 min-w-0 flex-1">
-                <span className={`text-xs font-semibold uppercase tracking-wide ${textSecondary}`}>
-                  {/* min-h (not fixed h) so in the scaled-up capture the
-                      header grows with the enlarged icon/label instead of
-                      staying cramped. */}
-                  <span className="flex items-center min-h-5 gap-1">
-                    <span className="material-symbols-outlined" style={{ fontSize: 20 }}>
-                      {config.icon}
-                    </span>
-                    {headerLabel}
-                  </span>
+              {/* Fixed-width identity gutter: icon + role label. Every card
+                  pays the same 7rem, so collapsed excerpts all start on one
+                  x — the collapse-all view reads as a table of contents.
+                  The label carries the role hue (the card fill no longer
+                  does); min-h (not fixed h) so the scaled-up capture header
+                  grows with the enlarged icon instead of staying cramped. */}
+              <span
+                className={`role-label-gutter w-28 shrink-0 flex items-center min-h-5 gap-1 text-xs font-semibold uppercase tracking-wide ${config.labelClassName}`}
+                title={headerLabel}
+              >
+                <span className="material-symbols-outlined shrink-0" style={{ fontSize: 20 }}>
+                  {config.icon}
                 </span>
-                <button className="presentation-chrome" aria-label="Toggle message content">
-                  <span
-                    className={`material-symbols-outlined ${textMuted} transition-transform duration-200 p-2 -m-2 ${isExpanded ? '' : '-rotate-90'}`}
-                    style={{ fontSize: 17 }}
-                    aria-hidden="true"
-                  >
-                    expand_less
-                  </span>
-                </button>
-                {!isExpanded && collapsedExcerpt && (
-                  <span className={`truncate min-w-0 flex-1 text-left text-xs font-normal normal-case tracking-normal ${textMuted}`}>
-                    {collapsedExcerpt}
-                  </span>
-                )}
-              </div>
+                {/* `role-label-text` lets the capture stylesheet release the
+                    truncation: a figure of ONE card has no column to align to,
+                    and the rasterizer's font metrics differ just enough from
+                    the measured box to shave the last glyph ("BASH" → "BASI"). */}
+                <span className="role-label-text truncate">{headerLabel}</span>
+              </span>
+              {/* Collapsed: a line-count badge + a width-aware excerpt
+                  (CSS ellipsis, never a JS slice, so it always fills the
+                  real column). Expanded: an empty spring. */}
+              {!isExpanded ? (
+                <span className="flex items-center gap-1.5 min-w-0 flex-1">
+                  {lineCount > 0 && (
+                    <span
+                      data-testid="collapsed-line-count"
+                      // Fixed width + right alignment: a 3-digit count must
+                      // not push the excerpt column off the shared x.
+                      className={`shrink-0 w-10 text-right font-mono text-[10px] tnum tracking-normal normal-case font-normal ${textMuted}`}
+                    >
+                      {lineCount} L
+                    </span>
+                  )}
+                  {collapsedExcerpt && (
+                    // `collapsed-excerpt` is hidden in a capture: the excerpt
+                    // is a scan-mode duplicate of the body, and at fontScale > 1
+                    // it overran the '#N · M ln' meta run.
+                    <span className={`collapsed-excerpt truncate min-w-0 flex-1 text-left text-xs font-normal normal-case tracking-normal ${textSecondary}`}>
+                      {collapsedExcerpt}
+                    </span>
+                  )}
+                </span>
+              ) : (
+                <span className="min-w-0 flex-1" />
+              )}
+              {/* Right slot: the quiet meta run (#index · line count) when
+                  idle, swapped for the action buttons on hover. The meta is
+                  absolutely positioned so the swap costs no layout shift. */}
+              <div className="relative flex items-center shrink-0">
+                <span
+                  data-testid="header-meta"
+                  aria-hidden="true"
+                  className={`absolute inset-y-0 right-0 flex items-center whitespace-nowrap font-mono text-[10px] tnum tracking-normal normal-case font-normal pointer-events-none transition-opacity ${textMuted} ${isHovered ? 'opacity-0' : 'opacity-100'}`}
+                >
+                  #{index + 1}{lineCount > 0 ? ` · ${lineCount} ln` : ''}
+                </span>
               {/* Action buttons — entirely presentation-chrome (excluded
                   from a captured image). */}
               <div className="flex items-center gap-1 presentation-chrome">
@@ -1222,22 +1301,41 @@ function MessageCardInner({
                   </span>
                 </button>
               </div>
+              </div>
+              {/* Chevron — parked at the far right end of the header row so
+                  the excerpt column runs uninterrupted from the gutter to
+                  the meta slot. The whole header stays clickable. */}
+              <button className="presentation-chrome shrink-0" aria-label="Toggle message content">
+                <span
+                  className={`material-symbols-outlined block ${textMuted} transition-transform duration-200 p-1 -m-1 ${isExpanded ? 'rotate-180' : ''}`}
+                  style={{ fontSize: 17 }}
+                  aria-hidden="true"
+                >
+                  expand_more
+                </span>
+              </button>
             </div>
           </div>
 
-          {/* Content */}
+          {/* Content. The grid-rows 1fr/0fr pair + the inner overflow-hidden
+              is the collapse animation. Both carry a dedicated class so the
+              capture stylesheet can force them open WITHOUT a blanket
+              `.overflow-hidden` override (which would also un-clip the
+              rounded card, the truncating header cells and the tool-call
+              scrollers). See `.capture-export .message-body-*` in index.css. */}
           <div
-            className={`grid transition-all duration-300 ease-in-out ${isExpanded ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]'}`}
+            data-testid="message-body-grid"
+            className={`message-body-grid grid transition-all duration-300 ease-in-out ${isExpanded ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]'}`}
             style={{ overflowWrap: 'anywhere' }}
           >
-            <div className="overflow-hidden">
+            <div className="message-body-clip overflow-hidden">
               <div
                 ref={contentRef}
                 className={
                   // Tool results are the evidence and keep the taller clamp;
                   // system/file boilerplate is read once per file and yields
                   // its screen space sooner.
-                  `space-y-2 py-2${isClamped ? ` ${message.role === 'tool' ? 'max-h-60' : 'max-h-40'} overflow-hidden relative` : ''}`
+                  `space-y-2 py-2${isClamped ? ` ${message.role === 'tool' ? 'max-h-60' : 'max-h-36'} overflow-hidden relative` : ''}`
                 }
               >
                 {/* Reasoning block. When collapsed whole, it is NOT drawn
@@ -1245,10 +1343,10 @@ function MessageCardInner({
                     own line; instead the [...] leads the main content below
                     inline (see the content block). */}
                 {reasoning && !isSectionCollapsed(reasoning) && (
-                  <div className="mx-3 rounded-md border-l-4 shadow-xs overflow-hidden reasoning">
-                    <div className={`px-2 py-0.5 flex items-center justify-between gap-1 text-xs font-semibold uppercase tracking-wide ${textSecondary} shadow-2xs reasoning-header`}>
-                      <span className="flex items-center gap-1">
-                        <span className="material-symbols-outlined" style={{ fontSize: 14 }}>lightbulb</span>
+                  <div className="mx-3 reasoning">
+                    <div className="flex items-center justify-between gap-1">
+                      <span className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide reasoning-label">
+                        <span className="material-symbols-outlined" style={{ fontSize: 12 }}>lightbulb</span>
                         reasoning
                       </span>
                       {isPresentationMode && (
@@ -1264,7 +1362,11 @@ function MessageCardInner({
                         </button>
                       )}
                     </div>
-                    <div data-msg-block data-block-kind="reasoning" className={`px-3 py-2 text-[13px] leading-[1.6] max-w-[90ch] ${textPrimary} whitespace-pre-wrap`}>
+                    {/* Reasoning reads at the SAME tier as the final answer
+                        (user decision 2026-08-16: reasoning is often where
+                        the evidence lives — the orange band is identity,
+                        not de-emphasis). */}
+                    <div data-msg-block data-block-kind="reasoning" className={`pt-1 pr-3 text-sm leading-6 max-w-[90ch] ${textPrimary} whitespace-pre-wrap`}>
                       {renderWithCollapse(reasoning, true, 'reasoning', -1, globalOccurrenceStarts.reasoningStart, localSearchStarts.reasoningStart)}
                     </div>
                   </div>
@@ -1282,8 +1384,10 @@ function MessageCardInner({
                     data-block-kind="content"
                     className={`mx-3 whitespace-pre-wrap ${
                       message.role === 'tool' || message.role === 'file'
-                        ? 'font-mono text-xs leading-[1.5]'
-                        : 'text-sm leading-6 max-w-[90ch]'
+                        ? 'font-mono text-[13px] leading-[20px]'
+                        : isTaskMessage
+                          ? 'text-[16px] leading-[1.55] font-[450] max-w-[90ch]'
+                          : 'text-sm leading-6 max-w-[90ch]'
                     } ${textPrimary}`}
                   >
                     {reasoning && isSectionCollapsed(reasoning) && (
@@ -1297,12 +1401,12 @@ function MessageCardInner({
                     were extracted (older Kimi rows the parser didn't fully
                     recover). Today the parser always populates `toolCalls`. */}
                 {toolCallText && toolCalls.length === 0 && (
-                  <div className={`mx-3 rounded-md border overflow-hidden ${isDarkMode ? 'border-gray-600 bg-gray-800/50' : 'border-gray-200 bg-gray-50'}`}>
-                    <div className={`px-2 py-1 flex items-center gap-1 text-xs font-medium ${isDarkMode ? 'bg-gray-700/50 text-gray-300' : 'bg-gray-100 text-gray-600'}`}>
-                      <span className="material-symbols-outlined" style={{ fontSize: 14 }}>terminal</span>
-                      tool call
+                  <div className="mx-3 tool-call-band pt-1.5">
+                    <div className={`flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide ${textMuted}`}>
+                      <span className="material-symbols-outlined" style={{ fontSize: 12 }}>terminal</span>
+                      call
                     </div>
-                    <pre className={`px-3 py-2 text-xs leading-[1.5] overflow-x-auto ${isDarkMode ? 'text-green-400' : 'text-gray-800'}`}>{toolCallText}</pre>
+                    <pre className={`pt-1 text-[13px] leading-[20px] overflow-x-auto ${isDarkMode ? 'text-gray-300' : 'text-gray-800'}`}>{toolCallText}</pre>
                   </div>
                 )}
 
@@ -1318,10 +1422,11 @@ function MessageCardInner({
                         // tool calls share a line instead of stacking.
                         <span key={tcIdx} className="text-xs whitespace-pre-wrap">{renderWithCollapse(args, false, 'tool', tcIdx, globalOccurrenceStarts.toolArgStarts[tcIdx] ?? messageOccurrenceStart, localSearchStarts.toolArgStarts[tcIdx] ?? localOccurrenceStart)}</span>
                       ) : (
-                        <div key={tcIdx} className={`rounded-md border overflow-hidden ${isDarkMode ? 'border-gray-600 bg-gray-800/50' : 'border-gray-200 bg-gray-50'}`}>
-                          <div className={`px-2 py-0.5 flex items-center justify-between text-xs font-medium ${isDarkMode ? 'bg-gray-700/50 text-gray-300' : 'bg-gray-100 text-gray-600'}`}>
-                            <div className="flex items-center gap-1 min-w-0">
-                              <span className="material-symbols-outlined" style={{ fontSize: 14 }}>terminal</span>
+                        <div key={tcIdx} className="tool-call-band pt-1.5">
+                          <div className="flex items-center justify-between gap-1">
+                            <div className={`flex items-center gap-1 min-w-0 text-[10px] font-bold uppercase tracking-wide ${textMuted}`}>
+                              <span className="material-symbols-outlined shrink-0" style={{ fontSize: 12 }}>terminal</span>
+                              <span className="shrink-0">call ·</span>
                               <span className="truncate">{highlightSearchAndUrl(tc.function.name, false, 'tool', tcIdx, globalOccurrenceStarts.toolNameStarts[tcIdx] ?? messageOccurrenceStart, localSearchStarts.toolNameStarts[tcIdx] ?? localOccurrenceStart)}</span>
                             </div>
                             <div className="flex items-center gap-0.5 shrink-0">
@@ -1362,9 +1467,9 @@ function MessageCardInner({
                             data-block-kind="tool"
                             data-block-index={tcIdx}
                             data-testid={`tool-call-pre-${tcIdx}`}
-                            className={`px-3 py-2 text-xs leading-[1.5] ${
+                            className={`pt-1 text-[13px] leading-[20px] ${
                               isWrapped ? 'whitespace-pre-wrap break-words' : 'overflow-x-auto'
-                            } ${isDarkMode ? 'text-green-400' : 'text-gray-800'}`}
+                            } ${isDarkMode ? 'text-gray-300' : 'text-gray-800'}`}
                           >
                             {renderWithCollapse(args, false, 'tool', tcIdx, globalOccurrenceStarts.toolArgStarts[tcIdx] ?? messageOccurrenceStart, localSearchStarts.toolArgStarts[tcIdx] ?? localOccurrenceStart)}
                           </pre>
@@ -1374,48 +1479,71 @@ function MessageCardInner({
                   </div>
                 )}
 
-                {/* Bottom fade + reveal control for clamped long cards.
-                    Rendered only when the body genuinely overflows. */}
+                {/* Clamp control as a FOOTER BAR flush to the card bottom —
+                    a floating pill in the middle of a wall of text reads as
+                    an interruption; a bar reads as the card's own edge. The
+                    fade is short (24px) and ends exactly where the bar
+                    begins. Rendered only when the body genuinely overflows. */}
                 {isClamped && isClampOverflowing && (
-                  <div
-                    className={`absolute bottom-0 inset-x-0 flex justify-center items-end pt-10 pb-1.5 bg-gradient-to-t to-transparent ${
-                      isDarkMode ? 'from-[#111827]' : 'from-white'
-                    }`}
-                  >
+                  <div className="absolute bottom-0 inset-x-0">
+                    <div
+                      className={`h-6 bg-gradient-to-t to-transparent ${
+                        message.role === 'user'
+                          ? (isDarkMode ? 'from-[#182426]' : 'from-[#eef7f6]')
+                          : (isDarkMode ? 'from-[#16191d]' : 'from-white')
+                      }`}
+                    />
+                    {/* Tail preview for clamped tool/file output: errors and
+                        final results live at the END of output, which a
+                        head-only clamp buries. Plain text (no highlight
+                        pipeline — marks would double-count occurrences);
+                        a current search match still force-reveals the card. */}
+                    {clampTail !== '' && clampHiddenLines >= 8 && (
+                      <div
+                        data-testid="clamp-tail"
+                        title="The last lines of this output"
+                        className={`border-t px-3 pb-1 font-mono text-[13px] leading-[20px] whitespace-pre-wrap overflow-hidden ${
+                          isDarkMode ? 'border-[#262b31] bg-[#16191d] text-gray-300' : 'border-[#e7e5e1] bg-white text-gray-800'
+                        }`}
+                      >
+                        <div className="text-center text-[10px] leading-4 opacity-50 select-none" aria-hidden="true">⋯</div>
+                        {clampTail}
+                      </div>
+                    )}
                     <button
                       type="button"
+                      data-testid="clamp-reveal"
                       onClick={(e) => { e.stopPropagation(); setShowFull(true); }}
-                      className={`px-2 py-0.5 rounded-full border text-xs font-medium shadow-sm ${
+                      className={`w-full h-7 border-t text-xs font-semibold transition-colors ${
                         isDarkMode
-                          ? 'bg-gray-800 border-gray-600 text-gray-200 hover:bg-gray-700'
-                          : 'bg-white border-gray-300 text-gray-600 hover:bg-gray-50'
+                          ? 'border-[#262b31] bg-[#232830] text-gray-300 hover:bg-[#2b323b]'
+                          : 'border-[#e7e5e1] bg-[#f1efec] text-gray-600 hover:bg-[#eae7e2]'
                       }`}
                     >
-                      {clampHiddenLines > 0 ? `Show full message (~${clampHiddenLines} lines)` : 'Show full message'}
+                      {clampHiddenLines > 0 ? `Show ${clampHiddenLines} more lines ▾` : 'Show more ▾'}
                     </button>
                   </div>
                 )}
 
-                {/* Way back down from a fully revealed long card — the header
-                    chevron may be thousands of pixels up by now. */}
-                {isClampable && showFull && !isHighlighted && !hasCurrentLocalMatch && (
-                  <div className="flex justify-center pb-1.5">
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setShowFull(false);
-                        cardRef.current?.scrollIntoView({ block: 'nearest' });
-                      }}
-                      className={`px-2 py-0.5 rounded-full border text-xs font-medium shadow-sm ${
-                        isDarkMode
-                          ? 'bg-gray-800 border-gray-600 text-gray-200 hover:bg-gray-700'
-                          : 'bg-white border-gray-300 text-gray-600 hover:bg-gray-50'
-                      }`}
-                    >
-                      Collapse
-                    </button>
-                  </div>
+                {/* The mirrored footer on a fully revealed long card — the
+                    header chevron may be thousands of pixels up by now. */}
+                {isClampable && showFull && isClampOverflowing && !isHighlighted && !hasCurrentLocalMatch && (
+                  <button
+                    type="button"
+                    data-testid="clamp-collapse"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setShowFull(false);
+                      cardRef.current?.scrollIntoView({ block: 'nearest' });
+                    }}
+                    className={`-mb-2 w-full h-7 border-t text-xs font-semibold transition-colors ${
+                      isDarkMode
+                        ? 'border-[#262b31] bg-[#232830] text-gray-300 hover:bg-[#2b323b]'
+                        : 'border-[#e7e5e1] bg-[#f1efec] text-gray-600 hover:bg-[#eae7e2]'
+                    }`}
+                  >
+                    ▴ Collapse
+                  </button>
                 )}
               </div>
             </div>

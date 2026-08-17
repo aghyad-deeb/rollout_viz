@@ -618,7 +618,7 @@ export function LeftPanel({
   }, [filteredSamples, currentMatchIndex, handleSelectSample]);
 
   return (
-    <div className={`h-full flex flex-col ${isDarkMode ? 'bg-[#1a1a2e] text-gray-200' : 'bg-white text-gray-900'}`}>
+    <div className={`h-full flex flex-col ${isDarkMode ? 'bg-[var(--bg-primary)] text-gray-200' : 'bg-white text-gray-900'}`}>
       {/* Header with toolbar buttons */}
       <div className={`flex border-b ${isDarkMode ? 'border-gray-700' : 'border-gray-200'}`}>
         {/* Static app-title mark — intentionally non-interactive (a link to "/"
@@ -631,7 +631,7 @@ export function LeftPanel({
             analytics
           </span>
         </div>
-        <div className={`flex overflow-hidden flex-1 ${isDarkMode ? 'bg-[#1a1a2e]' : 'bg-white'}`}>
+        <div className={`flex overflow-hidden flex-1 ${isDarkMode ? 'bg-[var(--bg-primary)]' : 'bg-white'}`}>
           {!isSharedMode && (
             <button
               onClick={onOpenFileBrowser}

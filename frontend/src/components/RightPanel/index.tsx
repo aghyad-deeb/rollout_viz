@@ -239,7 +239,7 @@ export function RightPanel({
   };
 
   return (
-    <div className={`h-full flex flex-col ${isDarkMode ? 'bg-[#1a1a2e]' : 'bg-white'}`}>
+    <div className={`h-full flex flex-col ${isDarkMode ? 'bg-[#0e1114]' : 'bg-[#f6f5f3]'}`}>
       <NavigationBar
         sample={sample}
         experimentName={experimentName}
@@ -272,22 +272,21 @@ export function RightPanel({
         commentsToggleRef={commentsToggleRef}
       />
 
-      {/* Content + comments drawer share a flex row: on sm+ the drawer is a
-          static sibling, so opening it SHRINKS the transcript instead of
-          covering it. `relative` hosts the drawer's small-screen overlay
-          fallback; the inner wrapper hosts CompanionDrawer, which still
-          overlays the content area only. */}
+      {/* Content + both drawers share a flex row: on sm+ each drawer is a
+          static sibling, so opening one SHRINKS the transcript instead of
+          covering the text you are reading. `relative` hosts their
+          small-screen overlay fallback. */}
       <div className="flex-1 min-h-0 flex relative overflow-hidden">
         <div className="relative flex-1 min-w-0 overflow-hidden">
           {renderContent()}
-          {isCompanionOpen && filePath && (
-            <CompanionDrawer
-              filePath={filePath}
-              isDarkMode={isDarkMode}
-              onClose={() => setIsCompanionOpen(false)}
-            />
-          )}
         </div>
+        {isCompanionOpen && filePath && (
+          <CompanionDrawer
+            filePath={filePath}
+            isDarkMode={isDarkMode}
+            onClose={() => setIsCompanionOpen(false)}
+          />
+        )}
         {commentsMounted && onAddComment && (
           <CommentsPanel
             sample={sample}

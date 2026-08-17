@@ -84,10 +84,15 @@ export function saveCaptureFontSize(size: FontSize): void {
   try { localStorage.setItem(CAPTURE_FONT_KEY, size); } catch { /* ignore */ }
 }
 
-// Page background behind the card (fills the rounded-corner gaps).
-const PAGE_BG: Record<'light' | 'dark', string> = {
-  light: '#ffffff',
-  dark: '#1a1a2e',
+// Page ground behind the card (fills the rounded-corner gaps and the 16px
+// frame). This is the transcript tray color, NOT the card paper — a card must
+// read as a card sitting on paper, so the two can never be the same value.
+// Single source of truth for the container background and the rasterizer's
+// backgroundColor. Keep in sync with `--transcript-bg` in src/index.css
+// (light `#f6f5f3` / dark `#0e1114`).
+export const CAPTURE_PAGE_BG: Record<'light' | 'dark', string> = {
+  light: '#f6f5f3',
+  dark: '#0e1114',
 };
 
 export interface CaptureOptions {
@@ -100,13 +105,65 @@ export interface CaptureOptions {
   pixelRatio?: number;
 }
 
+// The width-ish properties scaleCard rewrites, with their CSS names for the
+// Typed OM lookup below.
+const SCALED_WIDTH_PROPS = [
+  ['width', 'width'],
+  ['minWidth', 'min-width'],
+  ['maxWidth', 'max-width'],
+  ['flexBasis', 'flex-basis'],
+] as const;
+type ScaledWidthProp = (typeof SCALED_WIDTH_PROPS)[number][0];
+
+/**
+ * The px length an element *authors* for a width-ish property, or null when
+ * it authored none.
+ *
+ * `getComputedStyle(el).width` is the RESOLVED (used) value — it reports a px
+ * number for every laid-out box, including `auto` and percentage widths. So it
+ * cannot be scaled blindly: multiplying the card's own used width would push
+ * it past the fixed export column and crop the figure. CSS Typed OM's
+ * `computedStyleMap()` reports the COMPUTED value instead, which stays
+ * `auto` / `%` / `none` when that is what the author wrote, and absolutizes
+ * only real lengths (`7rem` → `112px`) — exactly the discriminator needed.
+ * Where Typed OM is unavailable (jsdom, older engines) we fall back to the
+ * inline style, which is authored by definition.
+ */
+export function authoredWidthPx(el: HTMLElement, prop: ScaledWidthProp): number | null {
+  const cssName = SCALED_WIDTH_PROPS.find(([js]) => js === prop)?.[1] ?? prop;
+  const withMap = el as HTMLElement & { computedStyleMap?: () => Map<string, unknown> };
+  if (typeof withMap.computedStyleMap === 'function') {
+    try {
+      const value = withMap.computedStyleMap().get(cssName) as
+        | { value?: unknown; unit?: unknown }
+        | undefined;
+      if (value && value.unit === 'px' && typeof value.value === 'number' && value.value > 0) {
+        return value.value;
+      }
+      return null;
+    } catch { /* fall through to the inline-style path */ }
+  }
+  const inline = el.style[prop];
+  const n = parseFloat(inline);
+  return inline.endsWith('px') && n > 0 ? n : null;
+}
+
 // Enlarge the card in the off-screen clone before rasterizing. Multiplies
-// every element's font-size, line-height, padding and gap by `factor` in a
-// single measure-then-write pass — so the capture is a faithful scaled-up
-// replica (the header bar and chrome scale with the body text), not just
-// bigger text inside fixed-size boxes. Measured first so an em-based
-// cascade isn't compounded.
-function scaleCard(root: HTMLElement, factor: number): void {
+// every element's font-size, line-height, padding, gap AND authored fixed
+// widths by `factor` in a single measure-then-write pass — so the capture is
+// a faithful scaled-up replica (the header bar and chrome scale with the body
+// text), not just bigger text inside fixed-size boxes. Measured first so an
+// em-based cascade isn't compounded.
+//
+// Widths matter because they are NOT font-relative: at fontScale > 1 the
+// `w-28` header gutter used to clip the role label ("BASH" → "BASI") and the
+// `w-10` line badge squeezed the meta run. `width` is only rewritten on boxes
+// that declare `flex-shrink: 0` — the layout's own marker for "this is a
+// fixed box" — so an auto-width container can never be frozen at a scaled
+// used value. `min/max-width` and `flex-basis` need no such guard: their
+// computed value is a keyword unless a length was authored.
+// Exported for the unit test that pins the width-rewriting contract.
+export function scaleCard(root: HTMLElement, factor: number): void {
   if (factor === 1) return;
   const els: HTMLElement[] = [root, ...Array.from(root.querySelectorAll<HTMLElement>('*'))];
   const scalePx = (v: string): string | null => {
@@ -120,6 +177,13 @@ function scaleCard(root: HTMLElement, factor: number): void {
       lineHeight: cs.lineHeight,
       padding: [cs.paddingTop, cs.paddingRight, cs.paddingBottom, cs.paddingLeft],
       gap: [cs.rowGap, cs.columnGap],
+      isFixedBox: cs.flexShrink === '0',
+      widths: {
+        width: authoredWidthPx(el, 'width'),
+        minWidth: authoredWidthPx(el, 'minWidth'),
+        maxWidth: authoredWidthPx(el, 'maxWidth'),
+        flexBasis: authoredWidthPx(el, 'flexBasis'),
+      },
     };
   });
   els.forEach((el, i) => {
@@ -134,6 +198,15 @@ function scaleCard(root: HTMLElement, factor: number): void {
     const [rg, cg] = m.gap.map(scalePx);
     if (rg) el.style.rowGap = rg;
     if (cg) el.style.columnGap = cg;
+    // `width` only on declared fixed boxes (see the note above); the other
+    // three are safe wherever they were authored. `el !== root` protects the
+    // clone's own `width:100%`, which the caller sets deliberately.
+    if (el !== root) {
+      if (m.isFixedBox && m.widths.width != null) el.style.width = `${m.widths.width * factor}px`;
+      if (m.widths.minWidth != null) el.style.minWidth = `${m.widths.minWidth * factor}px`;
+      if (m.widths.maxWidth != null) el.style.maxWidth = `${m.widths.maxWidth * factor}px`;
+      if (m.widths.flexBasis != null) el.style.flexBasis = `${m.widths.flexBasis * factor}px`;
+    }
   });
 }
 
@@ -189,7 +262,7 @@ export async function captureCardToPng(
   opts: CaptureOptions,
 ): Promise<Blob> {
   const width = WIDTH_PX[opts.exportWidth] ?? 640;
-  const bg = PAGE_BG[opts.imageTheme];
+  const bg = CAPTURE_PAGE_BG[opts.imageTheme];
   const fontScale = opts.fontScale ?? 1;
   // Render every width preset to roughly the same high absolute resolution
   // (~2200px wide) so a narrow preset is just as crisp as a wide one. The

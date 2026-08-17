@@ -80,7 +80,10 @@ export function CapturePreviewModal({
           </button>
         </div>
 
-        <div className="overflow-auto custom-scrollbar p-4 flex items-center justify-center" style={CHECKER}>
+        {/* items-START, not center: a tall export centered inside an
+            overflow-auto flex container has its top pushed above the scroll
+            origin and becomes unreachable. Horizontally it still centers. */}
+        <div className="overflow-auto custom-scrollbar p-4 flex items-start justify-center" style={CHECKER}>
           <img
             src={imageUrl}
             alt="Capture preview"

@@ -56,7 +56,9 @@ describe('MessageCard', () => {
   it('renders system role', () => {
     render(<MessageCard {...defaultProps} message={{ role: 'system', content: 'System prompt' }} />);
     expect(screen.getByText('system')).toBeInTheDocument();
-    expect(screen.getByText('System prompt')).toBeInTheDocument();
+    // System cards start collapsed, so the text appears twice: the hidden
+    // body and the header's one-line excerpt.
+    expect(screen.getAllByText('System prompt').length).toBeGreaterThan(0);
   });
 
   it('renders assistant role', () => {
@@ -935,19 +937,25 @@ describe('MessageCard long-card clamping', () => {
     Reflect.deleteProperty(HTMLElement.prototype, 'scrollHeight');
   });
 
-  it('clamps a long system card and reveals it via the Show full message button', () => {
+  it('clamps a long system card and reveals it via the footer bar', () => {
     const { container } = render(<MessageCard {...defaultProps} message={longSystem} />);
     expect(clampedEl(container)).not.toBeNull();
 
-    // The pill states how much is hidden (mocked overflow: 760px ≈ 38 lines).
-    const reveal = screen.getByText(/Show full message/);
-    expect(reveal.textContent).toMatch(/~\d+ lines/);
+    // The footer bar states how much is hidden (mocked overflow: 760px ≈ 38
+    // lines) and spans the full card width.
+    const reveal = screen.getByTestId('clamp-reveal');
+    expect(reveal.textContent).toMatch(/Show \d+ more lines/);
+    expect(reveal.className).toContain('w-full');
     fireEvent.click(reveal);
 
     expect(clampedEl(container)).toBeNull();
-    expect(screen.queryByText(/Show full message/)).not.toBeInTheDocument();
-    // A revealed long card offers the way back down.
-    expect(screen.getByText('Collapse')).toBeInTheDocument();
+    expect(screen.queryByTestId('clamp-reveal')).not.toBeInTheDocument();
+    // A revealed long card offers the mirrored way back down.
+    const collapse = screen.getByTestId('clamp-collapse');
+    expect(collapse.textContent).toContain('Collapse');
+    fireEvent.click(collapse);
+    expect(clampedEl(container)).not.toBeNull();
+    expect(screen.getByTestId('clamp-reveal')).toBeInTheDocument();
   });
 
   it('does not clamp user or assistant cards', () => {
@@ -955,7 +963,7 @@ describe('MessageCard long-card clamping', () => {
       message={{ role: 'assistant', content: 'a long answer. '.repeat(80) }}
     />);
     expect(clampedEl(container)).toBeNull();
-    expect(screen.queryByText('Show full message')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('clamp-reveal')).not.toBeInTheDocument();
   });
 
   it('renders no reveal chrome when the body fits within the clamp', () => {
@@ -964,7 +972,7 @@ describe('MessageCard long-card clamping', () => {
       get: () => 240, // equals clientHeight — no overflow
     });
     render(<MessageCard {...defaultProps} message={{ role: 'system', content: 'short prompt' }} />);
-    expect(screen.queryByText('Show full message')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('clamp-reveal')).not.toBeInTheDocument();
   });
 
   it('the expand-all signal unclamps and collapse-all re-clamps', () => {
@@ -993,7 +1001,7 @@ describe('MessageCard long-card clamping', () => {
       isHighlighted={true}
     />);
     expect(clampedEl(container)).toBeNull();
-    expect(screen.queryByText('Show full message')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('clamp-reveal')).not.toBeInTheDocument();
   });
 
   it('unclamps a card that contains the current local search match', () => {
@@ -1006,13 +1014,30 @@ describe('MessageCard long-card clamping', () => {
     expect(clampedEl(container)).toBeNull();
   });
 
+  it('shows a tail preview of the last lines on a clamped tool card', () => {
+    // 40 numbered lines: the head clamp hides the end, where errors and
+    // results live — the tail block surfaces the last 6 lines.
+    const lines = Array.from({ length: 40 }, (_, i) => `line ${i + 1}`).join('\n');
+    render(<MessageCard {...defaultProps} message={{ role: 'tool', content: lines, name: 'bash' }} />);
+
+    const tail = screen.getByTestId('clamp-tail');
+    expect(tail).toHaveTextContent('line 40');
+    expect(tail).toHaveTextContent('line 35');
+    expect(tail).not.toHaveTextContent('line 34');
+  });
+
+  it('renders no tail preview on clamped system prose', () => {
+    render(<MessageCard {...defaultProps} message={longSystem} />);
+    expect(screen.queryByTestId('clamp-tail')).not.toBeInTheDocument();
+  });
+
   it('never clamps in presentation mode', () => {
     const { container } = render(<MessageCard {...defaultProps}
       message={longSystem}
       isPresentationMode={true}
     />);
     expect(clampedEl(container)).toBeNull();
-    expect(screen.queryByText('Show full message')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('clamp-reveal')).not.toBeInTheDocument();
   });
 });
 
@@ -1077,5 +1102,153 @@ describe('MessageCard P shortcut', () => {
     fireEvent.mouseOver(container.firstChild as Element);
     fireEvent.keyDown(window, { key: 'p' });
     expect(onCapture).toHaveBeenCalledWith(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// forCapture: the off-screen clone ChatView portals for image export
+// ---------------------------------------------------------------------------
+//
+// Regression: the portal card used to inherit the role default (system cards
+// start collapsed) and leak isExpanded/showFull across activeIndex changes, so
+// an export could be a header-only strip.
+
+describe('MessageCard forCapture', () => {
+  const longSystem = {
+    role: 'system' as const,
+    content: 'a very long system prompt line. '.repeat(80),
+  };
+
+  beforeEach(() => {
+    Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
+      configurable: true,
+      get: () => 240,
+    });
+    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
+      configurable: true,
+      get: () => 1000,
+    });
+  });
+  afterEach(() => {
+    Reflect.deleteProperty(HTMLElement.prototype, 'clientHeight');
+    Reflect.deleteProperty(HTMLElement.prototype, 'scrollHeight');
+  });
+
+  it('mounts a system card open with no clamp footer', () => {
+    render(<MessageCard {...defaultProps} message={longSystem} forCapture={true} />);
+    expect(screen.getByTestId('message-body-grid').className).toContain('grid-rows-[1fr]');
+    expect(screen.queryByTestId('clamp-reveal')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('clamp-collapse')).not.toBeInTheDocument();
+    // No collapsed-header excerpt either — the body itself is showing.
+    expect(screen.queryByTestId('collapsed-line-count')).not.toBeInTheDocument();
+  });
+
+  it('still starts a system card collapsed without forCapture', () => {
+    render(<MessageCard {...defaultProps} message={longSystem} />);
+    expect(screen.getByTestId('message-body-grid').className).toContain('grid-rows-[0fr]');
+  });
+
+  it('ignores the bulk collapse-all signal', () => {
+    const { rerender } = render(
+      <MessageCard {...defaultProps} message={longSystem} forCapture={true}
+        expandAllSignal={{ value: false, version: 0 }} />,
+    );
+    rerender(
+      <MessageCard {...defaultProps} message={longSystem} forCapture={true}
+        expandAllSignal={{ value: false, version: 1 }} />,
+    );
+    expect(screen.getByTestId('message-body-grid').className).toContain('grid-rows-[1fr]');
+  });
+
+  it('marks the collapse wrapper so the capture stylesheet can force it open', () => {
+    const { container } = render(<MessageCard {...defaultProps} forCapture={true} />);
+    expect(screen.getByTestId('message-body-grid').className).toContain('message-body-grid');
+    expect(container.querySelector('.message-body-clip')).not.toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Scan-mode header: fixed gutter, line-count badge, meta run, TASK head
+// ---------------------------------------------------------------------------
+
+describe('MessageCard scan-mode header', () => {
+  const multiline = { role: 'tool' as const, content: 'one\ntwo\nthree\nfour', name: 'bash' };
+
+  it('starts a system card collapsed and every other role expanded', () => {
+    const gridOf = (text: string) =>
+      screen.getAllByText(text)
+        .map(el => el.closest('[class*="grid-rows"]'))
+        .find(el => el !== null) as HTMLElement;
+
+    const { unmount } = render(<MessageCard {...defaultProps}
+      message={{ role: 'system', content: 'boilerplate prompt' }}
+    />);
+    expect(gridOf('boilerplate prompt').className).toContain('grid-rows-[0fr]');
+    unmount();
+
+    render(<MessageCard {...defaultProps} message={{ role: 'tool', content: 'stdout here' }} />);
+    expect(gridOf('stdout here').className).toContain('grid-rows-[1fr]');
+  });
+
+  it('re-expands a collapsed system card from its header', () => {
+    render(<MessageCard {...defaultProps} message={{ role: 'system', content: 'boilerplate prompt' }} />);
+    fireEvent.click(screen.getByText('system').closest('[class*="cursor-pointer"]')!);
+    const grid = screen.getAllByText('boilerplate prompt')
+      .map(el => el.closest('[class*="grid-rows"]'))
+      .find(el => el !== null) as HTMLElement;
+    expect(grid.className).toContain('grid-rows-[1fr]');
+  });
+
+  it('force-expands a collapsed system card that is the deep-link target', () => {
+    render(<MessageCard {...defaultProps}
+      message={{ role: 'system', content: 'boilerplate prompt' }}
+      isHighlighted={true}
+    />);
+    const grid = screen.getAllByText('boilerplate prompt')
+      .map(el => el.closest('[class*="grid-rows"]'))
+      .find(el => el !== null) as HTMLElement;
+    expect(grid.className).toContain('grid-rows-[1fr]');
+  });
+
+  it('shows a line-count badge only while collapsed', () => {
+    render(<MessageCard {...defaultProps} message={multiline} />);
+    expect(screen.queryByTestId('collapsed-line-count')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByText('bash').closest('[class*="cursor-pointer"]')!);
+    expect(screen.getByTestId('collapsed-line-count')).toHaveTextContent('4 L');
+  });
+
+  it('keeps the role label in a fixed-width gutter so excerpts align', () => {
+    render(<MessageCard {...defaultProps} message={multiline} />);
+    const label = screen.getByText('bash').parentElement as HTMLElement;
+    expect(label.className).toContain('w-28');
+    expect(label.className).toContain('shrink-0');
+  });
+
+  it('shows the header meta run when unhovered and hides it on hover', () => {
+    const { container } = render(<MessageCard {...defaultProps} index={6} message={multiline} />);
+    const meta = screen.getByTestId('header-meta');
+    expect(meta).toHaveTextContent('#7 · 4 ln');
+    expect(meta.className).toContain('opacity-100');
+    expect(meta.className).toContain('pointer-events-none');
+
+    fireEvent.mouseOver(container.firstChild as Element);
+    expect(screen.getByTestId('header-meta').className).toContain('opacity-0');
+  });
+
+  it('gives the first user message a TASK running head and a bigger body', () => {
+    render(<MessageCard {...defaultProps} isTaskMessage={true} />);
+    expect(screen.getByText('TASK')).toBeInTheDocument();
+    expect(screen.queryByText('user')).not.toBeInTheDocument();
+    const body = screen.getByText('Hello world');
+    expect(body.className).toContain('text-[16px]');
+  });
+
+  it("prefixes a bound tool result's label with the turn glyph", () => {
+    render(<MessageCard {...defaultProps}
+      message={{ role: 'tool', content: 'stdout', name: 'bash' }}
+      isChainedToolResult={true}
+    />);
+    expect(screen.getByText('↳ bash')).toBeInTheDocument();
   });
 });

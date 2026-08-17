@@ -342,7 +342,7 @@ export function EvidenceView({ samples, isDarkMode, annotator, onOpenQuote, onAu
                   data-testid="evidence-card"
                   onClick={() => setActiveIdx(idx)}
                   className={`rounded-lg border p-3 shadow-sm ${
-                    isDarkMode ? 'border-gray-700 bg-gray-800/60' : 'border-gray-200 bg-white'
+                    isDarkMode ? 'border-[var(--card-border)] bg-[var(--card-paper)]' : 'border-gray-200 bg-white'
                   } ${
                     isActive
                       ? (isDarkMode ? 'ring-2 ring-blue-400/70' : 'ring-2 ring-blue-500/60')
@@ -404,7 +404,7 @@ export function EvidenceView({ samples, isDarkMode, annotator, onOpenQuote, onAu
                   {/* Body */}
                   {item.context && (
                     <div className={`whitespace-pre-wrap text-sm leading-relaxed rounded p-2 mb-2 ${
-                      isDarkMode ? 'bg-gray-900/40 text-gray-300' : 'bg-gray-50 text-gray-700'
+                      isDarkMode ? 'bg-[var(--bg-primary)] text-gray-300' : 'bg-[var(--card-quiet)] text-gray-700'
                     }`}>
                       {item.context.before}
                       <mark className={`border-b-2 border-purple-400 ${
@@ -429,7 +429,7 @@ export function EvidenceView({ samples, isDarkMode, annotator, onOpenQuote, onAu
                   )}
                   {item.transcriptUnloaded && item.quote && (
                     <div className={`text-sm rounded p-2 mb-2 border ${
-                      isDarkMode ? 'bg-gray-900/40 border-gray-700' : 'bg-gray-50 border-gray-200'
+                      isDarkMode ? 'bg-[var(--bg-primary)] border-[var(--card-border)]' : 'bg-[var(--card-quiet)] border-gray-200'
                     }`}>
                       <div className={`text-xs font-medium mb-1 ${mutedText}`}>
                         judge quoted:

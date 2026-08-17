@@ -128,6 +128,14 @@ export function ChatView({
       : sample.messages
   ), [isPresentationMode, presentationDrafts, sample.messages]);
 
+  // The conversation's first user turn is the task statement — MessageCard
+  // gives it a 'TASK' running head and a step-up in body size. -1 when the
+  // rollout has no user message at all.
+  const taskMessageIndex = useMemo(
+    () => displayedMessages.findIndex((m) => m.role === 'user'),
+    [displayedMessages],
+  );
+
   // Calculate the starting occurrence index for each message (cumulative count).
   // Uses the same normalized text and field scoping as MessageCard highlights.
   const messageOccurrenceStarts = useMemo(() => {
@@ -903,12 +911,19 @@ export function ChatView({
   // Render a MessageCard. `forCapture` builds the off-screen variant
   // portalled into `captureHost`: themed by the image theme (`opts.dark`)
   // rather than the app theme, and without the URL-share selection ring.
+  //
+  // The capture card is KEYED by message index so switching the active card
+  // remounts it. Without that key React reuses one instance and its
+  // isExpanded / showFull state leaks from the previously captured message —
+  // with system cards collapsed by default, that exported a header-only strip
+  // (or a card whose reveal state disagreed with the on-screen one).
   const renderMessageCard = (
     msg: Message,
     msgIndex: number,
-    opts?: { dark?: boolean; forCapture?: boolean },
+    opts?: { dark?: boolean; forCapture?: boolean; isChainedToolResult?: boolean },
   ) => (
     <MessageCard
+      key={opts?.forCapture ? `capture-${msgIndex}` : undefined}
       message={msg}
       index={msgIndex}
       searchConditions={opts?.forCapture ? [] : searchConditions}
@@ -950,6 +965,11 @@ export function ChatView({
       // double-firing the P-shortcut capture.
       isPresentationActive={!opts?.forCapture && isPresentationMode && activeIndex === msgIndex}
       expandAllSignal={opts?.forCapture ? undefined : expandAllSignal}
+      isTaskMessage={msgIndex === taskMessageIndex}
+      isChainedToolResult={opts?.isChainedToolResult ?? false}
+      // Forces the clone open (expanded + fully revealed, no clamp) so the
+      // exported figure is the whole message regardless of the role default.
+      forCapture={opts?.forCapture ?? false}
     />
   );
 
@@ -973,7 +993,7 @@ export function ChatView({
             onChange={(e) => setLocalSearchTerm(e.target.value)}
             onKeyDown={handleSearchKeyDown}
             placeholder="Search in this chat..."
-            className={`flex-1 px-2 py-1 text-sm border rounded focus:outline-none focus:ring-1 focus:ring-blue-500 ${
+            className={`flex-1 min-w-[180px] px-2 py-1 text-sm border rounded focus:outline-none focus:ring-1 focus:ring-blue-500 ${
               isDarkMode ? 'bg-gray-700 border-gray-600 text-gray-200 placeholder-gray-500' : 'bg-white border-gray-300'
             }`}
             autoFocus
@@ -1160,29 +1180,36 @@ export function ChatView({
       <div className="relative flex-1 min-h-0">
         <div
           ref={messagesContainerRef}
-          className="h-full overflow-y-auto custom-scrollbar py-4 pl-4 pr-7"
+          className={`h-full overflow-y-auto pt-10 pb-4 pl-4 pr-7 transcript-surface ${isPresentationMode ? 'custom-scrollbar' : 'scrollbar-none'}`}
           onDragOver={isPresentationMode ? (e) => e.preventDefault() : undefined}
           onDrop={isPresentationMode ? handlePngDrop : undefined}
         >
           {/* Role-aware rhythm instead of a uniform gap: a tool result hugs
-              the call that produced it (6px), each assistant turn opens a
-              visual paragraph (24px), everything else keeps the old 16px.
-              Wrappers stay direct children — the Cmd+C `:scope > div`
-              mapping and message indices are untouched. */}
-          {displayedMessages.map((message, index) => (
-            <div
-              key={index}
-              ref={(el) => setMessageRef(index, el)}
-              className={
-                index === 0 ? undefined
-                  : message.role === 'tool' ? 'mt-1.5'
-                    : message.role === 'assistant' ? 'mt-6'
-                      : 'mt-4'
-              }
-            >
-              {renderMessageCard(message, index)}
-            </div>
-          ))}
+              the assistant call that produced it (6px) — but ONLY that; a
+              tool result following another tool result keeps the full gap,
+              or two same-tinted cards fuse into one apparent card with a
+              clamp pill floating in its middle. Assistant turns open a
+              visual paragraph (24px); everything else keeps 16px. Wrappers
+              stay direct children — the Cmd+C `:scope > div` mapping and
+              message indices are untouched. */}
+          {displayedMessages.map((message, index) => {
+            const isChainedToolResult =
+              message.role === 'tool' && displayedMessages[index - 1]?.role === 'assistant';
+            return (
+              <div
+                key={index}
+                ref={(el) => setMessageRef(index, el)}
+                className={
+                  index === 0 ? undefined
+                    : isChainedToolResult ? 'mt-1 ml-6'
+                      : message.role === 'assistant' ? 'mt-7'
+                        : 'mt-4'
+                }
+              >
+                {renderMessageCard(message, index, { isChainedToolResult })}
+              </div>
+            );
+          })}
         </div>
 
         {/* Conversation minimap — slim overlay rail on the right edge, a
@@ -1210,7 +1237,7 @@ export function ChatView({
         {!isSearchOpen && !isPresentationMode && (
           <div
             className={`absolute top-1 right-9 z-10 flex items-center gap-1 px-1.5 py-0.5 rounded-md border backdrop-blur-sm shadow-sm ${
-              isDarkMode ? 'bg-[#111827]/85 border-gray-700' : 'bg-white/85 border-gray-200'
+              isDarkMode ? 'bg-[#16191d]/85 border-gray-700' : 'bg-white/85 border-gray-200'
             }`}
           >
             {ephemeralHighlights.length > 0 && (
@@ -1231,7 +1258,7 @@ export function ChatView({
             )}
             <button
               onClick={() => setExpandAllSignal(s => ({ value: false, version: s.version + 1 }))}
-              className={`p-1 rounded ${
+              className={`w-[26px] h-[26px] flex items-center justify-center rounded ${
                 isDarkMode ? 'text-gray-400 hover:text-gray-200 hover:bg-gray-700' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-100'
               }`}
               title="Collapse all messages"
@@ -1241,7 +1268,7 @@ export function ChatView({
             </button>
             <button
               onClick={() => setExpandAllSignal(s => ({ value: true, version: s.version + 1 }))}
-              className={`p-1 rounded ${
+              className={`w-[26px] h-[26px] flex items-center justify-center rounded ${
                 isDarkMode ? 'text-gray-400 hover:text-gray-200 hover:bg-gray-700' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-100'
               }`}
               title="Expand all messages"
@@ -1251,7 +1278,7 @@ export function ChatView({
             </button>
             <button
               onClick={() => setIsSearchOpen(true)}
-              className={`p-1 rounded ${
+              className={`w-[26px] h-[26px] flex items-center justify-center rounded ${
                 isDarkMode ? 'text-gray-400 hover:text-gray-200 hover:bg-gray-700' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-100'
               }`}
               title="Search in chat (Ctrl+F)"
@@ -1279,26 +1306,32 @@ export function ChatView({
       {/* Sample metadata footer — one compact row. Step is omitted (the
           navigation bar already shows it); Source flexes and truncates. */}
       <div className={`border-t px-3 py-1.5 ${isDarkMode ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-gray-50'}`}>
-        <div className={`flex items-center gap-3 text-xs whitespace-nowrap overflow-hidden ${isDarkMode ? 'text-gray-300' : 'text-gray-600'}`}>
-          <div>
-            <span className={`font-medium ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>Reward:</span>{' '}
-            <span className={`font-semibold ${sample.attributes.reward >= 0 ? (isDarkMode ? 'text-teal-400' : 'text-teal-700') : (isDarkMode ? 'text-red-400' : 'text-red-600')}`}>
+        {/* One measured run: 20px gaps, hairline dividers between groups,
+            11px uppercase labels against 12px values — the metadata reads as
+            an instrument strip instead of four loose sentences. */}
+        <div className={`flex items-center gap-5 whitespace-nowrap overflow-hidden ${isDarkMode ? 'text-gray-300' : 'text-gray-600'}`}>
+          <div className="flex items-baseline gap-1.5">
+            <span className={`text-[11px] uppercase tracking-wide ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>Reward:</span>
+            <span className={`text-xs font-semibold tnum ${sample.attributes.reward >= 0 ? (isDarkMode ? 'text-teal-400' : 'text-teal-700') : (isDarkMode ? 'text-red-400' : 'text-red-600')}`}>
               {sample.attributes.reward}
             </span>
           </div>
-          <div>
-            <span className={`font-medium ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>Rollout:</span>{' '}
-            <span className="font-semibold">{sample.attributes.rollout_n}</span>
+          <div className={`w-px h-3 shrink-0 ${isDarkMode ? 'bg-gray-700' : 'bg-gray-300'}`} />
+          <div className="flex items-baseline gap-1.5">
+            <span className={`text-[11px] uppercase tracking-wide ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>Rollout:</span>
+            <span className="text-xs font-medium tnum">{sample.attributes.rollout_n}</span>
           </div>
-          <div className="min-w-0 flex-1 flex items-center gap-1">
-            <span className={`font-medium ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>Source:</span>
-            <span className="font-semibold truncate min-w-0" title={sample.attributes.data_source}>
+          <div className={`w-px h-3 shrink-0 ${isDarkMode ? 'bg-gray-700' : 'bg-gray-300'}`} />
+          <div className="min-w-0 flex-1 flex items-baseline gap-1.5">
+            <span className={`text-[11px] uppercase tracking-wide shrink-0 ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>Source:</span>
+            <span className="text-xs font-medium truncate min-w-0" title={sample.attributes.data_source}>
               {sample.attributes.data_source}
             </span>
           </div>
-          <div>
-            <span className={`font-medium ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>Timestamp:</span>{' '}
-            <span className="font-semibold" title={sample.timestamp}>
+          <div className={`w-px h-3 shrink-0 ${isDarkMode ? 'bg-gray-700' : 'bg-gray-300'}`} />
+          <div className="flex items-baseline gap-1.5">
+            <span className={`text-[11px] uppercase tracking-wide ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>Timestamp:</span>
+            <span className="text-xs font-medium tnum" title={sample.timestamp}>
               {formatTimestamp(sample.timestamp) ?? sample.timestamp}
             </span>
           </div>
