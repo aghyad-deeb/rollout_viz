@@ -14,7 +14,12 @@ import { useUrlState } from './hooks/useUrlState';
 import { useServerConfig } from './hooks/useServerConfig';
 import { LibraryView } from './components/Library';
 import { useGrading } from './hooks/useGrading';
-import { loadCaptureWidth, saveCaptureWidth, loadCaptureFontSize, saveCaptureFontSize } from './utils/captureImage';
+import {
+  loadCaptureWidth, saveCaptureWidth,
+  loadCaptureFontSize, saveCaptureFontSize,
+  loadCaptureStyle, saveCaptureStyle,
+  loadCapturePaperWidth, saveCapturePaperWidth,
+} from './utils/captureImage';
 import { buildPageTitle } from './utils/pageTitle';
 import { messageToPresentationDraft, type PresentationMessageDraft, type PresentationMessageDrafts } from './utils/presentationDraft';
 import {
@@ -32,7 +37,7 @@ import {
   saveHumanGrade,
 } from './utils/humanGrades';
 import { TriageBar } from './components/TriageBar';
-import type { Sample, SearchCondition, SearchLogic, ExportWidth, FontSize, GradeEntry, ViewMode } from './types';
+import type { Sample, SearchCondition, SearchLogic, CaptureStyle, ExportWidth, FontSize, GradeEntry, ViewMode } from './types';
 
 // Helper to generate unique IDs
 const generateId = () => Math.random().toString(36).substring(2, 9);
@@ -257,12 +262,24 @@ function App() {
   const [imageTheme, setImageTheme] = useState<'light' | 'dark'>('light');
   const [exportWidth, setExportWidth] = useState<ExportWidth>(loadCaptureWidth);
   const [fontSize, setFontSize] = useState<FontSize>(loadCaptureFontSize);
+  // Figure style, and the paper style's own width. The two width states are
+  // kept apart (and in separate storage keys) so a trip through Paper and
+  // back restores the exact screen preset the user had — the screen path
+  // never sees a paper width, or vice versa.
+  const [captureStyle, setCaptureStyle] = useState<CaptureStyle>(loadCaptureStyle);
+  const [paperWidth, setPaperWidth] = useState<ExportWidth>(loadCapturePaperWidth);
   const [presentationActiveIndex, setPresentationActiveIndex] = useState<number | null>(null);
   const [presentationDrafts, setPresentationDrafts] = useState<PresentationMessageDrafts>({});
   useEffect(() => {
     saveCaptureWidth(exportWidth);
     saveCaptureFontSize(fontSize);
-  }, [exportWidth, fontSize]);
+    saveCaptureStyle(captureStyle);
+    saveCapturePaperWidth(paperWidth);
+  }, [exportWidth, fontSize, captureStyle, paperWidth]);
+  // One width prop / one setter reach the capture chain — which of the two
+  // states they address is decided here, by the active figure style.
+  const activeExportWidth = captureStyle === 'paper' ? paperWidth : exportWidth;
+  const setActiveExportWidth = captureStyle === 'paper' ? setPaperWidth : setExportWidth;
   // Press `p` (no modifiers, not while typing) to enter Presentation Mode.
   // The listener is attached only while it's off; once on, `p` is handled
   // per-card (capture the hovered card) instead.
@@ -1090,11 +1107,13 @@ function App() {
               isPending={previewPending}
               isDarkMode={isDarkMode}
               imageTheme={imageTheme}
-              exportWidth={exportWidth}
+              exportWidth={activeExportWidth}
               fontSize={fontSize}
+              captureStyle={captureStyle}
               onImageThemeChange={setImageTheme}
-              onExportWidthChange={setExportWidth}
+              onExportWidthChange={setActiveExportWidth}
               onFontSizeChange={setFontSize}
+              onCaptureStyleChange={setCaptureStyle}
               activeMessageIndex={presentationActiveIndex}
               messageLabels={selectedSample?.messages.map((m, i) =>
                 presentationDrafts[i]?.displayLabel || presentationDrafts[i]?.role || m.role
@@ -1210,8 +1229,9 @@ function App() {
             onPresentationPreview={handlePresentationPreview}
             onPreviewPending={setPreviewPending}
             imageTheme={imageTheme}
-            exportWidth={exportWidth}
+            exportWidth={activeExportWidth}
             fontSize={fontSize}
+            captureStyle={captureStyle}
             presentationDrafts={presentationDrafts}
             presentationActiveIndex={presentationActiveIndex}
             onPresentationActiveIndexChange={setPresentationActiveIndex}

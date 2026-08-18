@@ -1,0 +1,99 @@
+/* Self-hosted web fonts.
+ *
+ * These were served from the Google Fonts CDN until the paper-figure capture
+ * work exposed the cost: the image rasterizer inlines a snapshot of the DOM
+ * into an SVG, and a CROSS-ORIGIN font file cannot be embedded into that
+ * snapshot — every export rasterized in the fallback face (DejaVu) instead of
+ * Inter / IBM Plex Mono, silently, in BOTH figure styles.
+ *
+ * Hosting them ourselves makes them same-origin, so `src/utils/captureFonts.ts`
+ * can fetch the woff2 bytes and hand modern-screenshot a base64 @font-face
+ * block. Files are the exact Google Fonts latin + latin-ext woff2 subsets
+ * (Inter v20 variable 400..700; IBM Plex Mono static 400/500/600).
+ *
+ * CAUTION — the swap is NOT rendering-neutral for off-grid weights: the CDN
+ * stylesheet declared four STATIC Inter faces (400/500/600/700), so an
+ * authored weight like 450 snapped up to 500; the vendored VARIABLE face
+ * renders it as a true 450 (lighter). Keep authored weights on the
+ * 400/500/600/700 grid (guarded by a test) — font-[450] on the TASK card was
+ * the one affected call site, changed to font-[500].
+ *
+ * Keep this list in sync with CAPTURE_FONT_FACES in src/utils/captureFonts.ts.
+ *
+ * LICENSING. Both families are SIL Open Font License 1.1, which requires the
+ * license and copyright notice to travel WITH the font files wherever they are
+ * redistributed — and vendoring them here (and shipping them in dist/) is
+ * redistribution. The full texts sit next to the woff2 files they cover:
+ *   OFL-Inter.txt         Copyright (c) 2016 The Inter Project Authors
+ *   OFL-IBMPlexMono.txt   Copyright (c) 2017 IBM Corp. ("Plex", RFN)
+ * Both are served at /fonts/OFL-*.txt. Do not remove them while the woff2
+ * files are here; if a face is ever swapped, swap its license text with it.
+ */
+
+/* ── Inter (variable, wght 400–700) ─────────────────────────────────────── */
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url('/fonts/inter-latin-ext.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url('/fonts/inter-latin.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+/* ── IBM Plex Mono (400 / 500 / 600) ────────────────────────────────────── */
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/plexmono-400-latin-ext.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/plexmono-400-latin.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('/fonts/plexmono-500-latin-ext.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('/fonts/plexmono-500-latin.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url('/fonts/plexmono-600-latin-ext.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url('/fonts/plexmono-600-latin.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}

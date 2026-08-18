@@ -3,8 +3,11 @@ import {
   encodeImage,
   downloadBlob,
   copyImageToClipboard,
-  EXPORT_WIDTH_PRESETS,
+  captureWidthPresets,
+  capturePageWidthPt,
+  capturePhysicalSizeIn,
   FONT_SIZE_PRESETS,
+  PAPER_BODY_PT,
   type DownloadFormat,
 } from '../../utils/captureImage';
 import {
@@ -12,7 +15,7 @@ import {
   parsePresentationToolCallsJson,
   type PresentationMessageDraft,
 } from '../../utils/presentationDraft';
-import type { ExportWidth, FontSize } from '../../types';
+import type { CaptureStyle, ExportWidth, FontSize } from '../../types';
 
 interface PresentationPreviewPanelProps {
   /** Object URL of the rendered capture PNG (for display), or null. */
@@ -28,9 +31,13 @@ interface PresentationPreviewPanelProps {
   imageTheme: 'light' | 'dark';
   exportWidth: ExportWidth;
   fontSize: FontSize;
+  /** Figure style — 'screen' (the app's look) or 'paper' (figure style). */
+  captureStyle?: CaptureStyle;
   onImageThemeChange: (theme: 'light' | 'dark') => void;
   onExportWidthChange: (width: ExportWidth) => void;
   onFontSizeChange: (size: FontSize) => void;
+  /** Required: the style toggle is always live, never a decorative control. */
+  onCaptureStyleChange: (style: CaptureStyle) => void;
   activeMessageIndex: number | null;
   /** One label per message card (e.g. its effective role/display label) —
    *  the card count is derived from this array's length. */
@@ -53,16 +60,41 @@ const FORMATS: { id: DownloadFormat; label: string; ext: string }[] = [
   { id: 'pdf', label: 'PDF', ext: 'pdf' },
 ];
 
+// The one new capture control: which figure style a capture is rendered in.
+const CAPTURE_STYLES: { id: CaptureStyle; label: string; title: string }[] = [
+  { id: 'screen', label: 'Screen', title: "The app's transcript look — role colors, card tints, your theme" },
+  { id: 'paper',  label: 'Paper',  title: `Research-paper figure — white ground, ink only, typeset at ${PAPER_BODY_PT}pt for the chosen column width` },
+];
+
+// Tooltips for the controls the paper style pins (it is designed at final
+// size on the printed page, so neither is a free choice there).
+const LOCKED_BY_PAPER = {
+  theme: 'Locked by the Paper figure style — a paper figure is always light (it sits on the page). Switch to Screen to choose a theme.',
+  font: `Locked by the Paper figure style — body text is typeset at ${PAPER_BODY_PT}pt for the chosen column width. Switch to Screen to choose a size.`,
+};
+
 // Persisted so the download format-picker stays on the user's last choice.
+// The two figure styles keep SEPARATE keys and separate defaults: a screen
+// capture is a screenshot (PNG), a paper capture is a figure destined for
+// LaTeX (a vector-page PDF at its nominal column width, lossless inside).
+// Splitting the keys means picking PNG for a paper figure never demotes the
+// screen style's default, or vice versa.
 const FORMAT_KEY = 'rollout_viz_capture_format';
+const PAPER_FORMAT_KEY = 'rollout_viz_capture_format_paper';
 
 function isDownloadFormat(value: string | null): value is DownloadFormat {
   return FORMATS.some((format) => format.id === value);
 }
 
-function loadFormat(): DownloadFormat {
-  const saved = localStorage.getItem(FORMAT_KEY);
-  return isDownloadFormat(saved) ? saved : 'png';
+function formatKey(style: CaptureStyle): string {
+  return style === 'paper' ? PAPER_FORMAT_KEY : FORMAT_KEY;
+}
+
+function loadFormat(style: CaptureStyle): DownloadFormat {
+  let saved: string | null = null;
+  try { saved = localStorage.getItem(formatKey(style)); } catch { /* ignore */ }
+  if (isDownloadFormat(saved)) return saved;
+  return style === 'paper' ? 'pdf' : 'png';
 }
 
 /**
@@ -79,9 +111,11 @@ export function PresentationPreviewPanel({
   imageTheme,
   exportWidth,
   fontSize,
+  captureStyle = 'screen',
   onImageThemeChange,
   onExportWidthChange,
   onFontSizeChange,
+  onCaptureStyleChange,
   activeMessageIndex,
   messageLabels,
   exportBaseName,
@@ -93,21 +127,42 @@ export function PresentationPreviewPanel({
   onResetActiveDraft,
   onClearDrafts,
 }: PresentationPreviewPanelProps) {
-  const [format, setFormat] = useState<DownloadFormat>(loadFormat);
+  const isPaper = captureStyle === 'paper';
+  const [format, setFormat] = useState<DownloadFormat>(() => loadFormat(captureStyle));
+  // Rendered raster dimensions, read off the preview <img> — only their ratio
+  // is used, to state the figure's final PHYSICAL size (see the footer).
+  const [pixelSize, setPixelSize] = useState<{ w: number; h: number } | null>(null);
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState<'copied' | 'saved' | null>(null);
   const [isCardEditOpen, setIsCardEditOpen] = useState(false);
 
+  // Switching figure style swaps in that style's remembered format (PDF for
+  // paper, PNG for screen, unless the user chose otherwise IN THAT STYLE).
+  // In-render state adjustment — React's recommended alternative to an effect.
+  const [formatStyle, setFormatStyle] = useState<CaptureStyle>(captureStyle);
+  if (formatStyle !== captureStyle) {
+    setFormatStyle(captureStyle);
+    setFormat(loadFormat(captureStyle));
+  }
+
+  // Null under the screen style (a screenshot has no physical size) and until
+  // the preview image has reported its dimensions.
+  const physicalSize = pixelSize
+    ? capturePhysicalSizeIn(captureStyle, exportWidth, pixelSize.w, pixelSize.h)
+    : null;
+
   const pickFormat = (f: DownloadFormat) => {
     setFormat(f);
-    try { localStorage.setItem(FORMAT_KEY, f); } catch { /* ignore */ }
+    try { localStorage.setItem(formatKey(captureStyle), f); } catch { /* ignore */ }
   };
 
   const handleDownload = async () => {
     if (!imageBlob || busy) return;
     setBusy(true);
     try {
-      const blob = await encodeImage(imageBlob, format);
+      // Paper PDFs carry their nominal physical width (234pt for a column),
+      // so the figure drops into LaTeX at 1:1.
+      const blob = await encodeImage(imageBlob, format, capturePageWidthPt(captureStyle, exportWidth));
       const ext = FORMATS.find((f) => f.id === format)?.ext ?? 'png';
       downloadBlob(blob, `${exportBaseName ?? 'rollout-capture'}.${ext}`);
     } catch { /* ignore */ }
@@ -160,49 +215,120 @@ export function PresentationPreviewPanel({
       </div>
 
       {/* Image-capture settings */}
-      <div className={`px-3 py-2 border-b flex flex-wrap items-center gap-x-3 gap-y-1.5 text-xs ${border}`}>
-        <div className="flex items-center gap-1.5">
-          <span className={muted}>Theme</span>
-          <div className={`flex rounded overflow-hidden border ${isDarkMode ? 'border-gray-600' : 'border-gray-300'}`}>
-            {(['light', 'dark'] as const).map((t) => (
+      {/* @container: the row labels come back whenever THIS PANEL (not the
+          viewport — the divider is user-resizable) is wide enough; below
+          that they live on aria-label/title only. */}
+      <div className={`@container px-3 py-2 border-b flex flex-wrap items-center gap-x-2 gap-y-1.5 text-xs ${border}`}>
+        {/* Figure style governs the three controls after it, so it leads.
+            Screen = the app's own transcript look (the default, forever);
+            Paper = the research-paper figure style (white, ink-only, typeset
+            at final size), which pins the theme and the font size. */}
+        {/* No visible "Style" / "Theme" text: each group's buttons already
+            say what they are (Screen/Paper, Light/Dark) and the two words were
+            the last thing pushing the row onto a second line under 1280px.
+            The names survive for AT on the groups' aria-labels. */}
+        <div className="flex items-center gap-1">
+          <div
+            role="group"
+            aria-label="Figure style"
+            className={`flex rounded overflow-hidden border ${isDarkMode ? 'border-gray-600' : 'border-gray-300'}`}
+          >
+            {CAPTURE_STYLES.map((s) => (
               <button
-                key={t}
-                onClick={() => onImageThemeChange(t)}
-                className={`px-2 py-0.5 ${
-                  imageTheme === t
+                key={s.id}
+                onClick={() => onCaptureStyleChange(s.id)}
+                title={s.title}
+                aria-pressed={captureStyle === s.id}
+                className={`px-1.5 py-0.5 ${
+                  captureStyle === s.id
                     ? 'bg-sky-600 text-white'
                     : isDarkMode ? 'bg-gray-800 text-gray-300 hover:bg-gray-700' : 'bg-white text-gray-600 hover:bg-gray-50'
                 }`}
               >
-                {t === 'light' ? 'Light' : 'Dark'}
+                {s.label}
               </button>
             ))}
           </div>
         </div>
-        <label className="flex items-center gap-1.5">
-          <span className={muted}>Width</span>
-          <select
-            value={exportWidth}
-            onChange={(e) => onExportWidthChange(e.target.value as ExportWidth)}
-            className={`px-1.5 py-0.5 rounded border ${ctrl}`}
+        <div className="flex items-center gap-1">
+          <div role="group" aria-label="Image theme" className={`flex rounded overflow-hidden border ${isDarkMode ? 'border-gray-600' : 'border-gray-300'}`}>
+            {(['light', 'dark'] as const).map((t) => {
+              // Paper is always light. The Light button therefore reads as
+              // SELECTED BUT LOCKED — same sky fill as a live selection, held
+              // back to 60% and carrying a lock glyph — rather than the old
+              // gray wash, which looked like "off" and left the group
+              // apparently unselected. `aria-pressed` states it for AT.
+              const isSelected = isPaper ? t === 'light' : imageTheme === t;
+              const isLocked = isPaper && t === 'light';
+              return (
+                <button
+                  key={t}
+                  onClick={() => onImageThemeChange(t)}
+                  disabled={isPaper}
+                  aria-pressed={isSelected}
+                  title={isPaper ? LOCKED_BY_PAPER.theme : undefined}
+                  className={`px-1.5 py-0.5 inline-flex items-center gap-0.5 disabled:cursor-not-allowed ${
+                    isSelected
+                      ? `bg-sky-600 text-white ${isLocked ? 'opacity-60' : ''}`
+                      : `disabled:opacity-50 ${isDarkMode ? 'bg-gray-800 text-gray-300 hover:bg-gray-700' : 'bg-white text-gray-600 hover:bg-gray-50'}`
+                  }`}
+                >
+                  {isLocked && (
+                    <span className="material-symbols-outlined" style={{ fontSize: 12 }} aria-hidden="true">lock</span>
+                  )}
+                  {t === 'light' ? 'Light' : 'Dark'}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+        {/* Named for AT and on hover, not in ink: the option text ("Column
+            (3.25 in)", "Paper 1-column", "Slide") already says "width", and at
+            a 1280px window the four visible words were what still forced the
+            row onto a second line. */}
+        <span className={`hidden @[34rem]:inline ${muted}`} aria-hidden="true">Width</span>
+        <select
+          aria-label="Export width"
+          title="Export width"
+          value={exportWidth}
+          onChange={(e) => onExportWidthChange(e.target.value as ExportWidth)}
+          className={`px-1 py-0.5 rounded border ${ctrl}`}
+        >
+          {captureWidthPresets(captureStyle).map((p) => (
+            <option key={p.id} value={p.id}>{p.label}</option>
+          ))}
+        </select>
+        {/* Under Paper the size is not a choice — it is the derived final
+            size. A disabled dropdown still listing Small/Medium/Large invites
+            a click that does nothing AND is the widest control in the row (it
+            is what pushed the settings onto a second line). A locked readout
+            states the actual value in a third of the width. */}
+        {isPaper ? (
+          <span
+            data-testid="paper-font-locked"
+            aria-label={`Font size ${PAPER_BODY_PT}pt, locked`}
+            title={LOCKED_BY_PAPER.font}
+            className={`inline-flex items-center gap-0.5 px-1 py-0.5 rounded border ${ctrl} opacity-70`}
           >
-            {EXPORT_WIDTH_PRESETS.map((p) => (
-              <option key={p.id} value={p.id}>{p.label}</option>
-            ))}
-          </select>
-        </label>
-        <label className="flex items-center gap-1.5">
-          <span className={muted}>Font</span>
-          <select
-            value={fontSize}
-            onChange={(e) => onFontSizeChange(e.target.value as FontSize)}
-            className={`px-1.5 py-0.5 rounded border ${ctrl}`}
-          >
-            {FONT_SIZE_PRESETS.map((p) => (
-              <option key={p.id} value={p.id}>{p.label}</option>
-            ))}
-          </select>
-        </label>
+            <span className="material-symbols-outlined" style={{ fontSize: 12 }} aria-hidden="true">lock</span>
+            {PAPER_BODY_PT}pt
+          </span>
+        ) : (
+          <label className="flex items-center gap-1">
+            <span className={`hidden @[34rem]:inline ${muted}`} aria-hidden="true">Font</span>
+            <select
+              aria-label="Font size"
+              title="Font size"
+              value={fontSize}
+              onChange={(e) => onFontSizeChange(e.target.value as FontSize)}
+              className={`px-1 py-0.5 rounded border ${ctrl}`}
+            >
+              {FONT_SIZE_PRESETS.map((p) => (
+                <option key={p.id} value={p.id}>{p.label}</option>
+              ))}
+            </select>
+          </label>
+        )}
       </div>
 
       <div className={`border-b text-xs ${border}`}>
@@ -345,6 +471,10 @@ export function PresentationPreviewPanel({
             <img
               src={imageUrl}
               alt="Live capture preview"
+              onLoad={(e) => setPixelSize({
+                w: e.currentTarget.naturalWidth,
+                h: e.currentTarget.naturalHeight,
+              })}
               className={`max-w-full h-auto rounded shadow-lg transition-opacity ${isPending ? 'opacity-40' : ''}`}
             />
             {isPending && (
@@ -373,7 +503,22 @@ export function PresentationPreviewPanel({
       </div>
 
       {imageUrl && (
-        <div className={`flex items-center gap-2 px-3 py-2 border-t ${border}`}>
+        <div className={`px-3 py-2 border-t space-y-1.5 ${border}`}>
+        {/* Final physical size. A paper figure is placed at 1:1, so the
+            question before download is "does this fit the page?" — which the
+            pixel count cannot answer (the raster is supersampled). The width
+            is the chosen column; the height is whatever this card came out to. */}
+        {/* Gated on isPending like the Download button: for ~400ms after a
+            style flip the live style and the PREVIOUS raster's dimensions
+            disagree, and a confidently wrong size is worse than a beat of
+            silence. */}
+        {physicalSize && !isPending && (
+          <div data-testid="paper-size-readout" className={`text-[11px] ${muted}`}>
+            Final size {physicalSize.widthIn.toFixed(2)} × {physicalSize.heightIn.toFixed(2)} in
+            {' '}<span className="opacity-70">at 1:1</span>
+          </div>
+        )}
+        <div className="flex items-center gap-2">
           <select
             value={format}
             onChange={(e) => pickFormat(e.target.value as DownloadFormat)}
@@ -408,6 +553,7 @@ export function PresentationPreviewPanel({
             </span>
             {copied === 'copied' ? 'Copied' : copied === 'saved' ? 'Saved' : 'Copy'}
           </button>
+        </div>
         </div>
       )}
     </div>

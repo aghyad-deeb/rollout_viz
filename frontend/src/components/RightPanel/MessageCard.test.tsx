@@ -1252,3 +1252,17 @@ describe('MessageCard scan-mode header', () => {
     expect(screen.getByText('↳ bash')).toBeInTheDocument();
   });
 });
+
+describe('capture structural assumptions', () => {
+  // The entire .capture-paper box hangs on `.capture-paper .message-*` being
+  // DESCENDANT selectors: the clone root that receives the capture classes
+  // must never itself be the role-classed element, or the paper ground/rule
+  // silently vanish (round-3 code critic, reproduced by probing the wrong
+  // root). Pin the structure.
+  it('the card root is a wrapper, not the .message-* element itself', () => {
+    const { container } = render(<MessageCard {...defaultProps} />);
+    const root = container.firstChild as HTMLElement;
+    expect(root.className).not.toMatch(/message-(system|user|assistant|tool|file)/);
+    expect(root.querySelector('[class*="message-"]')).not.toBeNull();
+  });
+});

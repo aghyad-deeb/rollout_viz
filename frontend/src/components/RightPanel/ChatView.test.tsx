@@ -1,6 +1,7 @@
 import { useState, type ComponentProps } from 'react';
 import { render, screen, within, fireEvent, act } from '@testing-library/react';
 import { ChatView } from './ChatView';
+import { PAPER_FONT_SCALE } from '../../utils/captureImage';
 import type { Sample, SampleGrades } from '../../types';
 
 // Controls for the MessageCard mock below. Integration-style tests
@@ -15,14 +16,22 @@ const captureMocks = vi.hoisted(() => ({
   captureCardToPng: vi.fn(async () => new Blob(['png'], { type: 'image/png' })),
   copyImageToClipboard: vi.fn(async () => true),
   downloadBlob: vi.fn(),
+  encodeImage: vi.fn(async () => new Blob(['pdf'], { type: 'application/pdf' })),
 }));
 
-vi.mock('../../utils/captureImage', () => ({
-  captureCardToPng: captureMocks.captureCardToPng,
-  copyImageToClipboard: captureMocks.copyImageToClipboard,
-  downloadBlob: captureMocks.downloadBlob,
-  FONT_SIZE_PRESETS: [{ id: 'md', label: 'M', scale: 1 }],
-}));
+// Only the three rasterizing/clipboard entry points are stubbed — the pure
+// helpers (font-scale resolution, presets) stay real so the figure-style
+// plumbing test below asserts the actual derived scale.
+vi.mock('../../utils/captureImage', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../utils/captureImage')>();
+  return {
+    ...actual,
+    captureCardToPng: captureMocks.captureCardToPng,
+    copyImageToClipboard: captureMocks.copyImageToClipboard,
+    downloadBlob: captureMocks.downloadBlob,
+    encodeImage: captureMocks.encodeImage,
+  };
+});
 
 vi.mock('../../utils/pngMetadata', () => ({
   readPngTextChunks: vi.fn(async () => ({})),
@@ -817,6 +826,34 @@ describe('ChatView capture feedback', () => {
     expect(q.getByTestId('capture-status-1')).toHaveTextContent('none');
   });
 
+  // Figure style is inert plumbing until it reaches captureCardToPng: the
+  // whole feature is scoped to the capture clone, so the ONLY thing ChatView
+  // owes it is forwarding the style + the style's font scale.
+  it('forwards the paper figure style and its derived 9pt font scale', async () => {
+    const { container } = render(
+      <ChatView {...defaultProps} isPresentationMode={true} captureStyle="paper" exportWidth="col" imageTheme="dark" />,
+    );
+    await act(async () => { fireEvent.click(within(container).getByTestId('capture-0')); });
+    await flushCapture();
+
+    expect(captureMocks.captureCardToPng).toHaveBeenCalledTimes(1);
+    expect(captureMocks.captureCardToPng.mock.calls[0][1]).toMatchObject({
+      captureStyle: 'paper',
+      exportWidth: 'col',
+      fontScale: PAPER_FONT_SCALE,
+    });
+  });
+
+  it('defaults to the screen style and the font preset when no style is given', async () => {
+    const { container } = render(<ChatView {...defaultProps} isPresentationMode={true} fontSize="md" />);
+    await act(async () => { fireEvent.click(within(container).getByTestId('capture-0')); });
+    await flushCapture();
+
+    const opts = captureMocks.captureCardToPng.mock.calls[0][1] as { captureStyle: string; fontScale: number };
+    expect(opts.captureStyle).toBe('screen');
+    expect(opts.fontScale).toBe(1.35);
+  });
+
   it('reports fallback when the clipboard write fell back to a download', async () => {
     captureMocks.copyImageToClipboard.mockResolvedValueOnce(false);
     const { container } = render(<ChatView {...defaultProps} isPresentationMode={true} />);
@@ -1035,6 +1072,136 @@ describe('ChatView capture filenames', () => {
     });
     fireEvent.click(screen.getByText('Download'));
     expect(captureMocks.downloadBlob).toHaveBeenCalledWith(expect.any(Blob), 'rollout-1-step100-msg2.png');
+    expect(captureMocks.encodeImage).not.toHaveBeenCalled();   // screen = PNG
+  });
+
+  it('downloads a PAPER preview as a PDF page at the nominal column width', async () => {
+    globalThis.URL.createObjectURL = vi.fn(() => 'blob:preview');
+    globalThis.URL.revokeObjectURL = vi.fn();
+    const { container } = render(
+      <ChatView {...defaultProps} isPresentationMode={true} captureStyle="paper" exportWidth="col" />,
+    );
+    await act(async () => {
+      fireEvent.click(within(container).getByTestId('preview-1'));
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+
+    // The primary action names the format it produces; PNG stays one click away.
+    await act(async () => {
+      fireEvent.click(screen.getByText('Download PDF'));
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+    expect(captureMocks.encodeImage).toHaveBeenCalledWith(expect.any(Blob), 'pdf', 234);
+    expect(captureMocks.downloadBlob).toHaveBeenCalledWith(expect.any(Blob), 'rollout-1-step100-msg2.pdf');
+  });
+
+  it('keeps PNG available as the explicit secondary in the paper style', async () => {
+    globalThis.URL.createObjectURL = vi.fn(() => 'blob:preview');
+    globalThis.URL.revokeObjectURL = vi.fn();
+    const { container } = render(
+      <ChatView {...defaultProps} isPresentationMode={true} captureStyle="paper" exportWidth="full" />,
+    );
+    await act(async () => {
+      fireEvent.click(within(container).getByTestId('preview-1'));
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'PNG' }));
+    expect(captureMocks.downloadBlob).toHaveBeenCalledWith(expect.any(Blob), 'rollout-1-step100-msg2.png');
+    expect(captureMocks.encodeImage).not.toHaveBeenCalled();
+  });
+
+  it('leaves the clipboard on PNG in the paper style', async () => {
+    const { container } = render(
+      <ChatView {...defaultProps} isPresentationMode={true} captureStyle="paper" exportWidth="col" />,
+    );
+    await act(async () => {
+      fireEvent.click(within(container).getByTestId('capture-0'));
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+    expect(captureMocks.copyImageToClipboard).toHaveBeenCalledWith(
+      expect.any(Blob),
+      expect.any(String),
+      'rollout-1-step100-msg1.png',
+    );
+    expect(captureMocks.encodeImage).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Preview modal honesty: the modal describes the raster it HAS, not the live
+// settings row behind it (the settings stay interactive while it is open).
+// ---------------------------------------------------------------------------
+
+describe('ChatView capture preview modal — settings snapshot', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    globalThis.URL.createObjectURL = vi.fn(() => 'blob:preview');
+    globalThis.URL.revokeObjectURL = vi.fn();
+  });
+
+  const openPreview = async (container: HTMLElement) => {
+    await act(async () => {
+      fireEvent.click(within(container).getByTestId('preview-1'));
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+  };
+
+  it('keeps a SCREEN preview on the screen download when the style flips to paper', async () => {
+    const { container, rerender } = render(
+      <ChatView {...defaultProps} isPresentationMode={true} captureStyle="screen" exportWidth="paper1" />,
+    );
+    await openPreview(container);
+    // The user flips the settings row while the modal is up. That governs the
+    // NEXT capture; this raster is still screen pixels.
+    rerender(
+      <ChatView {...defaultProps} isPresentationMode={true} captureStyle="paper" exportWidth="col" />,
+    );
+
+    expect(screen.queryByText('Download PDF')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'PNG' })).toBeNull();
+    await act(async () => {
+      fireEvent.click(screen.getByText('Download'));
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+    // Screen pixels must not be wrapped in a 234pt "column" page.
+    expect(captureMocks.encodeImage).not.toHaveBeenCalled();
+    expect(captureMocks.downloadBlob).toHaveBeenCalledWith(expect.any(Blob), 'rollout-1-step100-msg2.png');
+  });
+
+  it('keeps a PAPER preview on its own page geometry when the settings move under it', async () => {
+    const { container, rerender } = render(
+      <ChatView {...defaultProps} isPresentationMode={true} captureStyle="paper" exportWidth="col" />,
+    );
+    await openPreview(container);
+    // Width changes to full-width (486pt) AND style flips back to screen.
+    rerender(
+      <ChatView {...defaultProps} isPresentationMode={true} captureStyle="screen" exportWidth="slide" />,
+    );
+
+    // Still the paper modal, still the 234pt column the raster was made for.
+    await act(async () => {
+      fireEvent.click(screen.getByText('Download PDF'));
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+    expect(captureMocks.encodeImage).toHaveBeenCalledWith(expect.any(Blob), 'pdf', 234);
+  });
+
+  it('re-snapshots on the NEXT capture — a new preview follows the new settings', async () => {
+    const { container, rerender } = render(
+      <ChatView {...defaultProps} isPresentationMode={true} captureStyle="screen" exportWidth="paper1" />,
+    );
+    await openPreview(container);
+    rerender(
+      <ChatView {...defaultProps} isPresentationMode={true} captureStyle="paper" exportWidth="full" />,
+    );
+    await openPreview(container);   // fresh capture under the new settings
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('Download PDF'));
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+    expect(captureMocks.encodeImage).toHaveBeenCalledWith(expect.any(Blob), 'pdf', 486);
   });
 });
 
@@ -1188,5 +1355,38 @@ describe('ChatView first-screen economy', () => {
       .map(el => el.closest('[class*="grid-rows"]'))
       .find(el => el !== null) as HTMLElement;
     expect(grid.className).toContain('grid-rows-[1fr]');
+  });
+});
+
+describe('ChatView tool-echo stripping', () => {
+  it('hides a command echoed at the head of its tool result, keeping raw_content', () => {
+    const sample = makeSample({
+      messages: [
+        { role: 'user', content: 'go' },
+        {
+          role: 'assistant', content: '',
+          tool_calls: [{ type: 'function', function: { name: 'bash', arguments: { command: 'ls -la' } } }],
+        },
+        { role: 'tool', content: 'ls -la\ntotal 4\nfile.txt', name: 'bash' },
+      ],
+    });
+    render(<ChatView {...defaultProps} sample={sample} />);
+    const toolContent = screen.getByTestId('content-2');
+    expect(toolContent).toHaveTextContent('total 4');
+    expect(toolContent.textContent).not.toContain('ls -la');
+  });
+
+  it('leaves non-echoing tool results untouched', () => {
+    const sample = makeSample({
+      messages: [
+        {
+          role: 'assistant', content: '',
+          tool_calls: [{ type: 'function', function: { name: 'bash', arguments: { command: 'ls -la' } } }],
+        },
+        { role: 'tool', content: 'total 4\nfile.txt', name: 'bash' },
+      ],
+    });
+    render(<ChatView {...defaultProps} sample={sample} />);
+    expect(screen.getByTestId('content-1')).toHaveTextContent('total 4');
   });
 });

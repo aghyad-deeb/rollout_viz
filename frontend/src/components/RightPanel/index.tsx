@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useRef, useState, lazy, Suspense } from 'react';
-import type { Sample, ViewMode, SearchCondition, ExportWidth, FontSize, GradeEntry } from '../../types';
+import type { Sample, ViewMode, SearchCondition, CaptureStyle, ExportWidth, FontSize, GradeEntry } from '../../types';
 import type { PresentationMessageDrafts } from '../../utils/presentationDraft';
 import { NavigationBar } from './NavigationBar';
 import { CompanionDrawer } from './CompanionDrawer';
@@ -75,6 +75,7 @@ interface RightPanelProps {
   imageTheme?: 'light' | 'dark';
   exportWidth?: ExportWidth;
   fontSize?: FontSize;
+  captureStyle?: CaptureStyle;
   presentationDrafts?: PresentationMessageDrafts;
   presentationActiveIndex?: number | null;
   onPresentationActiveIndexChange?: (index: number | null) => void;
@@ -121,6 +122,7 @@ export function RightPanel({
   imageTheme = 'light',
   exportWidth = 'paper1',
   fontSize = 'md',
+  captureStyle = 'screen',
   presentationDrafts = EMPTY_DRAFTS,
   presentationActiveIndex = null,
   onPresentationActiveIndexChange,
@@ -219,6 +221,7 @@ export function RightPanel({
           imageTheme={imageTheme}
           exportWidth={exportWidth}
           fontSize={fontSize}
+          captureStyle={captureStyle}
           onPresentationPreview={onPresentationPreview}
           onPreviewPending={onPreviewPending}
           presentationDrafts={presentationDrafts}

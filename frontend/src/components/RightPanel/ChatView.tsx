@@ -1,13 +1,14 @@
 import { useState, useMemo, useRef, useEffect, useLayoutEffect, useCallback } from 'react';
 import { createPortal, flushSync } from 'react-dom';
-import type { Sample, Message, SearchCondition, Quote, EphemeralHighlight, CollapsedRegion, RegionLocator, ExportWidth, FontSize } from '../../types';
+import type { Sample, Message, SearchCondition, Quote, EphemeralHighlight, CollapsedRegion, RegionLocator, CaptureStyle, ExportWidth, FontSize } from '../../types';
+import { displayMessages } from '../../utils/toolEcho';
 import { MessageCard } from './MessageCard';
 import { GradesDisplay } from './GradesDisplay';
 import { Minimap } from './Minimap';
 import { countMessageOccurrences, buildSearchCorpus } from '../../utils/parseContent';
 import { findAllMatchesCI } from '../../utils/textMatch';
 import { extractHighlightAnchor } from '../../utils/textSnippet';
-import { captureCardToPng, copyImageToClipboard, downloadBlob, FONT_SIZE_PRESETS } from '../../utils/captureImage';
+import { captureCardToPng, capturePageWidthPt, copyImageToClipboard, downloadBlob, encodeImage, resolveCaptureFontScale } from '../../utils/captureImage';
 import { readPngTextChunks, stripPngTextChunks } from '../../utils/pngMetadata';
 import { applyPresentationDraft, type PresentationMessageDrafts } from '../../utils/presentationDraft';
 import { CapturePreviewModal } from './CapturePreviewModal';
@@ -47,6 +48,8 @@ interface ChatViewProps {
   imageTheme?: 'light' | 'dark';
   exportWidth?: ExportWidth;
   fontSize?: FontSize;
+  /** Figure style for captures. 'paper' also forces the clone LIGHT. */
+  captureStyle?: CaptureStyle;
   onPresentationPreview?: (url: string | null, blob?: Blob | null) => void;
   // Fires true while a fresh left-panel preview render is pending (debounce +
   // capture), false once the preview is current again — lets the preview
@@ -84,6 +87,7 @@ export function ChatView({
   imageTheme = 'light',
   exportWidth = 'paper1',
   fontSize = 'md',
+  captureStyle = 'screen',
   onPresentationPreview,
   onPreviewPending,
   presentationDrafts = EMPTY_DRAFTS,
@@ -122,11 +126,18 @@ export function ChatView({
   // Get the first active condition for scroll targeting
   const primarySearchTerm = activeSearchTerms[0] || '';
 
-  const displayedMessages = useMemo(() => (
-    isPresentationMode
+  const displayedMessages = useMemo(() => {
+    const base = isPresentationMode
       ? sample.messages.map((message, index) => applyPresentationDraft(message, presentationDrafts[index]))
-      : sample.messages
-  ), [isPresentationMode, presentationDrafts, sample.messages]);
+      : sample.messages;
+    // Some producers echo the executed command as the first line(s) of the
+    // tool RESULT — the assistant's CALL band already shows it. `displayMessages`
+    // is the SHARED strip (utils/toolEcho.ts): LeftPanel's global-search
+    // matching and match counts run through the same mapping, so the table's
+    // count and the transcript's marks can never disagree. The original string
+    // is preserved on raw_content and the data on disk is untouched.
+    return displayMessages(base);
+  }, [isPresentationMode, presentationDrafts, sample.messages]);
 
   // The conversation's first user turn is the task statement — MessageCard
   // gives it a 'TASK' running head and a step-up in body size. -1 when the
@@ -188,7 +199,20 @@ export function ChatView({
   // live object URL so it can be revoked imperatively — an effect-cleanup
   // revoke fires during StrictMode's mount/cleanup/mount cycle and would
   // kill a URL the <img> still needs.
-  const [preview, setPreview] = useState<{ url: string; blob: Blob; caption: string; filename: string } | null>(null);
+  // The modal's blob and the SETTINGS THAT PRODUCED IT travel together. The
+  // settings row stays live behind the modal, so deriving the download label /
+  // format / PDF page geometry from current state mislabeled and mis-sized an
+  // artifact that had already been rasterized under the old ones (flip to
+  // Paper with a screen preview open and Download handed you screen pixels
+  // inside a 234pt "column" page). Snapshotting them into the same state that
+  // holds the blob makes the modal honest by construction.
+  const [preview, setPreview] = useState<{
+    url: string;
+    blob: Blob;
+    caption: string;
+    filename: string;
+    opts: { captureStyle: CaptureStyle; exportWidth: ExportWidth; imageTheme: 'light' | 'dark' };
+  } | null>(null);
   const previewUrlRef = useRef<string | null>(null);
   // Presentation-toolbar "?" shortcuts popover (Escape / outside-click close).
   const [isHelpOpen, setIsHelpOpen] = useState(false);
@@ -249,9 +273,13 @@ export function ChatView({
   // Carry the image theme on the host as a `.dark` class so the portalled
   // capture card's `.dark .message-*` CSS resolves to the image theme,
   // independent of the app UI theme.
+  // A paper figure is always light (it sits on the printed page), so the
+  // dark class is withheld there regardless of the image-theme setting —
+  // which the settings UI shows locked while the paper style is on.
+  const captureDark = imageTheme === 'dark' && captureStyle !== 'paper';
   useEffect(() => {
-    captureHost.classList.toggle('dark', imageTheme === 'dark');
-  }, [captureHost, imageTheme]);
+    captureHost.classList.toggle('dark', captureDark);
+  }, [captureHost, captureDark]);
   // Mirror the latest collapsedRegions into a ref (updated post-commit, not
   // during render) so the mutators below can snapshot pre-mutation state
   // for undo without a stale closure or an impure setState updater.
@@ -281,6 +309,29 @@ export function ChatView({
   useEffect(() => () => {
     if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
   }, []);
+
+  // Preview-modal downloads. PNG is the raw capture; PDF re-wraps that exact
+  // raster (losslessly) in a page sized to the figure's nominal physical
+  // width, which is what makes a paper figure droppable into LaTeX at 1:1.
+  const downloadPreviewPng = useCallback(() => {
+    if (preview) downloadBlob(preview.blob, preview.filename);
+  }, [preview]);
+
+  const downloadPreviewPdf = useCallback(async () => {
+    if (!preview) return;
+    try {
+      // Page geometry comes from the SNAPSHOT the blob was rendered under,
+      // never from the live settings row behind the modal.
+      const pdf = await encodeImage(
+        preview.blob,
+        'pdf',
+        capturePageWidthPt(preview.opts.captureStyle, preview.opts.exportWidth),
+      );
+      downloadBlob(pdf, preview.filename.replace(/\.png$/, '.pdf'));
+    } catch {
+      downloadBlob(preview.blob, preview.filename);   // never leave the click dead
+    }
+  }, [preview]);
 
   // Close the capture-preview modal, freeing its object URL.
   const closePreview = useCallback(() => {
@@ -420,8 +471,9 @@ export function ChatView({
     };
   }, [isHelpOpen]);
 
-  // Resolve the chosen font-size preset to a numeric multiplier.
-  const fontScale = FONT_SIZE_PRESETS.find((p) => p.id === fontSize)?.scale ?? 1;
+  // Resolve the capture font multiplier: the user's font-size preset in the
+  // screen style, the derived final-size (9pt) scale in the paper style.
+  const fontScale = resolveCaptureFontScale(captureStyle, fontSize);
 
   // Render a message card to a PNG. We strip rollout-viz text metadata from
   // new exports so shared captures do not carry hidden source paths or origins.
@@ -434,7 +486,11 @@ export function ChatView({
     flushSync(() => setActivePresentationIndex(messageIndex));
     const cardEl = captureHost.firstElementChild as HTMLElement | null;
     if (!cardEl) throw new Error('capture card is not mounted');
-    const rawPng = await captureCardToPng(cardEl, { exportWidth, imageTheme, fontScale });
+    // The settings this raster is rendered under, captured HERE so anything
+    // downstream (the preview modal's label / format / PDF page size) can
+    // describe the artifact it actually has rather than the live controls.
+    const opts = { captureStyle, exportWidth, imageTheme };
+    const rawPng = await captureCardToPng(cardEl, { ...opts, fontScale });
     const png = await stripPngTextChunks(rawPng, ['rollout-viz']);
     const caption =
       `${sample.attributes.experiment_name} · rollout ${sample.attributes.rollout_n}` +
@@ -443,8 +499,8 @@ export function ChatView({
     // the preview modal's Download button).
     const filename =
       `rollout-${sample.attributes.rollout_n}-step${sample.attributes.step}-msg${messageIndex + 1}.png`;
-    return { png, caption, filename };
-  }, [captureHost, exportWidth, imageTheme, fontScale, sample.attributes, setActivePresentationIndex]);
+    return { png, caption, filename, opts };
+  }, [captureHost, exportWidth, imageTheme, captureStyle, fontScale, sample.attributes, setActivePresentationIndex]);
 
   // P / camera button: capture straight to the clipboard. Reports per-card
   // status (busy → done / fallback / error) so the 0.5-2s render + clipboard
@@ -481,11 +537,11 @@ export function ChatView({
   // can check it before copying.
   const previewMessage = useCallback(async (messageIndex: number) => {
     try {
-      const { png, caption, filename } = await buildCapturePng(messageIndex);
+      const { png, caption, filename, opts } = await buildCapturePng(messageIndex);
       const url = URL.createObjectURL(png);
       if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
       previewUrlRef.current = url;
-      setPreview({ url, blob: png, caption, filename });
+      setPreview({ url, blob: png, caption, filename, opts });
     } catch (err) {
       console.error('[presentation] preview failed', err);
     }
@@ -519,7 +575,7 @@ export function ChatView({
         return;
       }
       try {
-        const raw = await captureCardToPng(cardEl, { exportWidth, imageTheme, fontScale });
+        const raw = await captureCardToPng(cardEl, { exportWidth, imageTheme, captureStyle, fontScale });
         const blob = await stripPngTextChunks(raw, ['rollout-viz']);
         if (cancelled) return;
         const url = URL.createObjectURL(blob);
@@ -533,7 +589,7 @@ export function ChatView({
       }
     }, 380);
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [isPresentationMode, activeIndex, displayedMessages, collapsedRegions, ephemeralHighlights, wrappedToolCalls, exportWidth, imageTheme, fontScale, captureHost]);
+  }, [isPresentationMode, activeIndex, displayedMessages, collapsedRegions, ephemeralHighlights, wrappedToolCalls, exportWidth, imageTheme, captureStyle, fontScale, captureHost]);
 
   // Free the left-panel preview URL on unmount; a pending flag must not
   // outlive the component that would clear it.
@@ -1297,7 +1353,7 @@ export function ChatView({
       {isPresentationMode && activeIndex !== null && displayedMessages[activeIndex] != null &&
         createPortal(
           renderMessageCard(displayedMessages[activeIndex], activeIndex, {
-            dark: imageTheme === 'dark',
+            dark: captureDark,
             forCapture: true,
           }),
           captureHost,
@@ -1343,7 +1399,19 @@ export function ChatView({
           imageUrl={preview.url}
           isDarkMode={isDarkMode}
           onCopy={() => { copyImageToClipboard(preview.blob, preview.caption, preview.filename); }}
-          onDownload={() => downloadBlob(preview.blob, preview.filename)}
+          // Paper figures download as a PDF by default — a page sized to the
+          // nominal column width, losslessly, ready to \includegraphics. PNG
+          // stays one click away; the clipboard is always PNG (item 6 of the
+          // figure critic loop).
+          //
+          // Every one of these reads `preview.opts`, NOT the live settings: the
+          // modal must describe the raster it is showing. Changing the style
+          // while it is open changes the next capture, not this one.
+          downloadLabel={preview.opts.captureStyle === 'paper' ? 'Download PDF' : 'Download'}
+          onDownload={preview.opts.captureStyle === 'paper' ? downloadPreviewPdf : downloadPreviewPng}
+          onDownloadAlt={preview.opts.captureStyle === 'paper'
+            ? { label: 'PNG', onDownload: downloadPreviewPng }
+            : undefined}
           onClose={closePreview}
         />
       )}

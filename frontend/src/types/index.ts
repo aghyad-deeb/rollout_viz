@@ -373,7 +373,21 @@ export interface CollapsedRegion {
 // off-screen render width so text reflows (not scales) to the target.
 // Ordered narrow → wide; label + pixel width live in EXPORT_WIDTH_PRESETS
 // (utils/captureImage.ts).
-export type ExportWidth = 'narrow' | 'paper2' | 'paper1' | 'half' | 'slide' | 'slidewide';
+//
+// `col` / `full` belong to the PAPER figure style only (the physical
+// LaTeX column widths, see PAPER_WIDTH_PRESETS); the other six are the
+// screen-style presets. The two sets never mix — `captureWidthPresets()`
+// serves one list per style and `resolveCaptureWidthPx()` falls back to
+// that style's default if an id from the other set ever reaches it.
+export type ExportWidth =
+  | 'narrow' | 'paper2' | 'paper1' | 'half' | 'slide' | 'slidewide'
+  | 'col' | 'full';
+
+// Figure style for a capture. 'screen' is the app's own transcript look
+// (the default, unchanged forever); 'paper' is the research-paper figure
+// style — white ground, ink-only, final-size type — applied ONLY to the
+// off-screen capture clone (see `.capture-paper` in index.css).
+export type CaptureStyle = 'screen' | 'paper';
 
 // Capture font-size presets. The multiplier (`scale`) + label live in
 // FONT_SIZE_PRESETS (utils/captureImage.ts).

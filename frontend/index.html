@@ -12,9 +12,13 @@
          (~320KB woff2 instead of the ~4MB full variable font); display=block
          hides raw ligature text until the icon font is ready. -->
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0&display=block" />
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <!-- Monospace numerals for the analysis dashboard's instrument-readout figures/axes -->
-    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <!-- Inter (body) + IBM Plex Mono (tool output, analysis readouts) are
+         SELF-HOSTED (public/fonts). They used to come from the Google CDN, but a
+         cross-origin font cannot be inlined into the image-capture snapshot, so
+         every exported figure silently rasterized in a fallback face. Same
+         woff2 bytes, now same-origin — see public/fonts/fonts.css and
+         src/utils/captureFonts.ts. -->
+    <link rel="stylesheet" href="/fonts/fonts.css">
   </head>
   <body class="font-sans">
     <div id="root"></div>

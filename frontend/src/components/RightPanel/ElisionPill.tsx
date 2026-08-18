@@ -1,5 +1,13 @@
 import { useState, useRef, useEffect } from 'react';
 
+/**
+ * The label shown when the user has not typed one — the pill renders
+ * `[{display}]`, so the default pill reads `[...]`. Imported by
+ * `paperizeClone` (utils/captureImage.ts), which rewrites exactly that
+ * default to a typographic `[…]` in paper exports.
+ */
+export const ELISION_DEFAULT_LABEL = '...';
+
 interface ElisionPillProps {
   /** The collapsed text — shown as a hover-preview tooltip. */
   text: string;
@@ -61,7 +69,7 @@ export function ElisionPill({
     };
   }, [menu]);
 
-  const display = label && label.trim() ? label.trim() : '...';
+  const display = label && label.trim() ? label.trim() : ELISION_DEFAULT_LABEL;
   // Whitespace-collapsed copy of the hidden text, surfaced on hover.
   const preview = text.replace(/\s+/g, ' ').trim();
 

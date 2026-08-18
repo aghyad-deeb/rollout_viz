@@ -20,6 +20,7 @@ import { COMMENTS_METRIC, visibleComments } from '../../utils/humanGrades';
 import { MetadataHeader } from './MetadataHeader';
 import { useDebouncedValue } from '../../hooks/useDebouncedValue';
 import { normalizeAssistantMessage, countMessageOccurrences } from '../../utils/parseContent';
+import { displayMessages } from '../../utils/toolEcho';
 
 // Helper to generate unique IDs (same pattern as FilterBar's search conditions)
 const generateId = () => Math.random().toString(36).substring(2, 9);
@@ -179,12 +180,18 @@ export function LeftPanel({
       const term = condition.term.toLowerCase();
       const attrs = sample.attributes;
       const field = condition.field;
-      
+      // Search the messages AS THE TRANSCRIPT RENDERS THEM — tool-result
+      // command echoes stripped (utils/toolEcho.ts). Searching the raw text
+      // here matched (and counted) hits the chat view has no mark for.
+      // Cached per message array, and the original array is returned when
+      // nothing strips, so this stays cheap across 5,000 samples.
+      const messages = displayMessages(sample.messages);
+
       let matches = false;
-      
+
       switch (field) {
         case 'chat':
-          matches = sample.messages.some(msg => {
+          matches = messages.some(msg => {
             const { reasoning, mainContent } = normalizeAssistantMessage(msg);
             const normalized = [mainContent, reasoning].filter(Boolean).join(' ');
             return normalized.toLowerCase().includes(term);
@@ -192,32 +199,32 @@ export function LeftPanel({
           break;
         
         case 'system':
-          matches = sample.messages.some(msg => 
+          matches = messages.some(msg => 
             msg.role === 'system' && msg.content.toLowerCase().includes(term)
           );
           break;
         
         case 'user':
-          matches = sample.messages.some(msg => 
+          matches = messages.some(msg => 
             msg.role === 'user' && msg.content.toLowerCase().includes(term)
           );
           break;
         
         case 'assistant':
-          matches = sample.messages.some(msg => {
+          matches = messages.some(msg => {
             if (msg.role !== 'assistant') return false;
             return normalizeAssistantMessage(msg).mainContent.toLowerCase().includes(term);
           });
           break;
         
         case 'tool':
-          matches = sample.messages.some(msg => 
+          matches = messages.some(msg => 
             msg.role === 'tool' && msg.content.toLowerCase().includes(term)
           );
           break;
         
         case 'reasoning':
-          matches = sample.messages.some(msg => {
+          matches = messages.some(msg => {
             if (msg.role !== 'assistant') return false;
             const reasoning = normalizeAssistantMessage(msg).reasoning;
             return reasoning ? reasoning.toLowerCase().includes(term) : false;
@@ -246,7 +253,7 @@ export function LeftPanel({
         
         case 'all':
         default: {
-          const inMessages = sample.messages.some(msg => {
+          const inMessages = messages.some(msg => {
             const { reasoning, mainContent } = normalizeAssistantMessage(msg);
             const normalized = [mainContent, reasoning].filter(Boolean).join(' ');
             return normalized.toLowerCase().includes(term);
@@ -568,8 +575,10 @@ export function LeftPanel({
     
     if (activeMessageConditions.length === 0) return 0;
 
+    // Same display mapping the transcript renders (and ChatView counts) — a
+    // match inside a stripped command echo is not a match the user can jump to.
     let count = 0;
-    sample.messages.forEach(msg => {
+    displayMessages(sample.messages).forEach(msg => {
       count += countMessageOccurrences(msg, activeMessageConditions);
     });
 

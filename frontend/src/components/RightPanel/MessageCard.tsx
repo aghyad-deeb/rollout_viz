@@ -1200,7 +1200,9 @@ function MessageCardInner({
                       data-testid="collapsed-line-count"
                       // Fixed width + right alignment: a 3-digit count must
                       // not push the excerpt column off the shared x.
-                      className={`shrink-0 w-10 text-right font-mono text-[10px] tnum tracking-normal normal-case font-normal ${textMuted}`}
+                      // `collapsed-line-count` is a marker class (no styles
+                      // of its own) that the paper figure style hides.
+                      className={`collapsed-line-count shrink-0 w-10 text-right font-mono text-[10px] tnum tracking-normal normal-case font-normal ${textMuted}`}
                     >
                       {lineCount} L
                     </span>
@@ -1224,7 +1226,9 @@ function MessageCardInner({
                 <span
                   data-testid="header-meta"
                   aria-hidden="true"
-                  className={`absolute inset-y-0 right-0 flex items-center whitespace-nowrap font-mono text-[10px] tnum tracking-normal normal-case font-normal pointer-events-none transition-opacity ${textMuted} ${isHovered ? 'opacity-0' : 'opacity-100'}`}
+                  // `header-meta` is a marker class (no styles of its own):
+                  // the paper figure style hides this scan-mode run.
+                  className={`header-meta absolute inset-y-0 right-0 flex items-center whitespace-nowrap font-mono text-[10px] tnum tracking-normal normal-case font-normal pointer-events-none transition-opacity ${textMuted} ${isHovered ? 'opacity-0' : 'opacity-100'}`}
                 >
                   #{index + 1}{lineCount > 0 ? ` · ${lineCount} ln` : ''}
                 </span>
@@ -1386,7 +1390,13 @@ function MessageCardInner({
                       message.role === 'tool' || message.role === 'file'
                         ? 'font-mono text-[13px] leading-[20px]'
                         : isTaskMessage
-                          ? 'text-[16px] leading-[1.55] font-[450] max-w-[90ch]'
+                          // font-[500], not 450: the old CDN served four
+                          // STATIC Inter faces so 450 silently snapped to
+                          // 500; the vendored VARIABLE face renders a true
+                          // 450 (lighter). 500 restores the pre-vendoring
+                          // rendering byte-for-byte. Keep authored weights
+                          // on the 400/500/600/700 grid.
+                          ? 'text-[16px] leading-[1.55] font-[500] max-w-[90ch]'
                           : 'text-sm leading-6 max-w-[90ch]'
                     } ${textPrimary}`}
                   >
@@ -1402,7 +1412,7 @@ function MessageCardInner({
                     recover). Today the parser always populates `toolCalls`. */}
                 {toolCallText && toolCalls.length === 0 && (
                   <div className="mx-3 tool-call-band pt-1.5">
-                    <div className={`flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide ${textMuted}`}>
+                    <div className={`call-label flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide ${textMuted}`}>
                       <span className="material-symbols-outlined" style={{ fontSize: 12 }}>terminal</span>
                       call
                     </div>
@@ -1424,10 +1434,14 @@ function MessageCardInner({
                       ) : (
                         <div key={tcIdx} className="tool-call-band pt-1.5">
                           <div className="flex items-center justify-between gap-1">
-                            <div className={`flex items-center gap-1 min-w-0 text-[10px] font-bold uppercase tracking-wide ${textMuted}`}>
+                            <div className={`call-label flex items-center gap-1 min-w-0 text-[10px] font-bold uppercase tracking-wide ${textMuted}`}>
                               <span className="material-symbols-outlined shrink-0" style={{ fontSize: 12 }}>terminal</span>
                               <span className="shrink-0">call ·</span>
-                              <span className="truncate">{highlightSearchAndUrl(tc.function.name, false, 'tool', tcIdx, globalOccurrenceStarts.toolNameStarts[tcIdx] ?? messageOccurrenceStart, localSearchStarts.toolNameStarts[tcIdx] ?? localOccurrenceStart)}</span>
+                              {/* call-label-name: exports keep THIS span
+                                  shrinkable with an ellipsis while the rest
+                                  of the label stays rigid (long MCP tool ids
+                                  overflowed the paper figure box). */}
+                              <span className="truncate call-label-name">{highlightSearchAndUrl(tc.function.name, false, 'tool', tcIdx, globalOccurrenceStarts.toolNameStarts[tcIdx] ?? messageOccurrenceStart, localSearchStarts.toolNameStarts[tcIdx] ?? localOccurrenceStart)}</span>
                             </div>
                             <div className="flex items-center gap-0.5 shrink-0">
                               {isPresentationMode && (
@@ -1502,7 +1516,7 @@ function MessageCardInner({
                       <div
                         data-testid="clamp-tail"
                         title="The last lines of this output"
-                        className={`border-t px-3 pb-1 font-mono text-[13px] leading-[20px] whitespace-pre-wrap overflow-hidden ${
+                        className={`clamp-tail border-t px-3 pb-1 font-mono text-[13px] leading-[20px] whitespace-pre-wrap overflow-hidden ${
                           isDarkMode ? 'border-[#262b31] bg-[#16191d] text-gray-300' : 'border-[#e7e5e1] bg-white text-gray-800'
                         }`}
                       >
@@ -1514,7 +1528,7 @@ function MessageCardInner({
                       type="button"
                       data-testid="clamp-reveal"
                       onClick={(e) => { e.stopPropagation(); setShowFull(true); }}
-                      className={`w-full h-7 border-t text-xs font-semibold transition-colors ${
+                      className={`clamp-footer-bar w-full h-7 border-t text-xs font-semibold transition-colors ${
                         isDarkMode
                           ? 'border-[#262b31] bg-[#232830] text-gray-300 hover:bg-[#2b323b]'
                           : 'border-[#e7e5e1] bg-[#f1efec] text-gray-600 hover:bg-[#eae7e2]'
@@ -1536,7 +1550,9 @@ function MessageCardInner({
                       setShowFull(false);
                       cardRef.current?.scrollIntoView({ block: 'nearest' });
                     }}
-                    className={`-mb-2 w-full h-7 border-t text-xs font-semibold transition-colors ${
+                    // `clamp-footer-bar`: marker class the paper figure
+                    // style hides (a figure has nothing to collapse).
+                    className={`clamp-footer-bar -mb-2 w-full h-7 border-t text-xs font-semibold transition-colors ${
                       isDarkMode
                         ? 'border-[#262b31] bg-[#232830] text-gray-300 hover:bg-[#2b323b]'
                         : 'border-[#e7e5e1] bg-[#f1efec] text-gray-600 hover:bg-[#eae7e2]'

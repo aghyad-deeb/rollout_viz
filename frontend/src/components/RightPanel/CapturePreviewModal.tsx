@@ -5,7 +5,11 @@ interface CapturePreviewModalProps {
   imageUrl: string;
   isDarkMode: boolean;
   onCopy: () => void | Promise<void>;
-  onDownload: () => void;
+  onDownload: () => void | Promise<void>;
+  /** Label for the primary download button. Defaults to "Download". */
+  downloadLabel?: string;
+  /** Optional secondary format (paper style offers PNG next to the PDF). */
+  onDownloadAlt?: { label: string; onDownload: () => void | Promise<void> };
   onClose: () => void;
 }
 
@@ -32,6 +36,8 @@ export function CapturePreviewModal({
   isDarkMode,
   onCopy,
   onDownload,
+  downloadLabel = 'Download',
+  onDownloadAlt,
   onClose,
 }: CapturePreviewModalProps) {
   const [copied, setCopied] = useState(false);
@@ -96,12 +102,24 @@ export function CapturePreviewModal({
         </div>
 
         <div className={`flex items-center justify-end gap-2 px-4 py-2 border-t ${border}`}>
+          {/* Secondary format sits BEFORE the primary so the primary keeps
+              its position next to Copy — the paper style promotes PDF, and
+              PNG must stay one click away rather than disappear. */}
+          {onDownloadAlt && (
+            <button
+              onClick={() => { void onDownloadAlt.onDownload(); }}
+              title={`Download as ${onDownloadAlt.label}`}
+              className={`flex items-center gap-1 px-2 h-8 rounded text-xs font-medium ${ghostBtn}`}
+            >
+              {onDownloadAlt.label}
+            </button>
+          )}
           <button
-            onClick={onDownload}
+            onClick={() => { void onDownload(); }}
             className={`flex items-center gap-1.5 px-3 h-8 rounded text-sm font-medium ${ghostBtn}`}
           >
             <span className="material-symbols-outlined" style={{ fontSize: 17 }}>download</span>
-            Download
+            {downloadLabel}
           </button>
           <button
             onClick={handleCopy}

@@ -39,6 +39,39 @@
    cells and the tool-call scrollers. */
 .capture-export .message-body-grid { grid-template-rows: auto !important; }
 .capture-export .message-body-clip { overflow: visible !important; }
+/* …but releasing that clip re-arms the grid item's `min-width: auto`, which
+   resolves to MIN-CONTENT once the overflow is visible. A card holding one
+   long unbreakable token (a path, a base64 blob, a `--flag=value` run) then
+   sizes its column to that token — measured at 1423px inside a 927px paper
+   clone — and everything past the container width is sliced off the raster
+   with no scrollbar and no warning: silent CONTENT LOSS in a figure whose
+   whole job is evidence. Pinning `min-width: 0` restores the pre-release
+   sizing (a grid item that wraps instead of growing); `max-width: 100%` is
+   the belt to that braces for the mono `pre`, whose own `overflow-x: auto`
+   box would otherwise be re-measured the same way. Neither is scaled by
+   scaleCard: `0` is not a positive length and `100%` is not px, so
+   `authoredWidthPx` reports null for both. */
+.capture-export .message-body-clip,
+.capture-export .message-body-clip > *,
+.capture-export pre[data-block-kind="tool"] {
+  min-width: 0 !important;
+  max-width: 100% !important;
+}
+/* The other half of the same defect. A tool-call `pre` that the user has not
+   toggled to wrap is a HORIZONTAL SCROLLER on screen (`overflow-x: auto`) —
+   an affordance an image does not have. Bounded above, it simply clips: a
+   Column export of a card with 67-char argument lines showed the first ~42 and
+   dropped the rest, mid-glyph, with nothing to say it had. Exports therefore
+   wrap: `anywhere` so an unbreakable token (a path, a base64 blob) folds
+   instead of vanishing. This is also the precondition the paper style's
+   hanging indent was written for — it marks SOFT wraps, of which an
+   unwrapped scroller has none. Applies to both figure styles: a screen export
+   was losing the same characters. */
+.capture-export pre[data-block-kind="tool"] {
+  white-space: pre-wrap !important;
+  overflow-wrap: anywhere !important;
+  overflow-x: visible !important;
+}
 /* The collapsed header's one-line excerpt is a scan-mode affordance that
    duplicates the body — in a figure it is noise, and at fontScale > 1 it
    overran the '#N · M ln' meta run. */
@@ -49,9 +82,40 @@
    width scaling, which alone still lost the last glyph to the rasterizer's
    sub-pixel font metrics. */
 .capture-export .role-label-gutter { width: auto !important; }
-.capture-export .role-label-text {
+/* Micro-labels never wrap or truncate in an export, in EITHER figure style.
+   Each of these boxes is sized to max-content on screen and the rasterizer
+   re-lays the text out with fractionally different font metrics — enough to
+   fold "REASONING" onto two lines or shave the "H" off "BASH". An exported
+   image shows ONE card, so there is no column alignment to protect: let them
+   size to their text and stay on one line. (Lived under `.capture-paper`
+   until round 1 of the figure critic loop; the same defect was visible in
+   screen-style exports.) */
+.capture-export .role-label-text,
+.capture-export .reasoning-label,
+.capture-export .call-label,
+.capture-export .call-label > * {
+  white-space: nowrap !important;
   overflow: visible !important;
   text-overflow: clip !important;
+  overflow-wrap: normal !important;
+  word-break: normal !important;
+  flex-shrink: 0 !important;
+}
+/* …except a LONG name (an MCP tool id can run 45+ chars): past the column
+   width it would overflow the figure box and be cut mid-glyph with no cue
+   (round-3 code critic, measured at Paper/Column). The NAME span alone
+   keeps shrinkability + an ellipsis; the 'CALL ·' run stays rigid. */
+.capture-export .call-label > .call-label-name {
+  flex-shrink: 1 !important;
+  min-width: 0 !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+}
+/* The `call · <name>` separator rides a flex `gap`, which the rasterizer
+   re-lays out from the ORIGINAL 4px rather than scaleCard's scaled value —
+   "CALL ·BASH". An em gap is immune: it follows the scaled font-size. */
+.capture-export .call-label {
+  column-gap: 0.45em !important;
 }
 /* Suppress transient/tooling highlights — search, URL-share, grade quotes —
    so the exported figure shows only the user's deliberate emphasis. */
@@ -96,6 +160,262 @@
   white-space: normal !important;
   overflow-wrap: anywhere !important;
   word-break: break-word !important;
+  opacity: 0.7;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+   PAPER FIGURE STYLE — `.capture-paper`
+
+   Applied to the capture clone ALONGSIDE `.capture-export` (never instead
+   of it) when the Figure style setting is "Paper". Nothing on screen ever
+   carries this class: it exists only inside the off-screen capture
+   container, so the transcript's own look is untouched in every mode.
+
+   The target is the project figure style guide
+   (environments/eval_envs/paper/figure_style/PLOTTING_STYLE.md):
+   reasoning-trace callouts get a consistent box, one clear sans (Inter) /
+   mono (IBM Plex Mono), `[…]` for every elision, bold only on the
+   load-bearing span, ink #222222 on white, muted #BBBBBB for de-emphasis,
+   NO decorative color, minimal chrome, grayscale-safe.
+
+   These rules MUST stay after the `.capture-export` block above: several
+   of them tie it on specificity and win by source order.
+   ───────────────────────────────────────────────────────────────────── */
+
+/* Strip every surface and hue back to ink on white. More specific paper
+   rules below re-introduce the only two other values the guide allows
+   (#666666 micro-labels, #BBBBBB rules). */
+.capture-paper,
+.capture-paper * {
+  background-color: transparent !important;
+  background-image: none !important;   /* clamp fades are gradients */
+  color: #222222 !important;
+  border-radius: 0 !important;
+  text-shadow: none !important;
+}
+
+/* Rule weights. The paper clone is laid out in a 300 DPI space (1 in = 300
+   px, see captureImage.ts), so a literal `1px` rule would print at 0.24pt —
+   under every hairline minimum and liable to vanish in a downsampled PDF.
+   The screen design's weights are therefore carried across at the same scale
+   the type uses, which preserves the intent (one thin rule for the box, a
+   heavier accent for reasoning, a receding hairline between bands) at final
+   size. `--paper-scale` is set INLINE on the clone from PAPER_FONT_SCALE
+   (captureImage.ts) so the two can never drift; the literal below is only a
+   fallback for a clone that somehow arrives without it. Borders are not
+   touched by scaleCard, which is why they must be expressed this way.
+     card box   1px × 2.68 ≈ 2.68px ≈ 0.64pt
+     reasoning  2px × 2.68 ≈ 5.36px ≈ 1.29pt
+     band rule  0.75px × 2.68 ≈ 2.01px ≈ 0.48pt  */
+.capture-paper {
+  --paper-scale: 2.678571;
+  --paper-box-rule: calc(1px * var(--paper-scale));
+  --paper-accent-rule: calc(2px * var(--paper-scale));
+  --paper-hairline: calc(0.75px * var(--paper-scale));
+}
+
+/* The figure box: white paper inside ONE consistent rule, square corners
+   (the blanket `border-radius: 0` above), no role rail. Overrides
+   `.message-*`'s 3px colored left border and the user card's mint fill. */
+.capture-paper .message-system,
+.capture-paper .message-user,
+.capture-paper .message-assistant,
+.capture-paper .message-tool,
+.capture-paper .message-file {
+  background-color: #ffffff !important;
+  border: var(--paper-box-rule) solid #444444 !important;
+}
+
+/* Header: no role tint, no divider shadow — the role LABEL alone (still
+   small-caps, now in ink) says whose turn this is. */
+.capture-paper .message-system-header,
+.capture-paper .message-user-header,
+.capture-paper .message-assistant-header,
+.capture-paper .message-tool-header,
+.capture-paper .message-file-header {
+  background-color: #ffffff !important;
+}
+
+/* INNER GUTTER. The on-screen card gets its horizontal inset from MARGINS
+   (`mx-3` on every body block) plus asymmetric header padding (`pl-3 pr-1`,
+   which is right because the right end holds icon buttons that want to sit
+   near the edge). Neither survives the trip to a figure: scaleCard scales
+   padding but NOT margin, so the body's 12px margin stayed 12px in a 300 DPI
+   space (2.9pt) while the header's left padding scaled to 7.7pt and its right
+   to 2.6pt — an unbalanced box whose text ran within a quarter-point of the
+   rule on the right in the round-2 measurement. The figure needs ONE
+   symmetric gutter instead: 8 × 2.679 = 21.4px @300 DPI = 5.14pt, inside the
+   4–6pt band. Expressed through `--paper-scale` for the same cascade reason
+   as the micro-labels above: these are `!important` overrides of a property
+   scaleCard writes inline, so they must carry the scale themselves. */
+.capture-paper .message-system-header > div,
+.capture-paper .message-user-header > div,
+.capture-paper .message-assistant-header > div,
+.capture-paper .message-tool-header > div,
+.capture-paper .message-file-header > div,
+.capture-paper .message-body-clip > * {
+  padding-inline: calc(8px * var(--paper-scale)) !important;
+}
+/* …and the per-block margins that used to supply it are dropped, so the one
+   gutter above is the only inset. (Margins are not scaleCard-owned, so a
+   plain `0` is safe here.) */
+.capture-paper .message-body-clip > * > * {
+  margin-inline: 0 !important;
+}
+/* The reasoning body's extra `pr-3` (a screen measure-width nicety) would
+   re-introduce the asymmetry inside the gutter. */
+.capture-paper [data-block-kind="reasoning"] {
+  padding-right: 0 !important;
+}
+
+/* Icon fonts rasterize as glyph art that reads as clip-art in a figure —
+   and the guide allows no decorative marks. The role/reasoning/tool icons
+   go; the words stay. (Applies to the inline SVGs `inlineIcons` swaps in,
+   which keep this class.) */
+.capture-paper .material-symbols-outlined { display: none !important; }
+
+/* Screen affordances `.capture-export` keeps but a figure has no use for:
+   the header's "#3 · 42 ln" meta run, the collapsed line-count badge, and
+   the clamped-output tail preview with its ⋯ divider. (The chevron and the
+   action buttons are already `.presentation-chrome`, dropped by the
+   snapshot filter.) */
+.capture-paper .header-meta,
+.capture-paper .collapsed-line-count,
+.capture-paper .clamp-tail,
+.capture-paper .clamp-footer-bar {
+  display: none !important;
+}
+
+/* Reasoning stays a band, not a box — but a NEUTRAL one: a muted rule and
+   a #666 micro-label instead of the orange identity color. */
+.capture-paper .reasoning {
+  border-left: var(--paper-accent-rule) solid #bbbbbb !important;
+  background-color: transparent !important;
+}
+/* The descendant selector matters: these labels wrap their text in spans
+   (`call ·` + the tool name), which the blanket ink rule above would
+   otherwise repaint #222 inside a #666 parent. */
+.capture-paper .reasoning-label,
+.capture-paper .reasoning-label *,
+.capture-paper .call-label,
+.capture-paper .call-label * {
+  color: #666666 !important;
+}
+/* (The `call · <name>` em gap that keeps the separator off the tool name is
+   now on `.capture-export` above — both styles need it.) */
+/* Tool-call band: the same muted hairline separating it from the prose. */
+.capture-paper .tool-call-band {
+  border-top: var(--paper-hairline) solid #bbbbbb !important;
+}
+
+/* Micro-labels no longer wrap or clip — that fix now lives on
+   `.capture-export` above, where BOTH figure styles get it. The paper style
+   only adds a size floor for them (next rule). */
+
+/* PAPER TYPOGRAPHY.
+   All three rules below are authored at SCREEN scale: the clone is measured
+   and multiplied by PAPER_FONT_SCALE (≈2.679) afterwards, so a px written
+   here lands at px × 2.679 in the 300 DPI design space. The pt each value
+   reaches at final size is noted per rule.
+
+   1. LEADING. The transcript's on-screen leading is generous for reading a
+      long scroll (prose 14/24 = 1.71, mono 13/20 = 1.54). Printed at 9pt in
+      a 3.25 in column that reads as a gappy, airy block that no paper sets
+      that way — figure captions and code listings run tight. Ratios, not
+      px, so they survive the scale multiply intact. */
+.capture-paper [data-msg-block] {
+  line-height: 1.25 !important;
+}
+.capture-paper pre[data-block-kind="tool"],
+.capture-paper .message-tool [data-block-kind="content"],
+.capture-paper .message-file [data-block-kind="content"],
+.capture-paper .clamp-tail {
+  line-height: 1.3 !important;   /* mono needs a hair more than prose */
+}
+
+/*  2. MICRO-LABEL FLOOR. The role / REASONING / CALL labels are `text-[10px]`
+      on screen → 10 × 2.679 = 26.8px = 6.4pt at final size, under the style
+      guide's 7.5pt floor for any type in a figure. 11.8px × 2.679 = 31.6px
+      = 7.58pt clears it with a hair of margin.
+
+      The `* var(--paper-scale)` is NOT decoration. `font-size` is one of the
+      properties scaleCard rewrites INLINE on the clone, and an inline
+      declaration loses to an `!important` stylesheet rule — so the flat
+      `font-size: 11.8px !important` this rule shipped with in round 1 SWALLOWED
+      the ×2.679 the rest of the card got, and the labels rasterized at 11.8px
+      in a 300 DPI space = 2.83pt: smaller than the round-0 defect it was
+      written to fix. Any `!important` here must therefore carry the scale
+      itself (pinned by the cascade-guard test in captureStyles.test.ts).
+
+      Leading is a unitless RATIO for the mirror-image reason: scaleCard only
+      rewrites px line-heights, and the inherited px leading it scaled (16 →
+      ~42px) was left stranded under the un-scaled font — a dead band ~3.5×
+      the type. A ratio re-derives from whatever the final size is. */
+.capture-paper .role-label-text,
+.capture-paper .reasoning-label,
+.capture-paper .reasoning-label *,
+.capture-paper .call-label,
+.capture-paper .call-label * {
+  font-size: calc(11.8px * var(--paper-scale)) !important;
+  line-height: 1.3 !important;
+}
+
+/*  2a. A tool-RESULT card in a figure is labeled only 'BASH' — the on-screen
+      '↳' chain cue is chrome the export strips, so a standalone box of
+      output under a bare tool name can read as the command itself. The
+      export's running head says what the box IS. */
+.capture-paper .message-tool .role-label-text::after,
+.capture-paper .message-file .role-label-text::after {
+  content: " · output";
+}
+
+/*  2b. The TASK card's on-screen step-up (16px/1.55, its lead-in hierarchy)
+      must not survive into a figure: a TASK callout and an assistant callout
+      side by side in one paper would carry visibly different body sizes
+      (10.3pt vs 9pt measured). Normalize it to the 14px paper base — same
+      calc shape the cascade-guard test requires. */
+.capture-paper .message-user [data-block-kind="content"] {
+  font-size: calc(14px * var(--paper-scale)) !important;
+  line-height: 1.25 !important;
+  font-weight: 400 !important;
+}
+
+/*  3. HANGING INDENT for mono. A shell command or a JSON argument that soft
+      wraps in a 3.25 in column is indistinguishable from the next real line
+      of output. A 2ch hanging indent marks continuations — the standard
+      listing convention. `each-line` is what makes it a HANGING indent in a
+      `pre-wrap` block (the negative indent is re-applied after every hard
+      newline, so only soft wraps are pushed in); without it the rule would
+      indent every line but the first, which is worse than nothing — hence
+      the @supports guard. */
+@supports (text-indent: -2ch each-line) {
+  .capture-paper pre[data-block-kind="tool"],
+  .capture-paper .message-tool [data-block-kind="content"],
+  .capture-paper .message-file [data-block-kind="content"] {
+    padding-left: 2ch !important;
+    text-indent: -2ch each-line !important;
+  }
+}
+
+/* "Bold only the load-bearing span": the user's ephemeral highlight is the
+   deliberate emphasis in the card, so it flattens from a fill to bold ink.
+   (Ties `.capture-export`'s amber rule on specificity — later wins.) */
+.capture-paper mark.ephemeral-highlight-mark,
+.capture-paper mark.ephemeral-highlight-fragment {
+  background: transparent !important;
+  background-color: transparent !important;
+  color: #222222 !important;
+  font-weight: 700 !important;
+  border: none !important;
+  padding: 0 !important;
+}
+
+/* Elisions read as typography, not as a widget: a plain bracketed ellipsis
+   in ink, held back to ~70% so it recedes behind the quoted text. The
+   glyph itself (`[…]`, U+2026) is set by `paperizeClone` in
+   utils/captureImage.ts — CSS cannot rewrite text. */
+.capture-paper .elision-pill {
+  color: #222222 !important;
   opacity: 0.7;
 }
 
