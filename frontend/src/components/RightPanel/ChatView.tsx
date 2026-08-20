@@ -303,6 +303,58 @@ export function ChatView({
     container.scrollTop += bottom - anchor.bottom;
   }, [collapsedRegions]);
 
+  // Entering/leaving Presentation Mode reflows the whole transcript — the
+  // scroller swaps scrollbar chrome (scrollbar-none ↔ custom-scrollbar
+  // changes the content width, rewrapping every line) and a toolbar row
+  // appears — so a raw scrollTop suddenly points at different content and
+  // the card being read drifts off screen. Track the topmost visible card
+  // and its offset continuously (scroll events cover programmatic scrolls
+  // too, since assigning scrollTop fires one), then re-pin that card at the
+  // same offset before paint when the mode flips.
+  const readingAnchorRef = useRef<{ index: number; offset: number } | null>(null);
+  const captureReadingAnchor = useCallback(() => {
+    const container = messagesContainerRef.current;
+    if (!container) return;
+    const cTop = container.getBoundingClientRect().top;
+    const indices = Array.from(messageRefs.current.keys()).sort((a, b) => a - b);
+    for (const i of indices) {
+      const el = messageRefs.current.get(i);
+      if (!el) continue;
+      const r = el.getBoundingClientRect();
+      if (r.bottom - cTop > 0) {
+        readingAnchorRef.current = { index: i, offset: r.top - cTop };
+        return;
+      }
+    }
+    readingAnchorRef.current = null;
+  }, []);
+  useEffect(() => {
+    const container = messagesContainerRef.current;
+    if (!container) return;
+    let raf = 0;
+    const onScroll = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => { raf = 0; captureReadingAnchor(); });
+    };
+    container.addEventListener('scroll', onScroll, { passive: true });
+    captureReadingAnchor();
+    return () => {
+      container.removeEventListener('scroll', onScroll);
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [captureReadingAnchor]);
+  const prevPresentationModeRef = useRef(isPresentationMode);
+  useLayoutEffect(() => {
+    if (prevPresentationModeRef.current === isPresentationMode) return;
+    prevPresentationModeRef.current = isPresentationMode;
+    const anchor = readingAnchorRef.current;
+    const container = messagesContainerRef.current;
+    const el = anchor ? messageRefs.current.get(anchor.index) : undefined;
+    if (!anchor || !container || !el) return;
+    const cTop = container.getBoundingClientRect().top;
+    container.scrollTop += (el.getBoundingClientRect().top - cTop) - anchor.offset;
+  }, [isPresentationMode]);
+
   // Revoke any live preview URL on unmount. previewUrlRef is null during the
   // StrictMode mount/cleanup/mount remount, so this cleanup is a safe no-op
   // then and frees a real URL only on a genuine unmount.

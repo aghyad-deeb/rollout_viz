@@ -1390,3 +1390,64 @@ describe('ChatView tool-echo stripping', () => {
     expect(screen.getByTestId('content-1')).toHaveTextContent('total 4');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Reading-position anchor across Presentation Mode toggles
+// ---------------------------------------------------------------------------
+//
+// The mode flip reflows the whole transcript (the scroller swaps scrollbar
+// chrome, a toolbar row appears), so a raw scrollTop lands on different
+// content. ChatView tracks the topmost visible card on scroll and re-pins it
+// at the same offset when isPresentationMode changes. jsdom has no layout:
+// rects are stubbed per element and the RAF throttle is made synchronous.
+
+describe('ChatView presentation-mode reading anchor', () => {
+  const rect = (top: number, bottom: number): DOMRect =>
+    ({ top, bottom, left: 0, right: 0, width: 0, height: bottom - top, x: 0, y: top, toJSON: () => ({}) } as DOMRect);
+
+  it('re-pins the topmost visible card when the mode flips', () => {
+    const messages = Array.from({ length: 6 }, (_, i) => ({
+      role: (i % 2 === 0 ? 'user' : 'assistant') as 'user' | 'assistant',
+      content: `message ${i}`,
+    }));
+    const sample = makeSample({ messages });
+    const rafSpy = vi.spyOn(window, 'requestAnimationFrame')
+      .mockImplementation((cb) => { cb(0); return 1; });
+    try {
+      const { container, rerender } = render(
+        <ChatView {...defaultProps} sample={sample} isPresentationMode={false} />
+      );
+      const scroller = container.querySelector('.transcript-surface') as HTMLElement;
+      const wrappers = Array.from(scroller.children) as HTMLElement[];
+      expect(wrappers).toHaveLength(6);
+
+      let scrollTop = 250;
+      Object.defineProperty(scroller, 'scrollTop', {
+        configurable: true,
+        get: () => scrollTop,
+        set: (v: number) => { scrollTop = v; },
+      });
+      scroller.getBoundingClientRect = () => rect(0, 500);
+      // Simulated layout: every card `h` px tall, stacked from the top.
+      const layout = (h: number) => {
+        wrappers.forEach((w, i) => {
+          w.getBoundingClientRect = () => rect(i * h - scrollTop, (i + 1) * h - scrollTop);
+        });
+      };
+      layout(100);
+      // At scrollTop 250 the topmost visible card is #2 (top at -50).
+      fireEvent.scroll(scroller);
+
+      // The flip re-lays every card out taller (150px), the way the
+      // scrollbar/toolbar reflow does; card #2 must stay pinned at -50.
+      layout(150);
+      rerender(<ChatView {...defaultProps} sample={sample} isPresentationMode={true} />);
+
+      // #2's new natural top is 300 at the old scrollTop 250 → the anchor
+      // effect adds 100 so its on-screen offset is -50 again.
+      expect(scrollTop).toBe(350);
+    } finally {
+      rafSpy.mockRestore();
+    }
+  });
+});

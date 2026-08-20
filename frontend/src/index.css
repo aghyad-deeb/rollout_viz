@@ -132,7 +132,11 @@
   border: none !important;
   text-decoration: none !important;
   box-shadow: none !important;
+  /* On screen every mark pairs px-0.5 with -mx-0.5 so highlights are
+     layout-neutral; zero BOTH here or the surviving negative margin
+     pulls the de-highlighted text together in the export. */
   padding: 0 !important;
+  margin: 0 !important;
 }
 /* The user's ephemeral highlight survives — flattened to one clean,
    colorblind-safe amber fill instead of the on-screen fuchsia. */
@@ -408,6 +412,7 @@
   font-weight: 700 !important;
   border: none !important;
   padding: 0 !important;
+  margin: 0 !important;   /* cancels the screen -mx-0.5 with the padding */
 }
 
 /* Elisions read as typography, not as a widget: a plain bracketed ellipsis
@@ -594,6 +599,20 @@
 .reasoning-label { color: #a85f21; }
 .dark .reasoning { border-left-color: #f6b077; }
 .dark .reasoning-label { color: #f2a86b; }
+
+/* Micro-label chrome (REASONING / CALL rows) never mid-word wraps ON
+   SCREEN either: the message body's `overflow-wrap: anywhere` is for user
+   content, not labels — a squeezed flex row (e.g. the Presentation-Mode
+   collapse button riding justify-between next to it) used to fold the G
+   of REASONING onto its own line. `white-space` inherits, and the long
+   tool-name span keeps its ellipsis: `truncate` re-asserts nowrap plus
+   hidden overflow on `.call-label-name`. */
+.reasoning-label,
+.call-label {
+  white-space: nowrap;
+  overflow-wrap: normal;
+  word-break: normal;
+}
 
 /* Tool-call band inside an assistant card — flattened the same way: a
    hairline separates bands, the micro label names the call. */

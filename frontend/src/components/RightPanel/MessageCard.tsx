@@ -613,6 +613,20 @@ function MessageCardInner({
     setClampHiddenLines(Math.max(0, Math.round((el.scrollHeight - el.clientHeight) / 20)));
   }, [isClamped, isExpanded, message]);
 
+  // The footer "▴ Collapse" button sits at the BOTTOM of a fully revealed
+  // long card, so at click time the card top is far above the viewport. A
+  // synchronous scrollIntoView would measure the still-expanded card (a
+  // no-op) and the subsequent shrink flings the reading position to
+  // whatever content slides up under the unchanged scrollTop. Instead the
+  // click arms this flag and the scroll runs after the collapsed layout
+  // commits — before paint, so the re-pin is invisible.
+  const pendingClampScrollRef = useRef(false);
+  useLayoutEffect(() => {
+    if (!pendingClampScrollRef.current || showFull) return;
+    pendingClampScrollRef.current = false;
+    cardRef.current?.scrollIntoView({ block: 'nearest' });
+  }, [showFull]);
+
   // Highlight compositor. Every strategy contributes ranges, then one
   // renderer splits the original text at all range boundaries and applies
   // every active mark to each segment. Target classes are attached only to
@@ -794,7 +808,13 @@ function MessageCardInner({
 
         if (!hasVisual) return node;
 
-        const classes = ['px-0.5', 'rounded'];
+        // px-0.5 lets the fill breathe past the text, and the mirroring
+        // -mx-0.5 cancels it back out of layout: a mark's footprint is
+        // identical to the plain text it wraps, so toggling highlights
+        // (grade quotes on/off, search, share links) never rewraps a line —
+        // which used to shove the scroll position around and make marked
+        // text read slightly "bigger" than its neighbors.
+        const classes = ['px-0.5', '-mx-0.5', 'rounded'];
         const titles: string[] = [];
         if (hasKind('url')) {
           classes.push(
@@ -1187,8 +1207,11 @@ function MessageCardInner({
                 {/* `role-label-text` lets the capture stylesheet release the
                     truncation: a figure of ONE card has no column to align to,
                     and the rasterizer's font metrics differ just enough from
-                    the measured box to shave the last glyph ("BASH" → "BASI"). */}
-                <span className="role-label-text truncate">{headerLabel}</span>
+                    the measured box to shave the last glyph ("BASH" → "BASI").
+                    A user-authored presentation label keeps its typed casing
+                    (normal-case beats the gutter's uppercase) — that
+                    transform is for role CHROME, not for the user's text. */}
+                <span className={`role-label-text truncate${presentationLabel ? ' normal-case' : ''}`}>{headerLabel}</span>
               </span>
               {/* Collapsed: a line-count badge + a width-aware excerpt
                   (CSS ellipsis, never a JS slice, so it always fills the
@@ -1547,8 +1570,8 @@ function MessageCardInner({
                     data-testid="clamp-collapse"
                     onClick={(e) => {
                       e.stopPropagation();
+                      pendingClampScrollRef.current = true;
                       setShowFull(false);
-                      cardRef.current?.scrollIntoView({ block: 'nearest' });
                     }}
                     // `clamp-footer-bar`: marker class the paper figure
                     // style hides (a figure has nothing to collapse).

@@ -1,5 +1,5 @@
 import { useState, type ComponentProps } from 'react';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen, fireEvent, cleanup } from '@testing-library/react';
 import { MessageCard } from './MessageCard';
 
 // The tool-call wrap toggle is controlled by lifted state (so the off-screen
@@ -85,6 +85,18 @@ describe('MessageCard', () => {
     expect(screen.queryByText('assistant')).not.toBeInTheDocument();
   });
 
+  it('a presentation label keeps its typed casing (role chrome stays uppercase)', () => {
+    // The gutter's `uppercase` transform is for role names; a user-authored
+    // label must render exactly as typed ("Claude judge", not "CLAUDE JUDGE").
+    render(<MessageCard {...defaultProps} message={{ role: 'assistant', content: 'Model answer', presentationLabel: 'Claude judge' }} />);
+    const label = screen.getByText('Claude judge');
+    expect(label.className).toContain('normal-case');
+
+    cleanup();
+    render(<MessageCard {...defaultProps} message={{ role: 'assistant', content: 'Model answer' }} />);
+    expect(screen.getByText('assistant').className).not.toContain('normal-case');
+  });
+
   it('extracts think tags from assistant content', () => {
     const message = { role: 'assistant' as const, content: '<think>internal reasoning</think>Main response' };
     render(<MessageCard {...defaultProps} message={message} />);
@@ -130,6 +142,20 @@ describe('MessageCard', () => {
     const mark = screen.getByText('important');
     expect(mark.tagName).toBe('MARK');
     expect(mark.className).toContain('violet');
+  });
+
+  it('highlight marks are layout-neutral: px-0.5 fill is cancelled by -mx-0.5', () => {
+    // Toggling a highlight must never rewrap a line (it used to shove the
+    // scroll position around and make marked text read "bigger"): the fill
+    // padding is paired with an equal negative margin so the mark's layout
+    // footprint is identical to the plain text it wraps.
+    render(<MessageCard {...defaultProps}
+      message={{ role: 'user', content: 'This is important text here' }}
+      gradeQuotes={[{ message_index: 0, start: 8, end: 17, text: 'important' }]}
+    />);
+    const mark = screen.getByText('important');
+    expect(mark.className).toContain('px-0.5');
+    expect(mark.className).toContain('-mx-0.5');
   });
 
   it('matches grade quotes across Unicode whitespace mismatches (LLM normalized U+202F → space)', () => {
@@ -956,6 +982,33 @@ describe('MessageCard long-card clamping', () => {
     fireEvent.click(collapse);
     expect(clampedEl(container)).not.toBeNull();
     expect(screen.getByTestId('clamp-reveal')).toBeInTheDocument();
+  });
+
+  it('re-pins the card only AFTER the collapsed layout commits', () => {
+    // The footer Collapse button sits at the bottom of a tall revealed
+    // card. A scrollIntoView fired synchronously in the click handler
+    // measures the still-expanded card (a no-op) and the subsequent shrink
+    // flings the reading position. The scroll must run after the collapsed
+    // DOM commits — i.e. at call time the clamp is already back on.
+    const { container } = render(<MessageCard {...defaultProps} message={longSystem} />);
+    fireEvent.click(screen.getByTestId('clamp-reveal'));
+
+    const observed: { clampedAtCall: boolean; target: Element }[] = [];
+    const orig = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function (this: Element) {
+      observed.push({ clampedAtCall: clampedEl(container) !== null, target: this });
+    } as typeof Element.prototype.scrollIntoView;
+    try {
+      fireEvent.click(screen.getByTestId('clamp-collapse'));
+    } finally {
+      Element.prototype.scrollIntoView = orig;
+    }
+
+    expect(observed).toHaveLength(1);
+    expect(observed[0].clampedAtCall).toBe(true);
+    // The receiver is the card root (it now contains the re-clamped
+    // footer), so `block: 'nearest'` brings its top back into view.
+    expect(observed[0].target.querySelector('[data-testid="clamp-reveal"]')).not.toBeNull();
   });
 
   it('does not clamp user or assistant cards', () => {

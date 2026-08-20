@@ -57,6 +57,29 @@ describe('capture stylesheet — micro-labels', () => {
     expect(css).not.toContain('.capture-paper .call-label {');
   });
 
+  it('micro-labels never mid-word wrap ON SCREEN either', () => {
+    // The message body sets overflow-wrap:anywhere for user content; a
+    // squeezed flex row used to fold the G of REASONING onto its own line
+    // in Presentation Mode. The screen rule (no !important — capture rules
+    // still win) pins label chrome to one line.
+    const screenLabels = block('.reasoning-label,\n.call-label {');
+    expect(screenLabels).toContain('white-space: nowrap');
+    expect(screenLabels).toContain('overflow-wrap: normal');
+    expect(screenLabels).toContain('word-break: normal');
+  });
+
+  it('capture rules cancel the screen marks\' layout-neutral margin pair', () => {
+    // Screen marks pair px-0.5 with -mx-0.5 so highlights never rewrap a
+    // line. Capture rules that zero the padding must zero the margin too,
+    // or the surviving negative margin pulls exported text together.
+    const suppressed = block('.capture-export .global-search-highlight,');
+    expect(suppressed).toContain('padding: 0 !important');
+    expect(suppressed).toContain('margin: 0 !important');
+    const paperEphemeral = block('.capture-paper mark.ephemeral-highlight-mark,');
+    expect(paperEphemeral).toContain('padding: 0 !important');
+    expect(paperEphemeral).toContain('margin: 0 !important');
+  });
+
   it('floors the paper micro-labels at the style guide 7.5pt minimum', () => {
     const decl = block('.capture-paper .role-label-text,').match(/font-size:\s*([^;]+);/)?.[1] ?? '';
     const size = Number(decl.match(/([\d.]+)px/)?.[1]);
